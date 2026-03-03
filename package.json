@@ -1,0 +1,47 @@
+{
+  "name": "qingflow-mcp",
+  "version": "0.2.0",
+  "private": false,
+  "license": "MIT",
+  "type": "module",
+  "description": "MCP server for Qingflow CRUL workflows",
+  "author": "Yanqi Dong",
+  "homepage": "https://github.com/yanqidong/qingflow-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yanqidong/qingflow-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yanqidong/qingflow-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "qingflow",
+    "openapi",
+    "automation",
+    "agent"
+  ],
+  "bin": {
+    "qingflow-mcp": "dist/server.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/server.js",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.4",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
