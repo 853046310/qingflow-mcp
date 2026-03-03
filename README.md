@@ -1,4 +1,4 @@
-# Qingflow MCP (CRUL)
+# Qingflow MCP (CRUD)
 
 This MCP server wraps Qingflow OpenAPI for:
 
@@ -50,16 +50,24 @@ npm start
 
 ## CLI Install
 
-Global install:
+Global install from GitHub:
 
 ```bash
-npm i -g qingflow-mcp
+npm i -g git+https://github.com/853046310/qingflow-mcp.git
 ```
 
-Or use without install:
+Or one-click installer:
 
 ```bash
-npx -y qingflow-mcp
+curl -fsSL https://raw.githubusercontent.com/853046310/qingflow-mcp/main/install.sh | bash
+```
+
+Safer (review script before execution):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/853046310/qingflow-mcp/main/install.sh -o install.sh
+less install.sh
+bash install.sh
 ```
 
 MCP client config example:
