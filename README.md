@@ -93,6 +93,20 @@ MCP client config example:
 3. `qf_record_create` or `qf_record_update`.
 4. If create/update returns only `request_id`, call `qf_operation_get` to resolve async result.
 
+## List Query Tips
+
+1. For `qf_records_list.sort[].que_id`, use a real field `que_id` (numeric) or exact field title from `qf_form_get`.
+2. Avoid aliases like `create_time`; Qingflow often rejects them.
+3. When `include_answers=true`, the server auto-limits returned items to protect MCP context size.
+4. You can override item count with `max_items` in `qf_records_list`.
+
+Optional env vars:
+
+```bash
+export QINGFLOW_LIST_MAX_ITEMS_WITH_ANSWERS=5
+export QINGFLOW_LIST_MAX_ITEMS_BYTES=400000
+```
+
 ## Publish
 
 ```bash

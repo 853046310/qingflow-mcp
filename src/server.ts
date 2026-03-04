@@ -43,6 +43,10 @@ interface FieldIndex {
 
 const FORM_CACHE_TTL_MS = Number(process.env.QINGFLOW_FORM_CACHE_TTL_MS ?? "300000")
 const formCache = new Map<string, FormCacheEntry>()
+const DEFAULT_PAGE_SIZE = 50
+const DEFAULT_MAX_ITEMS_WITH_ANSWERS =
+  toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_WITH_ANSWERS) ?? 5
+const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -237,6 +241,7 @@ const listInputSchema = z.object({
       })
     )
     .optional(),
+  max_items: z.number().int().positive().max(200).optional(),
   include_answers: z.boolean().optional()
 })
 
@@ -442,15 +447,18 @@ server.registerTool(
   },
   async (args) => {
     try {
+      const pageNum = args.page_num ?? 1
+      const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
+      const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
       const payload = buildListPayload({
-        pageNum: args.page_num ?? 1,
-        pageSize: args.page_size ?? 50,
+        pageNum,
+        pageSize,
         mode: args.mode,
         type: args.type,
         keyword: args.keyword,
         queryLogic: args.query_logic,
         applyIds: args.apply_ids,
-        sort: args.sort,
+        sort: normalizedSort,
         filters: args.filters
       })
 
@@ -458,24 +466,40 @@ server.registerTool(
       const result = asObject(response.result)
       const rawItems = asArray(result?.result)
       const includeAnswers = Boolean(args.include_answers)
+      const listLimit = resolveListItemLimit({
+        total: rawItems.length,
+        requestedMaxItems: args.max_items,
+        includeAnswers
+      })
 
-      const items = rawItems.map((raw) => normalizeRecordItem(raw, includeAnswers))
+      const items = rawItems
+        .slice(0, listLimit.limit)
+        .map((raw) => normalizeRecordItem(raw, includeAnswers))
+      const fitted = fitListItemsWithinSize({
+        items,
+        limitBytes: MAX_LIST_ITEMS_BYTES
+      })
+      const truncationReason = mergeTruncationReasons(listLimit.reason, fitted.reason)
       return okResult(
         {
           ok: true,
           data: {
             app_key: args.app_key,
             pagination: {
-              page_num: toPositiveInt(result?.pageNum) ?? (args.page_num ?? 1),
-              page_size: toPositiveInt(result?.pageSize) ?? (args.page_size ?? 50),
+              page_num: toPositiveInt(result?.pageNum) ?? pageNum,
+              page_size: toPositiveInt(result?.pageSize) ?? pageSize,
               page_amount: toNonNegativeInt(result?.pageAmount),
-              result_amount: toNonNegativeInt(result?.resultAmount) ?? items.length
+              result_amount: toNonNegativeInt(result?.resultAmount) ?? fitted.items.length
             },
-            items
+            items: fitted.items
           },
           meta: buildMeta(response)
         },
-        `Fetched ${items.length} records`
+        buildRecordsListMessage({
+          returned: fitted.items.length,
+          total: rawItems.length,
+          truncationReason
+        })
       )
     } catch (error) {
       return errorResult(error)
@@ -999,6 +1023,131 @@ function resolveFieldByKey(fieldKey: string, index: FieldIndex): FormField | nul
     throw new Error(`Field title "${fieldKey}" is ambiguous. Candidate queId: ${candidateIds}`)
   }
   return null
+}
+
+async function normalizeListSort(
+  sort: Array<{ que_id: string | number; ascend?: boolean }> | undefined,
+  appKey: string,
+  userId?: string
+): Promise<Array<{ que_id: string | number; ascend?: boolean }> | undefined> {
+  if (!sort?.length) {
+    return sort
+  }
+
+  // Fast path for numeric que_id, which can be passed through directly.
+  if (sort.every((item) => isNumericKey(String(item.que_id)))) {
+    return sort.map((item) => ({
+      que_id: Number(item.que_id),
+      ...(item.ascend !== undefined ? { ascend: item.ascend } : {})
+    }))
+  }
+
+  const form = await getFormCached(appKey, userId, false)
+  const index = buildFieldIndex(form.result)
+
+  return sort.map((item) => {
+    const rawKey = String(item.que_id).trim()
+    const resolved = resolveFieldByKey(rawKey, index)
+    if (!resolved || resolved.queId === undefined || resolved.queId === null) {
+      throw new Error(
+        `Cannot resolve sort.que_id "${rawKey}". Use numeric que_id or exact field title from qf_form_get.`
+      )
+    }
+    return {
+      que_id: normalizeQueId(resolved.queId),
+      ...(item.ascend !== undefined ? { ascend: item.ascend } : {})
+    }
+  })
+}
+
+function resolveListItemLimit(params: {
+  total: number
+  requestedMaxItems?: number
+  includeAnswers: boolean
+}): { limit: number; reason: string | null } {
+  if (params.total <= 0) {
+    return { limit: 0, reason: null }
+  }
+
+  if (params.requestedMaxItems !== undefined) {
+    const limit = Math.min(params.total, params.requestedMaxItems)
+    if (limit < params.total) {
+      return {
+        limit,
+        reason: `limited by max_items=${params.requestedMaxItems}`
+      }
+    }
+    return { limit, reason: null }
+  }
+
+  if (params.includeAnswers && params.total > DEFAULT_MAX_ITEMS_WITH_ANSWERS) {
+    return {
+      limit: DEFAULT_MAX_ITEMS_WITH_ANSWERS,
+      reason: `auto-limited to ${DEFAULT_MAX_ITEMS_WITH_ANSWERS} items because include_answers=true`
+    }
+  }
+
+  return { limit: params.total, reason: null }
+}
+
+function fitListItemsWithinSize(params: {
+  items: Array<Record<string, unknown>>
+  limitBytes: number
+}): { items: Array<Record<string, unknown>>; reason: string | null } {
+  let candidate = params.items
+  let size = jsonSizeBytes(candidate)
+  if (size <= params.limitBytes) {
+    return { items: candidate, reason: null }
+  }
+
+  while (candidate.length > 1) {
+    candidate = candidate.slice(0, candidate.length - 1)
+    size = jsonSizeBytes(candidate)
+    if (size <= params.limitBytes) {
+      return {
+        items: candidate,
+        reason: `auto-limited to ${candidate.length} items to keep response <= ${params.limitBytes} bytes`
+      }
+    }
+  }
+
+  throw new Error(
+    `qf_records_list response is too large (${size} bytes > ${params.limitBytes}) even with 1 item. Use qf_record_get(apply_id).`
+  )
+}
+
+function mergeTruncationReasons(...reasons: Array<string | null>): string | null {
+  const list = reasons.filter((item): item is string => Boolean(item))
+  return list.length > 0 ? list.join("; ") : null
+}
+
+function buildRecordsListMessage(params: {
+  returned: number
+  total: number
+  truncationReason: string | null
+}): string {
+  if (!params.truncationReason) {
+    return `Fetched ${params.returned} records`
+  }
+  return `Fetched ${params.returned}/${params.total} records (${params.truncationReason})`
+}
+
+function normalizeQueId(queId: unknown): string | number {
+  if (typeof queId === "number" && Number.isInteger(queId)) {
+    return queId
+  }
+  if (typeof queId === "string") {
+    const normalized = queId.trim()
+    if (!normalized) {
+      throw new Error("Resolved que_id is empty")
+    }
+    return isNumericKey(normalized) ? Number(normalized) : normalized
+  }
+  throw new Error(`Resolved que_id has unsupported type: ${typeof queId}`)
+}
+
+function jsonSizeBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8")
 }
 
 function isNumericKey(value: string): boolean {
