@@ -105,6 +105,12 @@ MCP client config example:
 
 ## List Query Tips
 
+Strict mode (`qf_records_list`):
+
+1. `select_columns` is required.
+2. `include_answers=false` is not allowed.
+3. Output `items[].answers` contains only selected columns, not full answers.
+
 1. For `qf_records_list.sort[].que_id`, use a real field `que_id` (numeric) or exact field title from `qf_form_get`.
 2. Avoid aliases like `create_time`; Qingflow often rejects them.
 3. Use `max_rows` (or `max_items`) to cap returned rows.

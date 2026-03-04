@@ -194,63 +194,64 @@ const formOutputSchema = z.object({
   meta: apiMetaSchema
 })
 
-const listInputSchema = z.object({
-  app_key: z.string().min(1),
-  user_id: z.string().min(1).optional(),
-  page_num: z.number().int().positive().optional(),
-  page_size: z.number().int().positive().max(200).optional(),
-  mode: z
-    .enum([
-      "todo",
-      "done",
-      "mine_approved",
-      "mine_rejected",
-      "mine_draft",
-      "mine_need_improve",
-      "mine_processing",
-      "all",
-      "all_approved",
-      "all_rejected",
-      "all_processing",
-      "cc"
-    ])
-    .optional(),
-  type: z.number().int().min(1).max(12).optional(),
-  keyword: z.string().optional(),
-  query_logic: z.enum(["and", "or"]).optional(),
-  apply_ids: z.array(z.union([z.string(), z.number()])).optional(),
-  sort: z
-    .array(
-      z.object({
-        que_id: z.union([z.string().min(1), z.number().int()]),
-        ascend: z.boolean().optional()
-      })
-    )
-    .optional(),
-  filters: z
-    .array(
-      z.object({
-        que_id: z.union([z.string().min(1), z.number().int()]).optional(),
-        search_key: z.string().optional(),
-        search_keys: z.array(z.string()).optional(),
-        min_value: z.string().optional(),
-        max_value: z.string().optional(),
-        scope: z.number().int().optional(),
-        search_options: z.array(z.union([z.string(), z.number()])).optional(),
-        search_user_ids: z.array(z.string()).optional()
-      })
-    )
-    .optional(),
-  max_rows: z.number().int().positive().max(200).optional(),
-  max_items: z.number().int().positive().max(200).optional(),
-  max_columns: z.number().int().positive().max(200).optional(),
-  select_columns: z
-    .array(z.union([z.string().min(1), z.number().int()]))
-    .min(1)
-    .max(200)
-    .optional(),
-  include_answers: z.boolean().optional()
-})
+const listInputSchema = z
+  .object({
+    app_key: z.string().min(1),
+    user_id: z.string().min(1).optional(),
+    page_num: z.number().int().positive().optional(),
+    page_size: z.number().int().positive().max(200).optional(),
+    mode: z
+      .enum([
+        "todo",
+        "done",
+        "mine_approved",
+        "mine_rejected",
+        "mine_draft",
+        "mine_need_improve",
+        "mine_processing",
+        "all",
+        "all_approved",
+        "all_rejected",
+        "all_processing",
+        "cc"
+      ])
+      .optional(),
+    type: z.number().int().min(1).max(12).optional(),
+    keyword: z.string().optional(),
+    query_logic: z.enum(["and", "or"]).optional(),
+    apply_ids: z.array(z.union([z.string(), z.number()])).optional(),
+    sort: z
+      .array(
+        z.object({
+          que_id: z.union([z.string().min(1), z.number().int()]),
+          ascend: z.boolean().optional()
+        })
+      )
+      .optional(),
+    filters: z
+      .array(
+        z.object({
+          que_id: z.union([z.string().min(1), z.number().int()]).optional(),
+          search_key: z.string().optional(),
+          search_keys: z.array(z.string()).optional(),
+          min_value: z.string().optional(),
+          max_value: z.string().optional(),
+          scope: z.number().int().optional(),
+          search_options: z.array(z.union([z.string(), z.number()])).optional(),
+          search_user_ids: z.array(z.string()).optional()
+        })
+      )
+      .optional(),
+    max_rows: z.number().int().positive().max(200).optional(),
+    max_items: z.number().int().positive().max(200).optional(),
+    max_columns: z.number().int().positive().max(200).optional(),
+    // Strict mode: callers must explicitly choose columns.
+    select_columns: z.array(z.union([z.string().min(1), z.number().int()])).min(1).max(200),
+    include_answers: z.boolean().optional()
+  })
+  .refine((value) => value.include_answers !== false, {
+    message: "include_answers=false is not allowed in strict column mode"
+  })
 
 const listOutputSchema = z.object({
   ok: z.literal(true),
@@ -268,7 +269,7 @@ const listOutputSchema = z.object({
         include_answers: z.boolean(),
         row_cap: z.number().int().nonnegative(),
         column_cap: z.number().int().positive().nullable(),
-        selected_columns: z.array(z.string()).nullable()
+        selected_columns: z.array(z.string())
       })
       .optional()
   }),
@@ -477,9 +478,7 @@ server.registerTool(
       const pageNum = args.page_num ?? 1
       const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
       const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
-      const includeAnswers = Boolean(
-        args.include_answers || (args.select_columns && args.select_columns.length > 0)
-      )
+      const includeAnswers = true
       const payload = buildListPayload({
         pageNum,
         pageSize,
@@ -511,6 +510,13 @@ server.registerTool(
         maxColumns: args.max_columns,
         selectColumns: args.select_columns
       })
+      if (items.length > 0 && columnProjection.matchedAnswersCount === 0) {
+        throw new Error(
+          `No answers matched select_columns (${args.select_columns
+            .map((item) => String(item))
+            .join(", ")}). Check que_id/title from qf_form_get.`
+        )
+      }
       const fitted = fitListItemsWithinSize({
         items: columnProjection.items,
         limitBytes: MAX_LIST_ITEMS_BYTES
@@ -1164,19 +1170,29 @@ function projectRecordItemsColumns(params: {
   items: Array<Record<string, unknown>>
   includeAnswers: boolean
   maxColumns?: number
-  selectColumns?: Array<string | number>
-}): { items: Array<Record<string, unknown>>; reason: string | null; selectedColumns: string[] | null } {
+  selectColumns: Array<string | number>
+}): {
+  items: Array<Record<string, unknown>>
+  reason: string | null
+  selectedColumns: string[]
+  matchedAnswersCount: number
+} {
   if (!params.includeAnswers) {
     return {
       items: params.items,
       reason: null,
-      selectedColumns: null
+      selectedColumns: [],
+      matchedAnswersCount: 0
     }
   }
 
   const normalizedSelectors = normalizeColumnSelectors(params.selectColumns)
+  if (normalizedSelectors.length === 0) {
+    throw new Error("select_columns must contain at least one non-empty column identifier")
+  }
   const selectorSet = new Set(normalizedSelectors.map((item) => normalizeColumnSelector(item)))
   let columnCapped = false
+  let matchedAnswersCount = 0
 
   const projectedItems = params.items.map((item) => {
     const answers = asArray(item.answers)
@@ -1190,6 +1206,7 @@ function projectRecordItemsColumns(params: {
       projected = projected.slice(0, params.maxColumns)
       columnCapped = true
     }
+    matchedAnswersCount += projected.length
 
     return {
       ...item,
@@ -1207,7 +1224,8 @@ function projectRecordItemsColumns(params: {
   return {
     items: projectedItems,
     reason,
-    selectedColumns: normalizedSelectors.length > 0 ? normalizedSelectors : null
+    selectedColumns: normalizedSelectors,
+    matchedAnswersCount
   }
 }
 
