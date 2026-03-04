@@ -66,7 +66,7 @@ const client = new QingflowClient({
 
 const server = new McpServer({
   name: "qingflow-mcp",
-  version: "0.2.0"
+  version: "0.2.6"
 })
 
 const jsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()])
@@ -164,7 +164,7 @@ const appsInputSchema = z.object({
   offset: z.number().int().nonnegative().optional()
 })
 
-const appsOutputSchema = z.object({
+const appsSuccessOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     total_apps: z.number().int().nonnegative(),
@@ -175,6 +175,7 @@ const appsOutputSchema = z.object({
   }),
   meta: apiMetaSchema
 })
+const appsOutputSchema = appsSuccessOutputSchema
 
 const formInputSchema = z.object({
   app_key: z.string().min(1),
@@ -183,7 +184,7 @@ const formInputSchema = z.object({
   include_raw: z.boolean().optional()
 })
 
-const formOutputSchema = z.object({
+const formSuccessOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     app_key: z.string(),
@@ -193,6 +194,7 @@ const formOutputSchema = z.object({
   }),
   meta: apiMetaSchema
 })
+const formOutputSchema = formSuccessOutputSchema
 
 const listInputSchema = z
   .object({
@@ -253,7 +255,7 @@ const listInputSchema = z
     message: "include_answers=false is not allowed in strict column mode"
   })
 
-const listOutputSchema = z.object({
+const listSuccessOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     app_key: z.string(),
@@ -275,6 +277,7 @@ const listOutputSchema = z.object({
   }),
   meta: apiMetaSchema
 })
+const listOutputSchema = listSuccessOutputSchema
 
 const recordGetInputSchema = z.object({
   apply_id: z.union([z.string().min(1), z.number().int()]),
@@ -286,7 +289,7 @@ const recordGetInputSchema = z.object({
     .optional()
 })
 
-const recordGetOutputSchema = z.object({
+const recordGetSuccessOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     apply_id: z.union([z.string(), z.number(), z.null()]),
@@ -301,6 +304,7 @@ const recordGetOutputSchema = z.object({
   }),
   meta: apiMetaSchema
 })
+const recordGetOutputSchema = recordGetSuccessOutputSchema
 
 const createInputSchema = z
   .object({
@@ -322,7 +326,7 @@ const createInputSchema = z
     message: "Either answers or fields is required"
   })
 
-const createOutputSchema = z.object({
+const createSuccessOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     request_id: z.string().nullable(),
@@ -331,6 +335,7 @@ const createOutputSchema = z.object({
   }),
   meta: apiMetaSchema
 })
+const createOutputSchema = createSuccessOutputSchema
 
 const updateInputSchema = z
   .object({
@@ -345,7 +350,7 @@ const updateInputSchema = z
     message: "Either answers or fields is required"
   })
 
-const updateOutputSchema = z.object({
+const updateSuccessOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     request_id: z.string().nullable(),
@@ -353,16 +358,157 @@ const updateOutputSchema = z.object({
   }),
   meta: apiMetaSchema
 })
+const updateOutputSchema = updateSuccessOutputSchema
 
 const operationInputSchema = z.object({
   request_id: z.string().min(1)
 })
 
-const operationOutputSchema = z.object({
+const operationSuccessOutputSchema = z.object({
   ok: z.literal(true),
   data: operationResultSchema,
   meta: apiMetaSchema
 })
+const operationOutputSchema = operationSuccessOutputSchema
+
+const queryInputSchema = z.object({
+  query_mode: z.enum(["auto", "list", "record", "summary"]).optional(),
+  app_key: z.string().min(1).optional(),
+  apply_id: z.union([z.string().min(1), z.number().int()]).optional(),
+  user_id: z.string().min(1).optional(),
+  page_num: z.number().int().positive().optional(),
+  page_size: z.number().int().positive().max(200).optional(),
+  mode: z
+    .enum([
+      "todo",
+      "done",
+      "mine_approved",
+      "mine_rejected",
+      "mine_draft",
+      "mine_need_improve",
+      "mine_processing",
+      "all",
+      "all_approved",
+      "all_rejected",
+      "all_processing",
+      "cc"
+    ])
+    .optional(),
+  type: z.number().int().min(1).max(12).optional(),
+  keyword: z.string().optional(),
+  query_logic: z.enum(["and", "or"]).optional(),
+  apply_ids: z.array(z.union([z.string(), z.number()])).optional(),
+  sort: z
+    .array(
+      z.object({
+        que_id: z.union([z.string().min(1), z.number().int()]),
+        ascend: z.boolean().optional()
+      })
+    )
+    .optional(),
+  filters: z
+    .array(
+      z.object({
+        que_id: z.union([z.string().min(1), z.number().int()]).optional(),
+        search_key: z.string().optional(),
+        search_keys: z.array(z.string()).optional(),
+        min_value: z.string().optional(),
+        max_value: z.string().optional(),
+        scope: z.number().int().optional(),
+        search_options: z.array(z.union([z.string(), z.number()])).optional(),
+        search_user_ids: z.array(z.string()).optional()
+      })
+    )
+    .optional(),
+  max_rows: z.number().int().positive().max(200).optional(),
+  max_items: z.number().int().positive().max(200).optional(),
+  max_columns: z.number().int().positive().max(200).optional(),
+  select_columns: z
+    .array(z.union([z.string().min(1), z.number().int()]))
+    .min(1)
+    .max(200)
+    .optional(),
+  include_answers: z.boolean().optional(),
+  amount_column: z.union([z.string().min(1), z.number().int()]).optional(),
+  time_range: z
+    .object({
+      column: z.union([z.string().min(1), z.number().int()]),
+      from: z.string().optional(),
+      to: z.string().optional(),
+      timezone: z.string().optional()
+    })
+    .optional(),
+  stat_policy: z
+    .object({
+      include_negative: z.boolean().optional(),
+      include_null: z.boolean().optional()
+    })
+    .optional(),
+  scan_max_pages: z.number().int().positive().max(500).optional()
+})
+
+const querySummaryOutputSchema = z.object({
+  summary: z.object({
+    total_count: z.number().int().nonnegative(),
+    total_amount: z.number().nullable(),
+    by_day: z.array(
+      z.object({
+        day: z.string(),
+        count: z.number().int().nonnegative(),
+        amount_total: z.number().nullable()
+      })
+    ),
+    missing_count: z.number().int().nonnegative()
+  }),
+  rows: z.array(z.record(z.unknown())),
+  meta: z.object({
+    field_mapping: z.array(
+      z.object({
+        role: z.enum(["row", "amount", "time"]),
+        requested: z.string(),
+        que_id: z.union([z.string(), z.number()]),
+        que_title: z.string().nullable(),
+        que_type: z.unknown()
+      })
+    ),
+    filters: z.object({
+      app_key: z.string(),
+      time_range: z
+        .object({
+          column: z.string(),
+          from: z.string().nullable(),
+          to: z.string().nullable(),
+          timezone: z.string()
+        })
+        .nullable()
+    }),
+    stat_policy: z.object({
+      include_negative: z.boolean(),
+      include_null: z.boolean()
+    }),
+    execution: z.object({
+      scanned_records: z.number().int().nonnegative(),
+      scanned_pages: z.number().int().nonnegative(),
+      truncated: z.boolean(),
+      row_cap: z.number().int().positive(),
+      column_cap: z.number().int().positive().nullable(),
+      scan_max_pages: z.number().int().positive()
+    })
+  })
+})
+
+const querySuccessOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    mode: z.enum(["list", "record", "summary"]),
+    source_tool: z.enum(["qf_records_list", "qf_record_get", "qf_records_summary"]),
+    list: listSuccessOutputSchema.shape.data.optional(),
+    record: recordGetSuccessOutputSchema.shape.data.optional(),
+    summary: querySummaryOutputSchema.optional()
+  }),
+  meta: apiMetaSchema
+})
+const queryOutputSchema = querySuccessOutputSchema
 
 server.registerTool(
   "qf_apps_list",
@@ -475,84 +621,8 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const pageNum = args.page_num ?? 1
-      const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
-      const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
-      const includeAnswers = true
-      const payload = buildListPayload({
-        pageNum,
-        pageSize,
-        mode: args.mode,
-        type: args.type,
-        keyword: args.keyword,
-        queryLogic: args.query_logic,
-        applyIds: args.apply_ids,
-        sort: normalizedSort,
-        filters: args.filters
-      })
-
-      const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
-      const result = asObject(response.result)
-      const rawItems = asArray(result?.result)
-      const listLimit = resolveListItemLimit({
-        total: rawItems.length,
-        requestedMaxRows: args.max_rows,
-        requestedMaxItems: args.max_items,
-        includeAnswers
-      })
-
-      const items = rawItems
-        .slice(0, listLimit.limit)
-        .map((raw) => normalizeRecordItem(raw, includeAnswers))
-      const columnProjection = projectRecordItemsColumns({
-        items,
-        includeAnswers,
-        maxColumns: args.max_columns,
-        selectColumns: args.select_columns
-      })
-      if (items.length > 0 && columnProjection.matchedAnswersCount === 0) {
-        throw new Error(
-          `No answers matched select_columns (${args.select_columns
-            .map((item) => String(item))
-            .join(", ")}). Check que_id/title from qf_form_get.`
-        )
-      }
-      const fitted = fitListItemsWithinSize({
-        items: columnProjection.items,
-        limitBytes: MAX_LIST_ITEMS_BYTES
-      })
-      const truncationReason = mergeTruncationReasons(
-        listLimit.reason,
-        columnProjection.reason,
-        fitted.reason
-      )
-      return okResult(
-        {
-          ok: true,
-          data: {
-            app_key: args.app_key,
-            pagination: {
-              page_num: toPositiveInt(result?.pageNum) ?? pageNum,
-              page_size: toPositiveInt(result?.pageSize) ?? pageSize,
-              page_amount: toNonNegativeInt(result?.pageAmount),
-              result_amount: toNonNegativeInt(result?.resultAmount) ?? fitted.items.length
-            },
-            items: fitted.items,
-            applied_limits: {
-              include_answers: includeAnswers,
-              row_cap: listLimit.limit,
-              column_cap: args.max_columns ?? null,
-              selected_columns: columnProjection.selectedColumns
-            }
-          },
-          meta: buildMeta(response)
-        },
-        buildRecordsListMessage({
-          returned: fitted.items.length,
-          total: rawItems.length,
-          truncationReason
-        })
-      )
+      const executed = await executeRecordsList(args)
+      return okResult(executed.payload, executed.message)
     } catch (error) {
       return errorResult(error)
     }
@@ -573,34 +643,77 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const response = await client.getRecord(String(args.apply_id))
-      const record = asObject(response.result) ?? {}
-      const projection = projectAnswersForOutput({
-        answers: asArray(record.answers),
-        maxColumns: args.max_columns,
-        selectColumns: args.select_columns
-      })
-      const projectedRecord: Record<string, unknown> = {
-        ...record,
-        answers: projection.answers
-      }
-      const answerCount = projection.answers.length
+      const executed = await executeRecordGet(args)
+      return okResult(executed.payload, executed.message)
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
 
+server.registerTool(
+  "qf_query",
+  {
+    title: "Qingflow Unified Query",
+    description:
+      "Unified read entry for list/record/summary. Use query_mode=auto to route automatically.",
+    inputSchema: queryInputSchema,
+    outputSchema: queryOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const routedMode = resolveQueryMode(args)
+
+      if (routedMode === "record") {
+        const recordArgs = buildRecordGetArgsFromQuery(args)
+        const executed = await executeRecordGet(recordArgs)
+        return okResult(
+          {
+            ok: true,
+            data: {
+              mode: "record",
+              source_tool: "qf_record_get",
+              record: executed.payload.data
+            },
+            meta: executed.payload.meta
+          },
+          executed.message
+        )
+      }
+
+      if (routedMode === "summary") {
+        const executed = await executeRecordsSummary(args)
+        return okResult(
+          {
+            ok: true,
+            data: {
+              mode: "summary",
+              source_tool: "qf_records_summary",
+              summary: executed.data
+            },
+            meta: executed.meta
+          },
+          executed.message
+        )
+      }
+
+      const listArgs = buildListArgsFromQuery(args)
+      const executed = await executeRecordsList(listArgs)
       return okResult(
         {
           ok: true,
           data: {
-            apply_id: (record.applyId as string | number | null | undefined) ?? null,
-            answer_count: answerCount,
-            record: projectedRecord,
-            applied_limits: {
-              column_cap: args.max_columns ?? null,
-              selected_columns: projection.selectedColumns
-            }
+            mode: "list",
+            source_tool: "qf_records_list",
+            list: executed.payload.data
           },
-          meta: buildMeta(response)
+          meta: executed.payload.meta
         },
-        `Fetched record ${String(args.apply_id)}`
+        executed.message
       )
     } catch (error) {
       return errorResult(error)
@@ -769,6 +882,589 @@ function buildMeta(response: QingflowResponse<unknown>) {
     provider_err_code: response.errCode,
     provider_err_msg: response.errMsg || null,
     base_url: baseUrl as string
+  }
+}
+
+function resolveQueryMode(args: z.infer<typeof queryInputSchema>): "list" | "record" | "summary" {
+  const requested = args.query_mode ?? "auto"
+  if (requested !== "auto") {
+    return requested
+  }
+
+  if (args.apply_id !== undefined) {
+    return "record"
+  }
+
+  if (
+    args.amount_column !== undefined ||
+    args.time_range !== undefined ||
+    args.stat_policy !== undefined ||
+    args.scan_max_pages !== undefined
+  ) {
+    return "summary"
+  }
+
+  return "list"
+}
+
+function buildListArgsFromQuery(args: z.infer<typeof queryInputSchema>): z.infer<typeof listInputSchema> {
+  if (!args.app_key) {
+    throw new Error("app_key is required for list query")
+  }
+  if (!args.select_columns?.length) {
+    throw new Error("select_columns is required for list query")
+  }
+
+  return listInputSchema.parse({
+    app_key: args.app_key,
+    user_id: args.user_id,
+    page_num: args.page_num,
+    page_size: args.page_size,
+    mode: args.mode,
+    type: args.type,
+    keyword: args.keyword,
+    query_logic: args.query_logic,
+    apply_ids: args.apply_ids,
+    sort: args.sort,
+    filters: args.filters,
+    max_rows: args.max_rows,
+    max_items: args.max_items,
+    max_columns: args.max_columns,
+    select_columns: args.select_columns,
+    include_answers: args.include_answers
+  })
+}
+
+function buildRecordGetArgsFromQuery(
+  args: z.infer<typeof queryInputSchema>
+): z.infer<typeof recordGetInputSchema> {
+  if (args.apply_id === undefined) {
+    throw new Error("apply_id is required for record query")
+  }
+
+  return recordGetInputSchema.parse({
+    apply_id: args.apply_id,
+    max_columns: args.max_columns,
+    select_columns: args.select_columns
+  })
+}
+
+async function executeRecordsList(
+  args: z.infer<typeof listInputSchema>
+): Promise<{ payload: z.infer<typeof listSuccessOutputSchema>; message: string }> {
+  const pageNum = args.page_num ?? 1
+  const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
+  const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
+  const includeAnswers = true
+  const payload = buildListPayload({
+    pageNum,
+    pageSize,
+    mode: args.mode,
+    type: args.type,
+    keyword: args.keyword,
+    queryLogic: args.query_logic,
+    applyIds: args.apply_ids,
+    sort: normalizedSort,
+    filters: args.filters
+  })
+
+  const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
+  const result = asObject(response.result)
+  const rawItems = asArray(result?.result)
+  const listLimit = resolveListItemLimit({
+    total: rawItems.length,
+    requestedMaxRows: args.max_rows,
+    requestedMaxItems: args.max_items,
+    includeAnswers
+  })
+
+  const items = rawItems
+    .slice(0, listLimit.limit)
+    .map((raw) => normalizeRecordItem(raw, includeAnswers))
+  const columnProjection = projectRecordItemsColumns({
+    items,
+    includeAnswers,
+    maxColumns: args.max_columns,
+    selectColumns: args.select_columns
+  })
+  if (items.length > 0 && columnProjection.matchedAnswersCount === 0) {
+    throw new Error(
+      `No answers matched select_columns (${args.select_columns
+        .map((item) => String(item))
+        .join(", ")}). Check que_id/title from qf_form_get.`
+    )
+  }
+  const fitted = fitListItemsWithinSize({
+    items: columnProjection.items,
+    limitBytes: MAX_LIST_ITEMS_BYTES
+  })
+  const truncationReason = mergeTruncationReasons(listLimit.reason, columnProjection.reason, fitted.reason)
+  const responsePayload: z.infer<typeof listSuccessOutputSchema> = {
+    ok: true,
+    data: {
+      app_key: args.app_key,
+      pagination: {
+        page_num: toPositiveInt(result?.pageNum) ?? pageNum,
+        page_size: toPositiveInt(result?.pageSize) ?? pageSize,
+        page_amount: toNonNegativeInt(result?.pageAmount),
+        result_amount: toNonNegativeInt(result?.resultAmount) ?? fitted.items.length
+      },
+      items: fitted.items as z.infer<typeof recordItemSchema>[],
+      applied_limits: {
+        include_answers: includeAnswers,
+        row_cap: listLimit.limit,
+        column_cap: args.max_columns ?? null,
+        selected_columns: columnProjection.selectedColumns
+      }
+    },
+    meta: buildMeta(response)
+  }
+
+  return {
+    payload: responsePayload,
+    message: buildRecordsListMessage({
+      returned: fitted.items.length,
+      total: rawItems.length,
+      truncationReason
+    })
+  }
+}
+
+async function executeRecordGet(
+  args: z.infer<typeof recordGetInputSchema>
+): Promise<{ payload: z.infer<typeof recordGetSuccessOutputSchema>; message: string }> {
+  const response = await client.getRecord(String(args.apply_id))
+  const record = asObject(response.result) ?? {}
+  const projection = projectAnswersForOutput({
+    answers: asArray(record.answers),
+    maxColumns: args.max_columns,
+    selectColumns: args.select_columns
+  })
+  const projectedRecord: Record<string, unknown> = {
+    ...record,
+    answers: projection.answers
+  }
+  const answerCount = projection.answers.length
+
+  return {
+    payload: {
+      ok: true,
+      data: {
+        apply_id: (record.applyId as string | number | null | undefined) ?? null,
+        answer_count: answerCount,
+        record: projectedRecord,
+        applied_limits: {
+          column_cap: args.max_columns ?? null,
+          selected_columns: projection.selectedColumns
+        }
+      },
+      meta: buildMeta(response)
+    },
+    message: `Fetched record ${String(args.apply_id)}`
+  }
+}
+
+interface SummaryColumn {
+  requested: string
+  que_id: string | number
+  que_title: string | null
+  que_type: unknown
+}
+
+async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Promise<{
+  data: z.infer<typeof querySummaryOutputSchema>
+  meta: ReturnType<typeof buildMeta>
+  message: string
+}> {
+  if (!args.app_key) {
+    throw new Error("app_key is required for summary query")
+  }
+  if (!args.select_columns?.length) {
+    throw new Error("select_columns is required for summary query")
+  }
+
+  const includeNegative = args.stat_policy?.include_negative ?? true
+  const includeNull = args.stat_policy?.include_null ?? false
+  const scanMaxPages = args.scan_max_pages ?? 50
+  const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
+  const rowCap = Math.min(args.max_rows ?? DEFAULT_PAGE_SIZE, 200)
+  const timezone = args.time_range?.timezone ?? "Asia/Shanghai"
+
+  const form = await getFormCached(args.app_key, args.user_id, false)
+  const index = buildFieldIndex(form.result)
+  const selectedColumns = resolveSummaryColumns(args.select_columns, index, "select_columns")
+  const effectiveColumns =
+    args.max_columns !== undefined ? selectedColumns.slice(0, args.max_columns) : selectedColumns
+
+  if (effectiveColumns.length === 0) {
+    throw new Error("No output columns remain after max_columns cap")
+  }
+
+  const amountColumn =
+    args.amount_column !== undefined
+      ? resolveSummaryColumn(args.amount_column, index, "amount_column")
+      : null
+  const timeColumn = args.time_range ? resolveSummaryColumn(args.time_range.column, index, "time_range.column") : null
+
+  const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
+  const summaryFilters = [...(args.filters ?? [])]
+  if (timeColumn && (args.time_range?.from || args.time_range?.to)) {
+    summaryFilters.push({
+      que_id: timeColumn.que_id,
+      ...(args.time_range.from ? { min_value: args.time_range.from } : {}),
+      ...(args.time_range.to ? { max_value: args.time_range.to } : {})
+    })
+  }
+
+  let currentPage = args.page_num ?? 1
+  let scannedPages = 0
+  let scannedRecords = 0
+  let truncated = false
+  let summaryMeta: ReturnType<typeof buildMeta> | null = null
+  let totalAmount = 0
+  let missingCount = 0
+
+  const rows: Array<Record<string, unknown>> = []
+  const byDay = new Map<string, { count: number; amount: number }>()
+
+  while (true) {
+    const payload = buildListPayload({
+      pageNum: currentPage,
+      pageSize,
+      mode: args.mode,
+      type: args.type,
+      keyword: args.keyword,
+      queryLogic: args.query_logic,
+      applyIds: args.apply_ids,
+      sort: normalizedSort,
+      filters: summaryFilters
+    })
+    const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
+    summaryMeta = summaryMeta ?? buildMeta(response)
+    scannedPages += 1
+
+    const result = asObject(response.result)
+    const rawItems = asArray(result?.result)
+    const pageAmount = toPositiveInt(result?.pageAmount)
+    const hasMoreByAmount = pageAmount !== null ? currentPage < pageAmount : rawItems.length === pageSize
+
+    for (const rawItem of rawItems) {
+      const record = asObject(rawItem) ?? {}
+      const answers = asArray(record.answers)
+      scannedRecords += 1
+
+      if (rows.length < rowCap) {
+        rows.push(buildSummaryRow(answers, effectiveColumns))
+      }
+
+      let amountContribution = 0
+      let hasAmountContribution = false
+      if (amountColumn) {
+        const amountValue = extractSummaryColumnValue(answers, amountColumn)
+        const numericAmount = toFiniteAmount(amountValue)
+
+        if (numericAmount === null) {
+          if (!includeNull) {
+            missingCount += 1
+          } else {
+            hasAmountContribution = true
+          }
+        } else if (includeNegative || numericAmount >= 0) {
+          amountContribution = numericAmount
+          hasAmountContribution = true
+        }
+      }
+
+      if (hasAmountContribution) {
+        totalAmount += amountContribution
+      }
+
+      const dayKey = timeColumn
+        ? toDayBucket(extractSummaryColumnValue(answers, timeColumn), timezone)
+        : "all"
+      const bucket = byDay.get(dayKey) ?? { count: 0, amount: 0 }
+      bucket.count += 1
+      if (amountColumn && hasAmountContribution) {
+        bucket.amount += amountContribution
+      }
+      byDay.set(dayKey, bucket)
+    }
+
+    if (!hasMoreByAmount) {
+      break
+    }
+
+    if (scannedPages >= scanMaxPages) {
+      truncated = true
+      break
+    }
+
+    currentPage += 1
+  }
+
+  const byDayStats = Array.from(byDay.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([day, bucket]) => ({
+      day,
+      count: bucket.count,
+      amount_total: amountColumn ? bucket.amount : null
+    }))
+
+  const fieldMapping = [
+    ...effectiveColumns.map((item) => ({
+      role: "row" as const,
+      requested: item.requested,
+      que_id: item.que_id,
+      que_title: item.que_title,
+      que_type: item.que_type
+    })),
+    ...(amountColumn
+      ? [
+          {
+            role: "amount" as const,
+            requested: amountColumn.requested,
+            que_id: amountColumn.que_id,
+            que_title: amountColumn.que_title,
+            que_type: amountColumn.que_type
+          }
+        ]
+      : []),
+    ...(timeColumn
+      ? [
+          {
+            role: "time" as const,
+            requested: timeColumn.requested,
+            que_id: timeColumn.que_id,
+            que_title: timeColumn.que_title,
+            que_type: timeColumn.que_type
+          }
+        ]
+      : [])
+  ]
+
+  if (!summaryMeta) {
+    throw new Error("Failed to build summary metadata")
+  }
+
+  return {
+    data: {
+      summary: {
+        total_count: scannedRecords,
+        total_amount: amountColumn ? totalAmount : null,
+        by_day: byDayStats,
+        missing_count: missingCount
+      },
+      rows,
+      meta: {
+        field_mapping: fieldMapping,
+        filters: {
+          app_key: args.app_key,
+          time_range: timeColumn
+            ? {
+                column: timeColumn.requested,
+                from: args.time_range?.from ?? null,
+                to: args.time_range?.to ?? null,
+                timezone
+              }
+            : null
+        },
+        stat_policy: {
+          include_negative: includeNegative,
+          include_null: includeNull
+        },
+        execution: {
+          scanned_records: scannedRecords,
+          scanned_pages: scannedPages,
+          truncated,
+          row_cap: rowCap,
+          column_cap: args.max_columns ?? null,
+          scan_max_pages: scanMaxPages
+        }
+      }
+    },
+    meta: summaryMeta,
+    message: `Summarized ${scannedRecords} records`
+  }
+}
+
+function resolveSummaryColumns(
+  columns: Array<string | number>,
+  index: FieldIndex,
+  label: string
+): SummaryColumn[] {
+  return normalizeColumnSelectors(columns).map((requested) =>
+    resolveSummaryColumn(requested, index, label)
+  )
+}
+
+function resolveSummaryColumn(
+  column: string | number,
+  index: FieldIndex,
+  label: string
+): SummaryColumn {
+  const requested = String(column).trim()
+  if (!requested) {
+    throw new Error(`${label} contains an empty column selector`)
+  }
+
+  if (isNumericKey(requested)) {
+    const hit = index.byId.get(String(Number(requested)))
+    if (!hit) {
+      throw new Error(`${label} references unknown que_id "${requested}"`)
+    }
+    return {
+      requested,
+      que_id: normalizeQueId(hit.queId),
+      que_title: asNullableString(hit.queTitle),
+      que_type: hit.queType
+    }
+  }
+
+  const hit = resolveFieldByKey(requested, index)
+  if (!hit || hit.queId === undefined || hit.queId === null) {
+    throw new Error(`${label} cannot resolve field "${requested}"`)
+  }
+
+  return {
+    requested,
+    que_id: normalizeQueId(hit.queId),
+    que_title: asNullableString(hit.queTitle),
+    que_type: hit.queType
+  }
+}
+
+function buildSummaryRow(answers: unknown[], columns: SummaryColumn[]): Record<string, unknown> {
+  const row: Record<string, unknown> = {}
+  for (const column of columns) {
+    row[column.requested] = extractSummaryColumnValue(answers, column)
+  }
+  return row
+}
+
+function extractSummaryColumnValue(answers: unknown[], column: SummaryColumn): unknown {
+  const targetId = normalizeColumnSelector(String(column.que_id))
+  const targetTitle = column.que_title ? normalizeColumnSelector(column.que_title) : null
+
+  for (const answerRaw of answers) {
+    const answer = asObject(answerRaw)
+    if (!answer) {
+      continue
+    }
+
+    const answerQueId = asNullableString(answer.queId)
+    if (answerQueId && normalizeColumnSelector(answerQueId) === targetId) {
+      return extractAnswerDisplayValue(answer)
+    }
+
+    if (targetTitle) {
+      const answerQueTitle = asNullableString(answer.queTitle)
+      if (answerQueTitle && normalizeColumnSelector(answerQueTitle) === targetTitle) {
+        return extractAnswerDisplayValue(answer)
+      }
+    }
+  }
+
+  return null
+}
+
+function extractAnswerDisplayValue(answer: Record<string, unknown>): unknown {
+  const tableValues = answer.tableValues ?? answer.table_values
+  if (tableValues !== undefined) {
+    return tableValues
+  }
+
+  const values = asArray(answer.values)
+  if (values.length === 0) {
+    return null
+  }
+
+  const normalized = values.map((item) => extractAnswerValueCell(item))
+  return normalized.length === 1 ? normalized[0] : normalized
+}
+
+function extractAnswerValueCell(value: unknown): unknown {
+  const obj = asObject(value)
+  if (!obj) {
+    return value
+  }
+
+  if (obj.dataValue !== undefined) {
+    return obj.dataValue
+  }
+  if (obj.value !== undefined) {
+    return obj.value
+  }
+  if (obj.valueStr !== undefined) {
+    return obj.valueStr
+  }
+  return obj
+}
+
+function toFiniteAmount(value: unknown): number | null {
+  if (value === null || value === undefined) {
+    return null
+  }
+  if (Array.isArray(value)) {
+    if (value.length !== 1) {
+      return null
+    }
+    return toFiniteAmount(value[0])
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value
+  }
+  if (typeof value === "string") {
+    const normalized = value.replace(/,/g, "").trim()
+    if (!normalized) {
+      return null
+    }
+    const parsed = Number(normalized)
+    if (Number.isFinite(parsed)) {
+      return parsed
+    }
+  }
+  return null
+}
+
+function toDayBucket(value: unknown, timezone: string): string {
+  const first = Array.isArray(value) ? value[0] : value
+  if (first === null || first === undefined) {
+    return "unknown"
+  }
+
+  if (typeof first === "string") {
+    const trimmed = first.trim()
+    const direct = trimmed.match(/^(\d{4}-\d{2}-\d{2})/)
+    if (direct) {
+      return direct[1]
+    }
+    const parsed = new Date(trimmed)
+    if (!Number.isNaN(parsed.getTime())) {
+      return formatDateBucket(parsed, timezone)
+    }
+    return "unknown"
+  }
+
+  if (typeof first === "number") {
+    const parsed = new Date(first)
+    if (!Number.isNaN(parsed.getTime())) {
+      return formatDateBucket(parsed, timezone)
+    }
+  }
+
+  return "unknown"
+}
+
+function formatDateBucket(value: Date, timezone: string): string {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).format(value)
+  } catch {
+    return value.toISOString().slice(0, 10)
   }
 }
 
@@ -1377,7 +2073,7 @@ function errorResult(error: unknown) {
   const payload = toErrorPayload(error)
   return {
     isError: true,
-    structuredContent: payload,
+    // Keep error payload in text to avoid outputSchema(success) validation conflicts across MCP clients.
     content: [
       {
         type: "text" as const,

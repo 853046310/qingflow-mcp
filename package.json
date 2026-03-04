@@ -1,6 +1,6 @@
 {
   "name": "qingflow-mcp",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "private": false,
   "license": "MIT",
   "type": "module",
@@ -31,6 +31,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test \"test/*.test.js\"",
     "dev": "tsx src/server.ts",
     "start": "node dist/server.js",
     "prepublishOnly": "npm run build"

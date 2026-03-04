@@ -6,6 +6,7 @@ This MCP server wraps Qingflow OpenAPI for:
 - `qf_form_get`
 - `qf_records_list`
 - `qf_record_get`
+- `qf_query` (unified read entry: list / record / summary)
 - `qf_record_create`
 - `qf_record_update`
 - `qf_operation_get`
@@ -50,6 +51,12 @@ Build and run:
 ```bash
 npm run build
 npm start
+```
+
+Run tests:
+
+```bash
+npm test
 ```
 
 ## CLI Install
@@ -102,6 +109,27 @@ MCP client config example:
 2. `qf_form_get` to inspect field ids/titles.
 3. `qf_record_create` or `qf_record_update`.
 4. If create/update returns only `request_id`, call `qf_operation_get` to resolve async result.
+
+## Unified Query (`qf_query`)
+
+`qf_query` is the recommended read entry for agents.
+
+1. `query_mode=auto`:
+   - if `apply_id` is set, route to single-record query.
+   - if summary params are set (`amount_column` / `time_range` / `stat_policy` / `scan_max_pages`), route to summary query.
+   - otherwise route to list query.
+2. `query_mode=list|record|summary` forces explicit behavior.
+
+Summary mode output:
+
+1. `summary`: aggregated stats (`total_count`, `total_amount`, `by_day`, `missing_count`).
+2. `rows`: strict column rows (only requested `select_columns`).
+3. `meta`: field mapping, filter scope, stat policy, execution limits.
+
+Return shape:
+
+1. success: structured payload `{ "ok": true, "data": ..., "meta": ... }`
+2. failure: MCP `isError=true`, and text content is JSON payload like `{ "ok": false, "message": ..., ... }`
 
 ## List Query Tips
 
