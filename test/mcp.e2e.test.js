@@ -698,6 +698,26 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(queryRecord.data.record.apply_id, "5001")
   })
 
+  await t.test("qf_query list mode applies time_range as filter", async () => {
+    const queryList = await callTool(mcp.client, "qf_query", {
+      query_mode: "list",
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: 20,
+      select_columns: [1001],
+      time_range: {
+        column: 1003,
+        from: "2026-01-02",
+        to: "2026-01-02"
+      }
+    })
+
+    assert.equal(queryList.ok, true)
+    assert.equal(queryList.data.mode, "list")
+    assert.equal(queryList.data.list.pagination.result_amount, 2)
+    assert.equal(queryList.data.list.items.length, 2)
+  })
+
   await t.test("qf_query summary returns computed aggregates + strict rows", async () => {
     const summary = await callTool(mcp.client, "qf_query", {
       query_mode: "summary",

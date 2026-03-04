@@ -119,6 +119,7 @@ MCP client config example:
    - if summary params are set (`amount_column` / `time_range` / `stat_policy` / `scan_max_pages`), route to summary query.
    - otherwise route to list query.
 2. `query_mode=list|record|summary` forces explicit behavior.
+3. In `list` mode, `time_range` is translated to list filters when `from` or `to` is provided.
 
 Summary mode output:
 

@@ -66,7 +66,7 @@ const client = new QingflowClient({
 
 const server = new McpServer({
   name: "qingflow-mcp",
-  version: "0.2.6"
+  version: "0.2.7"
 })
 
 const jsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()])
@@ -915,6 +915,8 @@ function buildListArgsFromQuery(args: z.infer<typeof queryInputSchema>): z.infer
     throw new Error("select_columns is required for list query")
   }
 
+  const filters = buildListFiltersFromQuery(args)
+
   return listInputSchema.parse({
     app_key: args.app_key,
     user_id: args.user_id,
@@ -926,13 +928,45 @@ function buildListArgsFromQuery(args: z.infer<typeof queryInputSchema>): z.infer
     query_logic: args.query_logic,
     apply_ids: args.apply_ids,
     sort: args.sort,
-    filters: args.filters,
+    filters,
     max_rows: args.max_rows,
     max_items: args.max_items,
     max_columns: args.max_columns,
     select_columns: args.select_columns,
     include_answers: args.include_answers
   })
+}
+
+function buildListFiltersFromQuery(
+  args: z.infer<typeof queryInputSchema>
+): z.infer<typeof listInputSchema>["filters"] {
+  const filters = [...(args.filters ?? [])]
+  const timeRange = args.time_range
+  if (!timeRange) {
+    return filters.length > 0 ? filters : undefined
+  }
+
+  if (timeRange.from === undefined && timeRange.to === undefined) {
+    return filters.length > 0 ? filters : undefined
+  }
+
+  const timeSelector = normalizeColumnSelector(timeRange.column)
+  const alreadyHasTimeFilter = filters.some((item) => {
+    if (item.que_id === undefined) {
+      return false
+    }
+    return normalizeColumnSelector(item.que_id) === timeSelector
+  })
+
+  if (!alreadyHasTimeFilter) {
+    filters.push({
+      que_id: timeRange.column,
+      ...(timeRange.from !== undefined ? { min_value: timeRange.from } : {}),
+      ...(timeRange.to !== undefined ? { max_value: timeRange.to } : {})
+    })
+  }
+
+  return filters.length > 0 ? filters : undefined
 }
 
 function buildRecordGetArgsFromQuery(
