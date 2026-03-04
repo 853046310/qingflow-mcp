@@ -107,8 +107,24 @@ MCP client config example:
 
 1. For `qf_records_list.sort[].que_id`, use a real field `que_id` (numeric) or exact field title from `qf_form_get`.
 2. Avoid aliases like `create_time`; Qingflow often rejects them.
-3. When `include_answers=true`, the server auto-limits returned items to protect MCP context size.
-4. You can override item count with `max_items` in `qf_records_list`.
+3. Use `max_rows` (or `max_items`) to cap returned rows.
+4. Use `max_columns` to cap answers per row when `include_answers=true`.
+5. Use `select_columns` to return only specific columns (supports `que_id` or exact field title).
+6. When `include_answers=true`, the server still auto-limits by response size to protect MCP context.
+
+Example:
+
+```json
+{
+  "app_key": "your_app_key",
+  "mode": "all",
+  "page_size": 50,
+  "include_answers": true,
+  "max_rows": 10,
+  "max_columns": 5,
+  "select_columns": [1, "客户名称", "1003"]
+}
+```
 
 Optional env vars:
 

@@ -241,7 +241,14 @@ const listInputSchema = z.object({
       })
     )
     .optional(),
+  max_rows: z.number().int().positive().max(200).optional(),
   max_items: z.number().int().positive().max(200).optional(),
+  max_columns: z.number().int().positive().max(200).optional(),
+  select_columns: z
+    .array(z.union([z.string().min(1), z.number().int()]))
+    .min(1)
+    .max(200)
+    .optional(),
   include_answers: z.boolean().optional()
 })
 
@@ -255,7 +262,15 @@ const listOutputSchema = z.object({
       page_amount: z.number().int().nonnegative().nullable(),
       result_amount: z.number().int().nonnegative()
     }),
-    items: z.array(recordItemSchema)
+    items: z.array(recordItemSchema),
+    applied_limits: z
+      .object({
+        include_answers: z.boolean(),
+        row_cap: z.number().int().nonnegative(),
+        column_cap: z.number().int().positive().nullable(),
+        selected_columns: z.array(z.string()).nullable()
+      })
+      .optional()
   }),
   meta: apiMetaSchema
 })
@@ -450,6 +465,9 @@ server.registerTool(
       const pageNum = args.page_num ?? 1
       const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
       const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
+      const includeAnswers = Boolean(
+        args.include_answers || (args.select_columns && args.select_columns.length > 0)
+      )
       const payload = buildListPayload({
         pageNum,
         pageSize,
@@ -465,9 +483,9 @@ server.registerTool(
       const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
       const result = asObject(response.result)
       const rawItems = asArray(result?.result)
-      const includeAnswers = Boolean(args.include_answers)
       const listLimit = resolveListItemLimit({
         total: rawItems.length,
+        requestedMaxRows: args.max_rows,
         requestedMaxItems: args.max_items,
         includeAnswers
       })
@@ -475,11 +493,21 @@ server.registerTool(
       const items = rawItems
         .slice(0, listLimit.limit)
         .map((raw) => normalizeRecordItem(raw, includeAnswers))
-      const fitted = fitListItemsWithinSize({
+      const columnProjection = projectRecordItemsColumns({
         items,
+        includeAnswers,
+        maxColumns: args.max_columns,
+        selectColumns: args.select_columns
+      })
+      const fitted = fitListItemsWithinSize({
+        items: columnProjection.items,
         limitBytes: MAX_LIST_ITEMS_BYTES
       })
-      const truncationReason = mergeTruncationReasons(listLimit.reason, fitted.reason)
+      const truncationReason = mergeTruncationReasons(
+        listLimit.reason,
+        columnProjection.reason,
+        fitted.reason
+      )
       return okResult(
         {
           ok: true,
@@ -491,7 +519,13 @@ server.registerTool(
               page_amount: toNonNegativeInt(result?.pageAmount),
               result_amount: toNonNegativeInt(result?.resultAmount) ?? fitted.items.length
             },
-            items: fitted.items
+            items: fitted.items,
+            applied_limits: {
+              include_answers: includeAnswers,
+              row_cap: listLimit.limit,
+              column_cap: args.max_columns ?? null,
+              selected_columns: columnProjection.selectedColumns
+            }
           },
           meta: buildMeta(response)
         },
@@ -1062,6 +1096,7 @@ async function normalizeListSort(
 
 function resolveListItemLimit(params: {
   total: number
+  requestedMaxRows?: number
   requestedMaxItems?: number
   includeAnswers: boolean
 }): { limit: number; reason: string | null } {
@@ -1069,12 +1104,22 @@ function resolveListItemLimit(params: {
     return { limit: 0, reason: null }
   }
 
+  const explicitLimits: Array<{ name: string; value: number }> = []
+  if (params.requestedMaxRows !== undefined) {
+    explicitLimits.push({ name: "max_rows", value: params.requestedMaxRows })
+  }
   if (params.requestedMaxItems !== undefined) {
-    const limit = Math.min(params.total, params.requestedMaxItems)
+    explicitLimits.push({ name: "max_items", value: params.requestedMaxItems })
+  }
+
+  if (explicitLimits.length > 0) {
+    const limit = Math.min(params.total, ...explicitLimits.map((item) => item.value))
     if (limit < params.total) {
       return {
         limit,
-        reason: `limited by max_items=${params.requestedMaxItems}`
+        reason: `limited by ${explicitLimits
+          .map((item) => `${item.name}=${item.value}`)
+          .join(", ")} (effective=${limit})`
       }
     }
     return { limit, reason: null }
@@ -1088,6 +1133,57 @@ function resolveListItemLimit(params: {
   }
 
   return { limit: params.total, reason: null }
+}
+
+function projectRecordItemsColumns(params: {
+  items: Array<Record<string, unknown>>
+  includeAnswers: boolean
+  maxColumns?: number
+  selectColumns?: Array<string | number>
+}): { items: Array<Record<string, unknown>>; reason: string | null; selectedColumns: string[] | null } {
+  if (!params.includeAnswers) {
+    return {
+      items: params.items,
+      reason: null,
+      selectedColumns: null
+    }
+  }
+
+  const normalizedSelectors = normalizeColumnSelectors(params.selectColumns)
+  const selectorSet = new Set(normalizedSelectors.map((item) => normalizeColumnSelector(item)))
+  let columnCapped = false
+
+  const projectedItems = params.items.map((item) => {
+    const answers = asArray(item.answers)
+    let projected = answers
+
+    if (selectorSet.size > 0) {
+      projected = answers.filter((answer) => answerMatchesAnySelector(answer, selectorSet))
+    }
+
+    if (params.maxColumns !== undefined && projected.length > params.maxColumns) {
+      projected = projected.slice(0, params.maxColumns)
+      columnCapped = true
+    }
+
+    return {
+      ...item,
+      answers: projected
+    }
+  })
+
+  const reason = mergeTruncationReasons(
+    selectorSet.size > 0 ? `selected columns=${normalizedSelectors.length}` : null,
+    columnCapped && params.maxColumns !== undefined
+      ? `limited to max_columns=${params.maxColumns}`
+      : null
+  )
+
+  return {
+    items: projectedItems,
+    reason,
+    selectedColumns: normalizedSelectors.length > 0 ? normalizedSelectors : null
+  }
 }
 
 function fitListItemsWithinSize(params: {
@@ -1130,6 +1226,51 @@ function buildRecordsListMessage(params: {
     return `Fetched ${params.returned} records`
   }
   return `Fetched ${params.returned}/${params.total} records (${params.truncationReason})`
+}
+
+function normalizeColumnSelectors(selectColumns?: Array<string | number>): string[] {
+  if (!selectColumns?.length) {
+    return []
+  }
+
+  const deduped = new Set<string>()
+  for (const value of selectColumns) {
+    const normalized = String(value).trim()
+    if (!normalized) {
+      continue
+    }
+    deduped.add(normalized)
+  }
+  return Array.from(deduped)
+}
+
+function normalizeColumnSelector(value: string | number): string {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return `id:${Math.trunc(value)}`
+  }
+
+  const normalized = String(value).trim()
+  if (!normalized) {
+    return "title:"
+  }
+  if (isNumericKey(normalized)) {
+    return `id:${Number(normalized)}`
+  }
+  return `title:${normalized.toLowerCase()}`
+}
+
+function answerMatchesAnySelector(answer: unknown, selectorSet: Set<string>): boolean {
+  const obj = asObject(answer)
+  if (!obj) {
+    return false
+  }
+
+  const candidates = [
+    normalizeColumnSelector(asNullableString(obj.queId) ?? ""),
+    normalizeColumnSelector(asNullableString(obj.queTitle) ?? "")
+  ]
+
+  return candidates.some((candidate) => selectorSet.has(candidate))
 }
 
 function normalizeQueId(queId: unknown): string | number {
