@@ -276,7 +276,13 @@ const listOutputSchema = z.object({
 })
 
 const recordGetInputSchema = z.object({
-  apply_id: z.union([z.string().min(1), z.number().int()])
+  apply_id: z.union([z.string().min(1), z.number().int()]),
+  max_columns: z.number().int().positive().max(200).optional(),
+  select_columns: z
+    .array(z.union([z.string().min(1), z.number().int()]))
+    .min(1)
+    .max(200)
+    .optional()
 })
 
 const recordGetOutputSchema = z.object({
@@ -284,7 +290,13 @@ const recordGetOutputSchema = z.object({
   data: z.object({
     apply_id: z.union([z.string(), z.number(), z.null()]),
     answer_count: z.number().int().nonnegative(),
-    record: z.unknown()
+    record: z.unknown(),
+    applied_limits: z
+      .object({
+        column_cap: z.number().int().positive().nullable(),
+        selected_columns: z.array(z.string()).nullable()
+      })
+      .optional()
   }),
   meta: apiMetaSchema
 })
@@ -557,7 +569,16 @@ server.registerTool(
     try {
       const response = await client.getRecord(String(args.apply_id))
       const record = asObject(response.result) ?? {}
-      const answerCount = asArray(record.answers).length
+      const projection = projectAnswersForOutput({
+        answers: asArray(record.answers),
+        maxColumns: args.max_columns,
+        selectColumns: args.select_columns
+      })
+      const projectedRecord: Record<string, unknown> = {
+        ...record,
+        answers: projection.answers
+      }
+      const answerCount = projection.answers.length
 
       return okResult(
         {
@@ -565,7 +586,11 @@ server.registerTool(
           data: {
             apply_id: (record.applyId as string | number | null | undefined) ?? null,
             answer_count: answerCount,
-            record: response.result
+            record: projectedRecord,
+            applied_limits: {
+              column_cap: args.max_columns ?? null,
+              selected_columns: projection.selectedColumns
+            }
           },
           meta: buildMeta(response)
         },
@@ -1182,6 +1207,29 @@ function projectRecordItemsColumns(params: {
   return {
     items: projectedItems,
     reason,
+    selectedColumns: normalizedSelectors.length > 0 ? normalizedSelectors : null
+  }
+}
+
+function projectAnswersForOutput(params: {
+  answers: unknown[]
+  maxColumns?: number
+  selectColumns?: Array<string | number>
+}): { answers: unknown[]; selectedColumns: string[] | null } {
+  const normalizedSelectors = normalizeColumnSelectors(params.selectColumns)
+  const selectorSet = new Set(normalizedSelectors.map((item) => normalizeColumnSelector(item)))
+  let projected = params.answers
+
+  if (selectorSet.size > 0) {
+    projected = projected.filter((answer) => answerMatchesAnySelector(answer, selectorSet))
+  }
+
+  if (params.maxColumns !== undefined && projected.length > params.maxColumns) {
+    projected = projected.slice(0, params.maxColumns)
+  }
+
+  return {
+    answers: projected,
     selectedColumns: normalizedSelectors.length > 0 ? normalizedSelectors : null
   }
 }

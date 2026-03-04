@@ -126,6 +126,16 @@ Example:
 }
 ```
 
+For single record details (`qf_record_get`), the same column controls are supported:
+
+```json
+{
+  "apply_id": "497600278750478338",
+  "max_columns": 5,
+  "select_columns": [1, "客户名称"]
+}
+```
+
 Optional env vars:
 
 ```bash
