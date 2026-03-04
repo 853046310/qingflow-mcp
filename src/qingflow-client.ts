@@ -153,10 +153,11 @@ export class QingflowClient {
     const url = new URL(params.path, this.baseUrl)
     appendQuery(url, options.query)
 
-    const headers = new Headers()
-    headers.set("accessToken", this.accessToken)
+    const headers: Record<string, string> = {
+      accessToken: this.accessToken
+    }
     if (options.userId) {
-      headers.set("userId", options.userId)
+      headers.userId = options.userId
     }
 
     const init: RequestInit = {
@@ -165,7 +166,7 @@ export class QingflowClient {
     }
 
     if (options.body !== undefined) {
-      headers.set("content-type", "application/json")
+      headers["content-type"] = "application/json"
       init.body = JSON.stringify(options.body)
     }
 
@@ -174,7 +175,7 @@ export class QingflowClient {
     init.signal = controller.signal
 
     try {
-      const response = await fetch(url, init)
+      const response = await getFetch()(url, init)
       const text = await response.text()
       const data = safeJsonParse(text)
 
@@ -343,4 +344,15 @@ function toFiniteNumber(value: unknown): number | null {
     }
   }
   return null
+}
+
+function getFetch(): typeof fetch {
+  const runtimeFetch = globalThis.fetch
+  if (typeof runtimeFetch === "function") {
+    return runtimeFetch.bind(globalThis) as typeof fetch
+  }
+
+  throw new QingflowApiError({
+    message: "Global fetch is not available. Use Node.js >= 18."
+  })
 }

@@ -14,6 +14,10 @@ It intentionally excludes delete for now.
 
 ## Setup
 
+Runtime requirement:
+
+- Node.js `>=18`
+
 1. Install dependencies:
 
 ```bash
@@ -54,6 +58,12 @@ Global install from GitHub:
 
 ```bash
 npm i -g git+https://github.com/853046310/qingflow-mcp.git
+```
+
+Install latest from npm:
+
+```bash
+npm i -g qingflow-mcp@latest
 ```
 
 Or one-click installer:
@@ -105,6 +115,23 @@ Optional env vars:
 ```bash
 export QINGFLOW_LIST_MAX_ITEMS_WITH_ANSWERS=5
 export QINGFLOW_LIST_MAX_ITEMS_BYTES=400000
+```
+
+## Troubleshooting
+
+If you see runtime errors around `Headers` or missing web APIs:
+
+1. Upgrade Node to `>=18`.
+2. Upgrade package to latest:
+
+```bash
+npm i -g qingflow-mcp@latest
+```
+
+3. Verify runtime:
+
+```bash
+node -e "console.log(process.version, typeof fetch, typeof Headers)"
 ```
 
 ## Publish

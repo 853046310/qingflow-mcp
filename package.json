@@ -1,6 +1,6 @@
 {
   "name": "qingflow-mcp",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": false,
   "license": "MIT",
   "type": "module",
@@ -34,6 +34,9 @@
     "dev": "tsx src/server.ts",
     "start": "node dist/server.js",
     "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.4",
