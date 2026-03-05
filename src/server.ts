@@ -121,7 +121,7 @@ const client = new QingflowClient({
 
 const server = new McpServer({
   name: "qingflow-mcp",
-  version: "0.3.5"
+  version: "0.3.7"
 })
 
 const jsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()])
@@ -1374,7 +1374,7 @@ async function callLocalMcp(
 
   const localClient = new Client({
     name: "qingflow-mcp-cli",
-    version: "0.3.0"
+    version: "0.3.7"
   })
 
   try {
@@ -1511,8 +1511,14 @@ const COMMON_INPUT_ALIASES: Record<string, string> = {
   applyId: "apply_id",
   applyIds: "apply_ids",
   maxRows: "max_rows",
+  rowLimit: "max_rows",
+  row_limit: "max_rows",
+  limit: "max_rows",
   maxItems: "max_items",
   maxColumns: "max_columns",
+  columns: "select_columns",
+  selected_columns: "select_columns",
+  selectedColumns: "select_columns",
   selectColumns: "select_columns",
   keepColumns: "keep_columns",
   keep_columns: "select_columns",
@@ -1520,6 +1526,10 @@ const COMMON_INPUT_ALIASES: Record<string, string> = {
   amountColumn: "amount_column",
   amountColumns: "amount_column",
   amount_columns: "amount_column",
+  amountQueId: "amount_column",
+  amountQueIds: "amount_column",
+  amount_que_id: "amount_column",
+  amount_que_ids: "amount_column",
   timeRange: "time_range",
   statPolicy: "stat_policy",
   groupBy: "group_by",
@@ -1550,6 +1560,7 @@ function normalizeListInput(raw: unknown): unknown {
   }
   const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
   const selectColumns = normalizedObj.select_columns ?? normalizedObj.keep_columns
+  const timeRange = buildFriendlyTimeRangeInput(normalizedObj)
 
   return {
     ...normalizedObj,
@@ -1567,7 +1578,7 @@ function normalizeListInput(raw: unknown): unknown {
     sort: normalizeSortInput(normalizedObj.sort),
     filters: normalizeFiltersInput(normalizedObj.filters),
     select_columns: normalizeSelectorListInput(selectColumns),
-    time_range: normalizeTimeRangeInput(normalizedObj.time_range)
+    time_range: timeRange
   }
 }
 
@@ -1596,6 +1607,7 @@ function normalizeQueryInput(raw: unknown): unknown {
   }
   const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
   const selectColumns = normalizedObj.select_columns ?? normalizedObj.keep_columns
+  const timeRange = buildFriendlyTimeRangeInput(normalizedObj)
 
   return {
     ...normalizedObj,
@@ -1610,12 +1622,12 @@ function normalizeQueryInput(raw: unknown): unknown {
     apply_id: coerceNumberLike(normalizedObj.apply_id),
     strict_full: coerceBooleanLike(normalizedObj.strict_full),
     include_answers: coerceBooleanLike(normalizedObj.include_answers),
-    amount_column: coerceNumberLike(normalizedObj.amount_column),
+    amount_column: normalizeAmountColumnInput(normalizedObj.amount_column),
     apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
     sort: normalizeSortInput(normalizedObj.sort),
     filters: normalizeFiltersInput(normalizedObj.filters),
     select_columns: normalizeSelectorListInput(selectColumns),
-    time_range: normalizeTimeRangeInput(normalizedObj.time_range),
+    time_range: timeRange,
     stat_policy: normalizeStatPolicyInput(normalizedObj.stat_policy)
   }
 }
@@ -1627,6 +1639,7 @@ function normalizeAggregateInput(raw: unknown): unknown {
     return parsedRoot
   }
   const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
+  const timeRange = buildFriendlyTimeRangeInput(normalizedObj)
 
   return {
     ...normalizedObj,
@@ -1638,11 +1651,11 @@ function normalizeAggregateInput(raw: unknown): unknown {
     max_groups: coerceNumberLike(normalizedObj.max_groups),
     strict_full: coerceBooleanLike(normalizedObj.strict_full),
     group_by: normalizeSelectorListInput(normalizedObj.group_by),
-    amount_column: coerceNumberLike(normalizedObj.amount_column),
+    amount_column: normalizeAmountColumnInput(normalizedObj.amount_column),
     apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
     sort: normalizeSortInput(normalizedObj.sort),
     filters: normalizeFiltersInput(normalizedObj.filters),
-    time_range: normalizeTimeRangeInput(normalizedObj.time_range),
+    time_range: timeRange,
     stat_policy: normalizeStatPolicyInput(normalizedObj.stat_policy)
   }
 }
@@ -1717,7 +1730,7 @@ function parseJsonLikeDeep(value: unknown, maxDepth = 4): unknown {
 function normalizeSelectorListInput(value: unknown): unknown {
   const parsed = parseJsonLikeDeep(value)
   if (Array.isArray(parsed)) {
-    return parsed.map((item) => coerceNumberLike(item))
+    return parsed.map((item) => coerceNumberLike(normalizeSelectorInputValue(item)))
   }
   if (typeof parsed === "string") {
     const trimmed = parsed.trim()
@@ -1729,12 +1742,12 @@ function normalizeSelectorListInput(value: unknown): unknown {
         .split(",")
         .map((item) => item.trim())
         .filter((item) => item.length > 0)
-        .map((item) => coerceNumberLike(item))
+        .map((item) => coerceNumberLike(normalizeSelectorInputValue(item)))
     }
-    return [coerceNumberLike(trimmed)]
+    return [coerceNumberLike(normalizeSelectorInputValue(trimmed))]
   }
   if (parsed !== undefined && parsed !== null) {
-    return [coerceNumberLike(parsed)]
+    return [coerceNumberLike(normalizeSelectorInputValue(parsed))]
   }
   return parsed
 }
@@ -1786,20 +1799,149 @@ function normalizeFiltersInput(value: unknown): unknown {
     }
     const normalizedObj = applyAliases(obj, {
       queId: "que_id",
+      queTitle: "que_title",
+      field: "que_id",
+      fieldId: "que_id",
+      fieldTitle: "que_title",
+      column: "que_id",
+      columnId: "que_id",
+      columnTitle: "que_title",
       searchKey: "search_key",
       searchKeys: "search_keys",
       minValue: "min_value",
       maxValue: "max_value",
+      compareType: "compare_type",
       searchOptions: "search_options",
-      searchUserIds: "search_user_ids"
+      searchUserIds: "search_user_ids",
+      users: "search_user_ids",
+      options: "search_options",
+      start: "min_value",
+      from: "min_value",
+      min: "min_value",
+      end: "max_value",
+      to: "max_value",
+      max: "max_value"
     })
+
+    const normalizedCompareType =
+      typeof normalizedObj.compare_type === "string"
+        ? normalizedObj.compare_type.trim().toLowerCase()
+        : null
+    const parsedValue = parseJsonLikeDeep(normalizedObj.value)
+    const valueObject = asObject(parsedValue)
+    const valueArray = Array.isArray(parsedValue) ? parsedValue : null
+
+    let minValue = normalizedObj.min_value
+    let maxValue = normalizedObj.max_value
+    let searchKey = normalizedObj.search_key
+    let searchKeys = normalizedObj.search_keys
+    let searchOptions = normalizedObj.search_options
+    let searchUserIds = normalizedObj.search_user_ids
+
+    const rangeLikeCompareType = new Set(["date_range", "range", "between", "gte_lte"])
+    const equalsLikeCompareType = new Set(["eq", "equals", "exact", "is"])
+    const containsLikeCompareType = new Set(["contains", "like", "fuzzy", "match"])
+    const inLikeCompareType = new Set(["in", "one_of", "any_of"])
+
+    if (valueObject) {
+      const valueAliases = applyAliases(valueObject, {
+        start: "min_value",
+        from: "min_value",
+        min: "min_value",
+        date_from: "min_value",
+        dateFrom: "min_value",
+        end: "max_value",
+        to: "max_value",
+        max: "max_value",
+        date_to: "max_value",
+        dateTo: "max_value",
+        searchKey: "search_key",
+        searchKeys: "search_keys",
+        searchOptions: "search_options",
+        searchUserIds: "search_user_ids"
+      })
+
+      if (minValue === undefined && valueAliases.min_value !== undefined) {
+        minValue = valueAliases.min_value
+      }
+      if (maxValue === undefined && valueAliases.max_value !== undefined) {
+        maxValue = valueAliases.max_value
+      }
+      if (searchKey === undefined && valueAliases.search_key !== undefined) {
+        searchKey = valueAliases.search_key
+      }
+      if (searchKeys === undefined && valueAliases.search_keys !== undefined) {
+        searchKeys = valueAliases.search_keys
+      }
+      if (searchOptions === undefined && valueAliases.search_options !== undefined) {
+        searchOptions = valueAliases.search_options
+      }
+      if (searchUserIds === undefined && valueAliases.search_user_ids !== undefined) {
+        searchUserIds = valueAliases.search_user_ids
+      }
+    }
+
+    if (
+      normalizedCompareType &&
+      rangeLikeCompareType.has(normalizedCompareType) &&
+      valueArray &&
+      valueArray.length > 0
+    ) {
+      if (minValue === undefined) {
+        minValue = valueArray[0]
+      }
+      if (maxValue === undefined && valueArray.length > 1) {
+        maxValue = valueArray[1]
+      }
+    }
+
+    if (normalizedCompareType && (equalsLikeCompareType.has(normalizedCompareType) || containsLikeCompareType.has(normalizedCompareType))) {
+      if (searchKey === undefined && parsedValue !== undefined && !Array.isArray(parsedValue) && !valueObject) {
+        searchKey = parsedValue
+      }
+    }
+
+    if (normalizedCompareType && inLikeCompareType.has(normalizedCompareType)) {
+      if (searchKeys === undefined && valueArray) {
+        searchKeys = valueArray
+      }
+    }
+
+    const filterQueId = normalizeSelectorInputValue(normalizedObj.que_id ?? normalizedObj.que_title)
+
     return {
       ...normalizedObj,
-      que_id: coerceNumberLike(normalizedObj.que_id),
+      que_id: coerceNumberLike(filterQueId),
       scope: coerceNumberLike(normalizedObj.scope),
-      search_options: normalizeIdArrayInput(normalizedObj.search_options)
+      min_value: minValue !== undefined ? coerceStringLike(minValue) : undefined,
+      max_value: maxValue !== undefined ? coerceStringLike(maxValue) : undefined,
+      search_key: searchKey !== undefined ? coerceStringLike(searchKey) : undefined,
+      search_keys: normalizeStringArrayInput(searchKeys),
+      search_options: normalizeIdArrayInput(searchOptions),
+      search_user_ids: normalizeStringArrayInput(searchUserIds)
     }
   })
+}
+
+function normalizeStringArrayInput(value: unknown): unknown {
+  const parsed = parseJsonLikeDeep(value)
+  if (parsed === undefined || parsed === null) {
+    return parsed
+  }
+  if (Array.isArray(parsed)) {
+    return parsed
+      .map((item) => coerceStringLike(item)?.trim() ?? "")
+      .filter((item) => item.length > 0)
+  }
+  if (typeof parsed === "string" && parsed.includes(",")) {
+    return parsed
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0)
+  }
+
+  const scalar = (coerceStringLike(parsed) ?? "").trim()
+  return scalar ? [scalar] : []
 }
 
 function normalizeTimeRangeInput(value: unknown): unknown {
@@ -1815,7 +1957,11 @@ function normalizeTimeRangeInput(value: unknown): unknown {
   })
   return {
     ...normalizedObj,
-    column: coerceNumberLike(normalizedObj.column)
+    column: coerceNumberLike(normalizeSelectorInputValue(normalizedObj.column)),
+    from: normalizedObj.from !== undefined ? coerceStringLike(normalizedObj.from) : undefined,
+    to: normalizedObj.to !== undefined ? coerceStringLike(normalizedObj.to) : undefined,
+    timezone:
+      normalizedObj.timezone !== undefined ? coerceStringLike(normalizedObj.timezone) : undefined
   }
 }
 
@@ -1834,6 +1980,141 @@ function normalizeStatPolicyInput(value: unknown): unknown {
     include_negative: coerceBooleanLike(normalizedObj.include_negative),
     include_null: coerceBooleanLike(normalizedObj.include_null)
   }
+}
+
+function normalizeAmountColumnInput(value: unknown): unknown {
+  const parsed = parseJsonLikeDeep(value)
+  if (parsed === undefined || parsed === null) {
+    return parsed
+  }
+  if (Array.isArray(parsed)) {
+    if (parsed.length === 0) {
+      return parsed
+    }
+    const first = normalizeSelectorInputValue(parsed[0])
+    return coerceNumberLike(first)
+  }
+  return coerceNumberLike(normalizeSelectorInputValue(parsed))
+}
+
+function buildFriendlyTimeRangeInput(obj: Record<string, unknown>): unknown {
+  const normalizedRawTimeRange = normalizeTimeRangeInput(obj.time_range)
+  const normalizedTimeRange = asObject(normalizedRawTimeRange)
+
+  const columnCandidate = firstPresent(
+    obj.date_field,
+    obj.dateField,
+    obj.time_field,
+    obj.timeField,
+    obj.time_column,
+    obj.timeColumn,
+    obj.date_column,
+    obj.dateColumn,
+    normalizedTimeRange?.column
+  )
+  const fromCandidate = firstPresent(
+    obj.date_from,
+    obj.dateFrom,
+    obj.time_from,
+    obj.timeFrom,
+    obj.start,
+    obj.start_date,
+    obj.startDate,
+    obj.from,
+    normalizedTimeRange?.from
+  )
+  const toCandidate = firstPresent(
+    obj.date_to,
+    obj.dateTo,
+    obj.time_to,
+    obj.timeTo,
+    obj.end,
+    obj.end_date,
+    obj.endDate,
+    obj.to,
+    normalizedTimeRange?.to
+  )
+  const timezoneCandidate = firstPresent(
+    obj.timezone,
+    obj.timeZone,
+    obj.tz,
+    normalizedTimeRange?.timezone
+  )
+
+  if (
+    columnCandidate === undefined &&
+    fromCandidate === undefined &&
+    toCandidate === undefined &&
+    timezoneCandidate === undefined
+  ) {
+    return normalizedRawTimeRange
+  }
+
+  return {
+    ...(columnCandidate !== undefined
+      ? { column: coerceNumberLike(normalizeSelectorInputValue(columnCandidate)) }
+      : {}),
+    ...(fromCandidate !== undefined ? { from: coerceStringLike(fromCandidate) } : {}),
+    ...(toCandidate !== undefined ? { to: coerceStringLike(toCandidate) } : {}),
+    ...(timezoneCandidate !== undefined ? { timezone: coerceStringLike(timezoneCandidate) } : {})
+  }
+}
+
+function coerceStringLike(value: unknown): string | undefined {
+  const parsed = parseJsonLikeDeep(value)
+  if (parsed === undefined || parsed === null) {
+    return undefined
+  }
+  if (typeof parsed === "string") {
+    return parsed
+  }
+  if (typeof parsed === "number" || typeof parsed === "boolean") {
+    return String(parsed)
+  }
+  return undefined
+}
+
+function firstPresent(...values: unknown[]): unknown {
+  for (const value of values) {
+    if (value === undefined || value === null) {
+      continue
+    }
+    if (typeof value === "string" && value.trim().length === 0) {
+      continue
+    }
+    return value
+  }
+  return undefined
+}
+
+function normalizeSelectorInputValue(value: unknown): unknown {
+  const parsed = parseJsonLikeDeep(value)
+  const obj = asObject(parsed)
+  if (!obj) {
+    return parsed
+  }
+
+  const normalizedObj = applyAliases(obj, {
+    queId: "que_id",
+    fieldId: "que_id",
+    columnId: "que_id",
+    id: "que_id",
+    queTitle: "que_title",
+    fieldTitle: "que_title",
+    columnTitle: "que_title",
+    title: "que_title",
+    name: "que_title",
+    field: "que_id",
+    column: "que_id"
+  })
+
+  if (normalizedObj.que_id !== undefined) {
+    return normalizedObj.que_id
+  }
+  if (normalizedObj.que_title !== undefined) {
+    return normalizedObj.que_title
+  }
+  return parsed
 }
 
 function resolveStartPage(pageNum: number | undefined, pageToken: string | undefined, appKey: string): number {
@@ -2026,7 +2307,10 @@ function appendTimeRangeFilter(
     if (item.que_id === undefined) {
       return false
     }
-    return normalizeColumnSelector(item.que_id) === timeSelector
+    return (
+      normalizeColumnSelector(item.que_id) === timeSelector &&
+      (item.min_value !== undefined || item.max_value !== undefined)
+    )
   })
   if (!alreadyHasTimeFilter) {
     filters.push({
@@ -2037,6 +2321,59 @@ function appendTimeRangeFilter(
   }
 
   return filters.length > 0 ? filters : undefined
+}
+
+function assertTimeRangeFilterApplied(
+  tool: string,
+  timeRange:
+    | {
+        column: string | number
+        from?: string
+        to?: string
+      }
+    | undefined,
+  filters:
+    | Array<{
+        que_id?: string | number
+        min_value?: string
+        max_value?: string
+      }>
+    | undefined
+): void {
+  if (!timeRange || (timeRange.from === undefined && timeRange.to === undefined)) {
+    return
+  }
+  const target = normalizeColumnSelector(timeRange.column)
+  const matched = (filters ?? []).some((item) => {
+    if (item.que_id === undefined) {
+      return false
+    }
+    if (normalizeColumnSelector(item.que_id) !== target) {
+      return false
+    }
+    if (timeRange.from !== undefined && item.min_value === undefined) {
+      return false
+    }
+    if (timeRange.to !== undefined && item.max_value === undefined) {
+      return false
+    }
+    return true
+  })
+  if (matched) {
+    return
+  }
+
+  throw new InputValidationError({
+    message: "Time range was provided but did not produce an effective date filter.",
+    errorCode: "FILTER_NOT_APPLIED",
+    fixHint:
+      "Provide a valid date_field/date_from/date_to (or time_range.column/from/to) so MCP can generate min_value/max_value filters.",
+    details: {
+      tool,
+      time_range: timeRange,
+      effective_filters: echoFilters(filters)
+    }
+  })
 }
 
 function isLikelyDateLiteral(value: string | undefined): boolean {
@@ -2211,6 +2548,7 @@ async function executeRecordsList(
   const requestedPages = args.requested_pages ?? 1
   const scanMaxPages = args.scan_max_pages ?? requestedPages
   const effectiveFilters = appendTimeRangeFilter(args.filters, args.time_range)
+  assertTimeRangeFilterApplied("qf_records_list", args.time_range, effectiveFilters)
   if (hasDateLikeRangeFilters(effectiveFilters)) {
     const form = await getFormCached(args.app_key, args.user_id, false)
     const index = buildFieldIndex(form.result)
@@ -3853,11 +4191,385 @@ function errorResult(error: unknown) {
   }
 }
 
+type ExampleToolCall = {
+  tool: string
+  arguments: Record<string, unknown>
+  note?: string
+}
+
+function withExampleCalls(
+  payload: Record<string, unknown>,
+  params: {
+    errorCode: string
+    message?: string
+    details?: Record<string, unknown> | null
+    nextPageToken?: string | null
+    timeoutHint?: boolean
+  }
+): Record<string, unknown> {
+  const exampleCalls = buildErrorExampleCalls(params)
+  if (exampleCalls.length === 0) {
+    return payload
+  }
+  return {
+    ...payload,
+    example_calls: exampleCalls
+  }
+}
+
+function buildErrorExampleCalls(params: {
+  errorCode: string
+  message?: string
+  details?: Record<string, unknown> | null
+  nextPageToken?: string | null
+  timeoutHint?: boolean
+}): ExampleToolCall[] {
+  const appKey = resolveExampleAppKey(params.details)
+  const selectColumns = resolveExampleSelectColumns(params.details)
+  const errorCode = params.errorCode
+
+  if (errorCode === "NEED_MORE_DATA") {
+    const inferred = inferNeedMoreDataTarget(params.message, params.details)
+    const nextPageToken = params.nextPageToken ?? resolveNextPageToken(params.details)
+    const continued = buildBaseExampleCall({
+      tool: inferred.tool,
+      queryMode: inferred.queryMode,
+      appKey,
+      selectColumns
+    })
+    if (nextPageToken) {
+      continued.arguments.page_token = nextPageToken
+    }
+    if (continued.tool !== "qf_record_get") {
+      continued.arguments.requested_pages = 1
+    }
+    const expanded = buildBaseExampleCall({
+      tool: inferred.tool,
+      queryMode: inferred.queryMode,
+      appKey,
+      selectColumns
+    })
+    expanded.arguments.requested_pages = 5
+    expanded.arguments.scan_max_pages = 5
+    expanded.arguments.strict_full = false
+    return [
+      {
+        ...continued,
+        note: "继续分页拉取剩余数据"
+      },
+      {
+        ...expanded,
+        note: "或扩大单次扫描页数后重试"
+      }
+    ]
+  }
+
+  if (
+    errorCode === "FILTER_FIELD_TYPE_MISMATCH" ||
+    errorCode === "FILTER_NOT_APPLIED" ||
+    errorCode === "INVALID_FILTER_FIELD"
+  ) {
+    return [
+      {
+        tool: "qf_form_get",
+        arguments: {
+          app_key: appKey
+        },
+        note: "先确认日期字段的真实 que_id 与字段类型"
+      },
+      {
+        tool: "qf_query",
+        arguments: {
+          query_mode: "list",
+          app_key: appKey,
+          mode: "all",
+          page_size: 50,
+          max_rows: 20,
+          select_columns: selectColumns,
+          time_range: {
+            column: "日期字段que_id",
+            from: "2026-03-05",
+            to: "2026-03-05"
+          }
+        },
+        note: "推荐使用 time_range，让 MCP 自动下推为 min_value/max_value"
+      }
+    ]
+  }
+
+  if (errorCode === "MISSING_REQUIRED_FIELD") {
+    const field = asNullableString(params.details?.field)
+    const toolHint = parseToolHint(params.details)
+    const call = buildBaseExampleCall({
+      tool: toolHint.tool,
+      queryMode: toolHint.queryMode,
+      appKey,
+      selectColumns
+    })
+    if (field === "app_key") {
+      call.arguments.app_key = appKey
+    } else if (field === "select_columns") {
+      call.arguments.select_columns = selectColumns
+    } else if (field === "apply_id") {
+      call.arguments.apply_id = "your_apply_id"
+    }
+    return [
+      {
+        ...call,
+        note: field ? `补齐必填字段 ${field}` : "按示例补齐必填参数"
+      }
+    ]
+  }
+
+  if (errorCode === "UPSTREAM_TIMEOUT" || params.timeoutHint) {
+    return [
+      {
+        tool: "qf_query",
+        arguments: {
+          query_mode: "list",
+          app_key: appKey,
+          mode: "all",
+          page_size: 20,
+          requested_pages: 1,
+          scan_max_pages: 1,
+          max_rows: 50,
+          select_columns: selectColumns
+        },
+        note: "先缩小请求规模（页大小/扫描页数）再逐步放大"
+      }
+    ]
+  }
+
+  if (errorCode === "INVALID_ARGUMENTS" || errorCode === "QINGFLOW_API_ERROR") {
+    return [
+      {
+        tool: "qf_form_get",
+        arguments: {
+          app_key: appKey
+        },
+        note: "先确认字段 que_id 与字段标题"
+      },
+      {
+        tool: "qf_query",
+        arguments: {
+          query_mode: "list",
+          app_key: appKey,
+          mode: "all",
+          page_size: 50,
+          max_rows: 20,
+          select_columns: selectColumns
+        },
+        note: "再使用标准 list 查询模板重试"
+      }
+    ]
+  }
+
+  if (errorCode === "INTERNAL_ERROR" || errorCode === "UNKNOWN_ERROR") {
+    return [
+      {
+        tool: "qf_query",
+        arguments: {
+          query_mode: "list",
+          app_key: appKey,
+          mode: "all",
+          page_size: 20,
+          requested_pages: 1,
+          scan_max_pages: 1,
+          max_rows: 20,
+          select_columns: selectColumns,
+          strict_full: false
+        },
+        note: "用最小参数模板重试，便于定位问题"
+      }
+    ]
+  }
+
+  return []
+}
+
+function parseToolHint(
+  details?: Record<string, unknown> | null
+): { tool: string; queryMode?: "list" | "record" | "summary" } {
+  const toolLabel = asNullableString(details?.tool)
+  if (!toolLabel) {
+    return {
+      tool: "qf_query",
+      queryMode: "list"
+    }
+  }
+
+  const toolMatch = toolLabel.match(/^(qf_[a-z_]+)/)
+  const modeMatch = toolLabel.match(/\((list|record|summary)\)/)
+  const tool = toolMatch?.[1] ?? "qf_query"
+  const queryMode = modeMatch?.[1] as "list" | "record" | "summary" | undefined
+
+  if (tool === "qf_query") {
+    return {
+      tool,
+      queryMode: queryMode ?? "list"
+    }
+  }
+  return { tool }
+}
+
+function inferNeedMoreDataTarget(
+  message: string | undefined,
+  details?: Record<string, unknown> | null
+): { tool: string; queryMode?: "list" | "record" | "summary" } {
+  const byDetails = parseToolHint(details)
+  if (byDetails.tool !== "qf_query" || byDetails.queryMode !== "list") {
+    return byDetails
+  }
+  const text = (message ?? "").toLowerCase()
+  if (text.includes("aggregate")) {
+    return { tool: "qf_records_aggregate" }
+  }
+  if (text.includes("summary")) {
+    return { tool: "qf_query", queryMode: "summary" }
+  }
+  if (text.includes("list")) {
+    return { tool: "qf_records_list" }
+  }
+  return byDetails
+}
+
+function resolveExampleAppKey(details?: Record<string, unknown> | null): string {
+  const evidence = asObject(details?.evidence)
+  return (
+    asNullableString(evidence?.app_key) ??
+    asNullableString(details?.app_key) ??
+    "your_app_key"
+  )
+}
+
+function resolveExampleSelectColumns(
+  details?: Record<string, unknown> | null
+): Array<string | number> {
+  const evidence = asObject(details?.evidence)
+  const candidates: unknown[] = []
+  candidates.push(...asArray(evidence?.selected_columns))
+  candidates.push(...asArray(details?.select_columns))
+
+  const resolved = candidates
+    .map((item) => {
+      if (typeof item === "number" && Number.isFinite(item)) {
+        return Math.trunc(item)
+      }
+      if (typeof item === "string" && item.trim()) {
+        return item.trim()
+      }
+      return null
+    })
+    .filter((item): item is string | number => item !== null)
+
+  if (resolved.length > 0) {
+    return resolved.slice(0, 3)
+  }
+  return [0, "客户名称"]
+}
+
+function resolveNextPageToken(details?: Record<string, unknown> | null): string | null {
+  const completeness = asObject(details?.completeness)
+  return asNullableString(completeness?.next_page_token)
+}
+
+function buildBaseExampleCall(params: {
+  tool: string
+  queryMode?: "list" | "record" | "summary"
+  appKey: string
+  selectColumns: Array<string | number>
+}): ExampleToolCall {
+  if (params.tool === "qf_form_get") {
+    return {
+      tool: "qf_form_get",
+      arguments: {
+        app_key: params.appKey
+      }
+    }
+  }
+
+  if (params.tool === "qf_record_get") {
+    return {
+      tool: "qf_record_get",
+      arguments: {
+        apply_id: "your_apply_id",
+        select_columns: params.selectColumns
+      }
+    }
+  }
+
+  if (params.tool === "qf_records_list") {
+    return {
+      tool: "qf_records_list",
+      arguments: {
+        app_key: params.appKey,
+        mode: "all",
+        page_size: 50,
+        max_rows: 20,
+        select_columns: params.selectColumns
+      }
+    }
+  }
+
+  if (params.tool === "qf_records_aggregate") {
+    return {
+      tool: "qf_records_aggregate",
+      arguments: {
+        app_key: params.appKey,
+        mode: "all",
+        group_by: [params.selectColumns[0] ?? 0],
+        page_size: 50,
+        requested_pages: 3,
+        scan_max_pages: 3,
+        strict_full: false
+      }
+    }
+  }
+
+  const queryMode = params.queryMode ?? "list"
+  if (queryMode === "record") {
+    return {
+      tool: "qf_query",
+      arguments: {
+        query_mode: "record",
+        apply_id: "your_apply_id",
+        select_columns: params.selectColumns
+      }
+    }
+  }
+  if (queryMode === "summary") {
+    return {
+      tool: "qf_query",
+      arguments: {
+        query_mode: "summary",
+        app_key: params.appKey,
+        mode: "all",
+        select_columns: params.selectColumns,
+        page_size: 50,
+        scan_max_pages: 3,
+        strict_full: false
+      }
+    }
+  }
+  return {
+    tool: "qf_query",
+    arguments: {
+      query_mode: "list",
+      app_key: params.appKey,
+      mode: "all",
+      page_size: 50,
+      max_rows: 20,
+      select_columns: params.selectColumns
+    }
+  }
+}
+
 function toErrorPayload(error: unknown): Record<string, unknown> {
   if (error instanceof NeedMoreDataError) {
     const details = asObject(error.details)
     const completeness = asObject(details?.completeness)
-    return {
+    return withExampleCalls(
+      {
       ok: false,
       code: error.code,
       error_code: error.code,
@@ -3866,21 +4578,36 @@ function toErrorPayload(error: unknown): Record<string, unknown> {
       fix_hint: "Continue with next_page_token or increase requested_pages/scan_max_pages.",
       next_page_token: asNullableString(completeness?.next_page_token),
       details: error.details
-    }
+      },
+      {
+        errorCode: error.code,
+        message: error.message,
+        details,
+        nextPageToken: asNullableString(completeness?.next_page_token)
+      }
+    )
   }
   if (error instanceof InputValidationError) {
-    return {
+    return withExampleCalls(
+      {
       ok: false,
       error_code: error.errorCode,
       message: error.message,
       fix_hint: error.fixHint,
       next_page_token: null,
       details: error.details
-    }
+      },
+      {
+        errorCode: error.errorCode,
+        message: error.message,
+        details: error.details
+      }
+    )
   }
   if (error instanceof QingflowApiError) {
     const timeoutHint = /timeout/i.test(error.message) || /timeout/i.test(error.errMsg)
-    return {
+    return withExampleCalls(
+      {
       ok: false,
       error_code: timeoutHint ? "UPSTREAM_TIMEOUT" : "QINGFLOW_API_ERROR",
       message: error.message,
@@ -3892,37 +4619,62 @@ function toErrorPayload(error: unknown): Record<string, unknown> {
         : "Check app_key/accessToken and request body against qf_form_get field definitions.",
       next_page_token: null,
       details: error.details ?? null
-    }
+      },
+      {
+        errorCode: timeoutHint ? "UPSTREAM_TIMEOUT" : "QINGFLOW_API_ERROR",
+        message: error.message,
+        details: asObject(error.details),
+        timeoutHint
+      }
+    )
   }
   if (error instanceof z.ZodError) {
     const firstIssue = error.issues[0]
     const firstPath = firstIssue?.path?.join(".") || "arguments"
-    return {
+    return withExampleCalls(
+      {
       ok: false,
       error_code: "INVALID_ARGUMENTS",
       message: "Invalid arguments",
       fix_hint: `Fix field "${firstPath}" and retry with schema-compliant values.`,
       next_page_token: null,
       issues: error.issues
-    }
+      },
+      {
+        errorCode: "INVALID_ARGUMENTS",
+        message: "Invalid arguments"
+      }
+    )
   }
   if (error instanceof Error) {
-    return {
+    return withExampleCalls(
+      {
       ok: false,
       error_code: "INTERNAL_ERROR",
       message: error.message,
       fix_hint: "Retry the request. If it persists, report query_id and input payload.",
       next_page_token: null
-    }
+      },
+      {
+        errorCode: "INTERNAL_ERROR",
+        message: error.message
+      }
+    )
   }
-  return {
+  return withExampleCalls(
+    {
     ok: false,
     error_code: "UNKNOWN_ERROR",
     message: "Unknown error",
     fix_hint: "Retry the request with explicit app_key/select_columns and deterministic page parameters.",
     next_page_token: null,
     details: error
-  }
+    },
+    {
+      errorCode: "UNKNOWN_ERROR",
+      message: "Unknown error"
+    }
+  )
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {

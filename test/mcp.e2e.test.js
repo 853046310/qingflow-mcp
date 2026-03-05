@@ -762,6 +762,32 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(listed.data.list.completeness.returned_items, 2)
   })
 
+  await t.test("qf_query list mode auto-normalizes model-style date_range filter", async () => {
+    const listed = await callTool(mcp.client, "qf_query", {
+      query_mode: "list",
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: 20,
+      max_rows: 20,
+      selected_columns: [1001, 1003],
+      filters: [
+        {
+          que_id: 1003,
+          compare_type: "date_range",
+          value: {
+            start: "2026-01-02",
+            end: "2026-01-02"
+          }
+        }
+      ]
+    })
+
+    assert.equal(listed.ok, true)
+    assert.equal(listed.data.mode, "list")
+    assert.equal(listed.data.list.pagination.result_amount, 2)
+    assert.equal(listed.data.list.items.length, 2)
+  })
+
   await t.test("qf_records_list returns deterministic pagination token", async () => {
     const page1 = await callTool(mcp.client, "qf_records_list", {
       app_key: APP_KEY,
@@ -872,6 +898,9 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(failed.ok, false)
     assert.equal(failed.error_code, "FILTER_FIELD_TYPE_MISMATCH")
     assert.equal(typeof failed.fix_hint, "string")
+    assert.ok(Array.isArray(failed.example_calls))
+    assert.equal(failed.example_calls[0].tool, "qf_form_get")
+    assert.equal(failed.example_calls[1].tool, "qf_query")
   })
 
   await t.test("qf_query summary returns computed aggregates + strict rows", async () => {
@@ -948,6 +977,9 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(failed.error_code, "MISSING_REQUIRED_FIELD")
     assert.equal(typeof failed.fix_hint, "string")
     assert.match(failed.message, /Missing required field "select_columns"/)
+    assert.ok(Array.isArray(failed.example_calls))
+    assert.equal(failed.example_calls[0].tool, "qf_query")
+    assert.ok(Array.isArray(failed.example_calls[0].arguments.select_columns))
   })
 
   await t.test("qf_query list mode uses default row limit when max_rows is omitted", async () => {
@@ -979,6 +1011,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(failed.code, "NEED_MORE_DATA")
     assert.equal(failed.status, "need_more_data")
     assert.equal(failed.details.completeness.is_complete, false)
+    assert.ok(Array.isArray(failed.example_calls))
+    assert.equal(failed.example_calls[0].tool, "qf_records_list")
   })
 
   await t.test("qf_query summary strict_full fails when scan is incomplete", async () => {
@@ -999,6 +1033,9 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(failed.code, "NEED_MORE_DATA")
     assert.equal(failed.details.completeness.is_complete, false)
     assert.equal(failed.details.completeness.has_more, true)
+    assert.ok(Array.isArray(failed.example_calls))
+    assert.equal(failed.example_calls[0].tool, "qf_query")
+    assert.equal(failed.example_calls[0].arguments.query_mode, "summary")
   })
 
   await t.test("qf_records_aggregate returns grouped metrics with evidence", async () => {
@@ -1057,6 +1094,27 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
 
     assert.equal(aggregated.ok, true)
     assert.equal(aggregated.data.summary.total_count, 6)
+    assert.equal(aggregated.completeness.is_complete, true)
+  })
+
+  await t.test("qf_records_aggregate accepts model-style group/date/amount fields", async () => {
+    const aggregated = await callTool(mcp.client, "qf_records_aggregate", {
+      app_key: APP_KEY,
+      mode: "all",
+      group_by: [{ que_id: 1003 }],
+      amount_que_ids: [1002],
+      date_field: 1003,
+      date_from: "2026-01-01",
+      date_to: "2026-01-31",
+      page_size: 2,
+      requested_pages: 10,
+      scan_max_pages: 10,
+      strict_full: true
+    })
+
+    assert.equal(aggregated.ok, true)
+    assert.equal(aggregated.data.summary.total_count, 5)
+    assert.equal(aggregated.data.summary.total_amount, 280)
     assert.equal(aggregated.completeness.is_complete, true)
   })
 
