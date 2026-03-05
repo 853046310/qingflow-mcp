@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
+import { randomUUID } from "node:crypto"
 import { z } from "zod"
 
 import { QingflowApiError, QingflowClient, type QingflowResponse } from "./qingflow-client.js"
@@ -41,11 +42,41 @@ interface FieldIndex {
   byTitle: Map<string, FormField[]>
 }
 
+interface ListQueryState {
+  query_id: string
+  app_key: string
+  selected_columns: string[]
+  filters: Array<Record<string, unknown>>
+  time_range: {
+    column: string
+    from: string | null
+    to: string | null
+    timezone: string | null
+  } | null
+}
+
+interface ContinuationTokenPayload {
+  app_key: string
+  next_page_num: number
+  page_size: number
+}
+
+class NeedMoreDataError extends Error {
+  public readonly code = "NEED_MORE_DATA"
+  public readonly details: Record<string, unknown>
+
+  constructor(message: string, details: Record<string, unknown>) {
+    super(message)
+    this.name = "NeedMoreDataError"
+    this.details = details
+  }
+}
+
 const FORM_CACHE_TTL_MS = Number(process.env.QINGFLOW_FORM_CACHE_TTL_MS ?? "300000")
 const formCache = new Map<string, FormCacheEntry>()
 const DEFAULT_PAGE_SIZE = 50
-const DEFAULT_MAX_ITEMS_WITH_ANSWERS =
-  toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_WITH_ANSWERS) ?? 5
+const DEFAULT_SCAN_MAX_PAGES = 50
+const DEFAULT_ROW_LIMIT = 200
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
@@ -66,7 +97,7 @@ const client = new QingflowClient({
 
 const server = new McpServer({
   name: "qingflow-mcp",
-  version: "0.2.7"
+  version: "0.3.0"
 })
 
 const jsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()])
@@ -127,6 +158,36 @@ const apiMetaSchema = z.object({
   provider_err_code: z.number(),
   provider_err_msg: z.string().nullable(),
   base_url: z.string()
+})
+
+const completenessSchema = z.object({
+  result_amount: z.number().int().nonnegative(),
+  returned_items: z.number().int().nonnegative(),
+  fetched_pages: z.number().int().nonnegative(),
+  requested_pages: z.number().int().positive(),
+  actual_scanned_pages: z.number().int().nonnegative(),
+  has_more: z.boolean(),
+  next_page_token: z.string().nullable(),
+  is_complete: z.boolean(),
+  partial: z.boolean(),
+  omitted_items: z.number().int().nonnegative(),
+  omitted_chars: z.number().int().nonnegative()
+})
+
+const evidenceSchema = z.object({
+  query_id: z.string(),
+  app_key: z.string(),
+  filters: z.array(z.record(z.unknown())),
+  selected_columns: z.array(z.string()),
+  time_range: z
+    .object({
+      column: z.string(),
+      from: z.string().nullable(),
+      to: z.string().nullable(),
+      timezone: z.string().nullable()
+    })
+    .nullable(),
+  source_pages: z.array(z.number().int().positive())
 })
 
 const appSchema = z.object({
@@ -201,7 +262,10 @@ const listInputSchema = z
     app_key: z.string().min(1),
     user_id: z.string().min(1).optional(),
     page_num: z.number().int().positive().optional(),
+    page_token: z.string().min(1).optional(),
     page_size: z.number().int().positive().max(200).optional(),
+    requested_pages: z.number().int().positive().max(500).optional(),
+    scan_max_pages: z.number().int().positive().max(500).optional(),
     mode: z
       .enum([
         "todo",
@@ -244,15 +308,27 @@ const listInputSchema = z
         })
       )
       .optional(),
+    time_range: z
+      .object({
+        column: z.union([z.string().min(1), z.number().int()]),
+        from: z.string().optional(),
+        to: z.string().optional(),
+        timezone: z.string().optional()
+      })
+      .optional(),
     max_rows: z.number().int().positive().max(200).optional(),
     max_items: z.number().int().positive().max(200).optional(),
-    max_columns: z.number().int().positive().max(200).optional(),
+    max_columns: z.number().int().positive().max(10).optional(),
     // Strict mode: callers must explicitly choose columns.
-    select_columns: z.array(z.union([z.string().min(1), z.number().int()])).min(1).max(200),
-    include_answers: z.boolean().optional()
+    select_columns: z.array(z.union([z.string().min(1), z.number().int()])).min(1).max(10),
+    include_answers: z.boolean().optional(),
+    strict_full: z.boolean().optional()
   })
   .refine((value) => value.include_answers !== false, {
     message: "include_answers=false is not allowed in strict column mode"
+  })
+  .refine((value) => !(value.page_num !== undefined && value.page_token !== undefined), {
+    message: "page_num and page_token cannot be used together"
   })
 
 const listSuccessOutputSchema = z.object({
@@ -273,7 +349,9 @@ const listSuccessOutputSchema = z.object({
         column_cap: z.number().int().positive().nullable(),
         selected_columns: z.array(z.string())
       })
-      .optional()
+      .optional(),
+    completeness: completenessSchema,
+    evidence: evidenceSchema
   }),
   meta: apiMetaSchema
 })
@@ -281,12 +359,11 @@ const listOutputSchema = listSuccessOutputSchema
 
 const recordGetInputSchema = z.object({
   apply_id: z.union([z.string().min(1), z.number().int()]),
-  max_columns: z.number().int().positive().max(200).optional(),
+  max_columns: z.number().int().positive().max(10).optional(),
   select_columns: z
     .array(z.union([z.string().min(1), z.number().int()]))
     .min(1)
-    .max(200)
-    .optional()
+    .max(10)
 })
 
 const recordGetSuccessOutputSchema = z.object({
@@ -300,7 +377,13 @@ const recordGetSuccessOutputSchema = z.object({
         column_cap: z.number().int().positive().nullable(),
         selected_columns: z.array(z.string()).nullable()
       })
-      .optional()
+      .optional(),
+    completeness: completenessSchema,
+    evidence: z.object({
+      query_id: z.string(),
+      apply_id: z.string(),
+      selected_columns: z.array(z.string())
+    })
   }),
   meta: apiMetaSchema
 })
@@ -377,7 +460,9 @@ const queryInputSchema = z.object({
   apply_id: z.union([z.string().min(1), z.number().int()]).optional(),
   user_id: z.string().min(1).optional(),
   page_num: z.number().int().positive().optional(),
+  page_token: z.string().min(1).optional(),
   page_size: z.number().int().positive().max(200).optional(),
+  requested_pages: z.number().int().positive().max(500).optional(),
   mode: z
     .enum([
       "todo",
@@ -422,11 +507,11 @@ const queryInputSchema = z.object({
     .optional(),
   max_rows: z.number().int().positive().max(200).optional(),
   max_items: z.number().int().positive().max(200).optional(),
-  max_columns: z.number().int().positive().max(200).optional(),
+  max_columns: z.number().int().positive().max(10).optional(),
   select_columns: z
     .array(z.union([z.string().min(1), z.number().int()]))
     .min(1)
-    .max(200)
+    .max(10)
     .optional(),
   include_answers: z.boolean().optional(),
   amount_column: z.union([z.string().min(1), z.number().int()]).optional(),
@@ -444,8 +529,12 @@ const queryInputSchema = z.object({
       include_null: z.boolean().optional()
     })
     .optional(),
-  scan_max_pages: z.number().int().positive().max(500).optional()
+  scan_max_pages: z.number().int().positive().max(500).optional(),
+  strict_full: z.boolean().optional()
 })
+  .refine((value) => !(value.page_num !== undefined && value.page_token !== undefined), {
+    message: "page_num and page_token cannot be used together"
+  })
 
 const querySummaryOutputSchema = z.object({
   summary: z.object({
@@ -461,6 +550,8 @@ const querySummaryOutputSchema = z.object({
     missing_count: z.number().int().nonnegative()
   }),
   rows: z.array(z.record(z.unknown())),
+  completeness: completenessSchema,
+  evidence: evidenceSchema,
   meta: z.object({
     field_mapping: z.array(
       z.object({
@@ -509,6 +600,118 @@ const querySuccessOutputSchema = z.object({
   meta: apiMetaSchema
 })
 const queryOutputSchema = querySuccessOutputSchema
+
+const aggregateInputSchema = z
+  .object({
+    app_key: z.string().min(1),
+    user_id: z.string().min(1).optional(),
+    page_num: z.number().int().positive().optional(),
+    page_token: z.string().min(1).optional(),
+    page_size: z.number().int().positive().max(200).optional(),
+    requested_pages: z.number().int().positive().max(500).optional(),
+    scan_max_pages: z.number().int().positive().max(500).optional(),
+    mode: z
+      .enum([
+        "todo",
+        "done",
+        "mine_approved",
+        "mine_rejected",
+        "mine_draft",
+        "mine_need_improve",
+        "mine_processing",
+        "all",
+        "all_approved",
+        "all_rejected",
+        "all_processing",
+        "cc"
+      ])
+      .optional(),
+    type: z.number().int().min(1).max(12).optional(),
+    keyword: z.string().optional(),
+    query_logic: z.enum(["and", "or"]).optional(),
+    apply_ids: z.array(z.union([z.string(), z.number()])).optional(),
+    sort: z
+      .array(
+        z.object({
+          que_id: z.union([z.string().min(1), z.number().int()]),
+          ascend: z.boolean().optional()
+        })
+      )
+      .optional(),
+    filters: z
+      .array(
+        z.object({
+          que_id: z.union([z.string().min(1), z.number().int()]).optional(),
+          search_key: z.string().optional(),
+          search_keys: z.array(z.string()).optional(),
+          min_value: z.string().optional(),
+          max_value: z.string().optional(),
+          scope: z.number().int().optional(),
+          search_options: z.array(z.union([z.string(), z.number()])).optional(),
+          search_user_ids: z.array(z.string()).optional()
+        })
+      )
+      .optional(),
+    time_range: z
+      .object({
+        column: z.union([z.string().min(1), z.number().int()]),
+        from: z.string().optional(),
+        to: z.string().optional(),
+        timezone: z.string().optional()
+      })
+      .optional(),
+    group_by: z.array(z.union([z.string().min(1), z.number().int()])).min(1).max(20),
+    amount_column: z.union([z.string().min(1), z.number().int()]).optional(),
+    stat_policy: z
+      .object({
+        include_negative: z.boolean().optional(),
+        include_null: z.boolean().optional()
+      })
+      .optional(),
+    max_groups: z.number().int().positive().max(2000).optional(),
+    strict_full: z.boolean().optional()
+  })
+  .refine((value) => !(value.page_num !== undefined && value.page_token !== undefined), {
+    message: "page_num and page_token cannot be used together"
+  })
+
+const aggregateOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    app_key: z.string(),
+    summary: z.object({
+      total_count: z.number().int().nonnegative(),
+      total_amount: z.number().nullable()
+    }),
+    groups: z.array(
+      z.object({
+        group: z.record(z.unknown()),
+        count: z.number().int().nonnegative(),
+        count_ratio: z.number().min(0).max(1),
+        amount_total: z.number().nullable(),
+        amount_ratio: z.number().nullable()
+      })
+    ),
+    completeness: completenessSchema,
+    evidence: evidenceSchema,
+    meta: z.object({
+      field_mapping: z.array(
+        z.object({
+          role: z.enum(["group_by", "amount", "time"]),
+          requested: z.string(),
+          que_id: z.union([z.string(), z.number()]),
+          que_title: z.string().nullable(),
+          que_type: z.unknown()
+        })
+      ),
+      stat_policy: z.object({
+        include_negative: z.boolean(),
+        include_null: z.boolean()
+      })
+    })
+  }),
+  meta: apiMetaSchema
+})
 
 server.registerTool(
   "qf_apps_list",
@@ -863,6 +1066,29 @@ server.registerTool(
   }
 )
 
+server.registerTool(
+  "qf_records_aggregate",
+  {
+    title: "Qingflow Records Aggregate",
+    description:
+      "Aggregate records by group_by columns with optional amount metrics. Designed for deterministic, auditable statistics.",
+    inputSchema: aggregateInputSchema,
+    outputSchema: aggregateOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const executed = await executeRecordsAggregate(args)
+      return okResult(executed.payload, executed.message)
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
 async function main(): Promise<void> {
   const transport = new StdioServerTransport()
   await server.connect(transport)
@@ -883,6 +1109,85 @@ function buildMeta(response: QingflowResponse<unknown>) {
     provider_err_msg: response.errMsg || null,
     base_url: baseUrl as string
   }
+}
+
+function resolveStartPage(pageNum: number | undefined, pageToken: string | undefined, appKey: string): number {
+  if (!pageToken) {
+    return pageNum ?? 1
+  }
+
+  const payload = decodeContinuationToken(pageToken)
+  if (payload.app_key !== appKey) {
+    throw new Error(
+      `page_token app_key mismatch: token for ${payload.app_key}, request for ${appKey}`
+    )
+  }
+  return payload.next_page_num
+}
+
+function encodeContinuationToken(payload: ContinuationTokenPayload): string {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")
+}
+
+function decodeContinuationToken(token: string): ContinuationTokenPayload {
+  let parsed: unknown
+  try {
+    const decoded = Buffer.from(token, "base64url").toString("utf8")
+    parsed = JSON.parse(decoded)
+  } catch {
+    throw new Error("Invalid page_token")
+  }
+
+  const obj = asObject(parsed)
+  const appKey = asNullableString(obj?.app_key)
+  const nextPageNum = toPositiveInt(obj?.next_page_num)
+  const pageSize = toPositiveInt(obj?.page_size)
+  if (!appKey || !nextPageNum || !pageSize) {
+    throw new Error("Invalid page_token payload")
+  }
+  return {
+    app_key: appKey,
+    next_page_num: nextPageNum,
+    page_size: pageSize
+  }
+}
+
+function buildEvidencePayload(
+  state: ListQueryState,
+  sourcePages: number[]
+): z.infer<typeof evidenceSchema> {
+  return {
+    query_id: state.query_id,
+    app_key: state.app_key,
+    filters: state.filters,
+    selected_columns: state.selected_columns,
+    time_range: state.time_range,
+    source_pages: sourcePages
+  }
+}
+
+function echoFilters(
+  filters?: Array<{
+    que_id?: string | number
+    search_key?: string
+    search_keys?: string[]
+    min_value?: string
+    max_value?: string
+    scope?: number
+    search_options?: Array<string | number>
+    search_user_ids?: string[]
+  }>
+): Array<Record<string, unknown>> {
+  return (filters ?? []).map((item) => ({
+    ...(item.que_id !== undefined ? { que_id: String(item.que_id) } : {}),
+    ...(item.search_key !== undefined ? { search_key: item.search_key } : {}),
+    ...(item.search_keys !== undefined ? { search_keys: item.search_keys } : {}),
+    ...(item.min_value !== undefined ? { min_value: item.min_value } : {}),
+    ...(item.max_value !== undefined ? { max_value: item.max_value } : {}),
+    ...(item.scope !== undefined ? { scope: item.scope } : {}),
+    ...(item.search_options !== undefined ? { search_options: item.search_options } : {}),
+    ...(item.search_user_ids !== undefined ? { search_user_ids: item.search_user_ids } : {})
+  }))
 }
 
 function resolveQueryMode(args: z.infer<typeof queryInputSchema>): "list" | "record" | "summary" {
@@ -921,7 +1226,10 @@ function buildListArgsFromQuery(args: z.infer<typeof queryInputSchema>): z.infer
     app_key: args.app_key,
     user_id: args.user_id,
     page_num: args.page_num,
+    page_token: args.page_token,
     page_size: args.page_size,
+    requested_pages: args.requested_pages,
+    scan_max_pages: args.scan_max_pages,
     mode: args.mode,
     type: args.type,
     keyword: args.keyword,
@@ -929,23 +1237,48 @@ function buildListArgsFromQuery(args: z.infer<typeof queryInputSchema>): z.infer
     apply_ids: args.apply_ids,
     sort: args.sort,
     filters,
+    time_range: args.time_range,
     max_rows: args.max_rows,
     max_items: args.max_items,
     max_columns: args.max_columns,
     select_columns: args.select_columns,
-    include_answers: args.include_answers
+    include_answers: args.include_answers,
+    strict_full: args.strict_full
   })
 }
 
 function buildListFiltersFromQuery(
   args: z.infer<typeof queryInputSchema>
 ): z.infer<typeof listInputSchema>["filters"] {
-  const filters = [...(args.filters ?? [])]
-  const timeRange = args.time_range
+  return appendTimeRangeFilter(args.filters, args.time_range)
+}
+
+function appendTimeRangeFilter(
+  inputFilters:
+    | Array<{
+        que_id?: string | number
+        search_key?: string
+        search_keys?: string[]
+        min_value?: string
+        max_value?: string
+        scope?: number
+        search_options?: Array<string | number>
+        search_user_ids?: string[]
+      }>
+    | undefined,
+  timeRange:
+    | {
+        column: string | number
+        from?: string
+        to?: string
+        timezone?: string
+      }
+    | undefined
+): z.infer<typeof listInputSchema>["filters"] {
+  const filters = [...(inputFilters ?? [])]
   if (!timeRange) {
     return filters.length > 0 ? filters : undefined
   }
-
   if (timeRange.from === undefined && timeRange.to === undefined) {
     return filters.length > 0 ? filters : undefined
   }
@@ -957,7 +1290,6 @@ function buildListFiltersFromQuery(
     }
     return normalizeColumnSelector(item.que_id) === timeSelector
   })
-
   if (!alreadyHasTimeFilter) {
     filters.push({
       que_id: timeRange.column,
@@ -975,6 +1307,9 @@ function buildRecordGetArgsFromQuery(
   if (args.apply_id === undefined) {
     throw new Error("apply_id is required for record query")
   }
+  if (!args.select_columns?.length) {
+    throw new Error("select_columns is required for record query")
+  }
 
   return recordGetInputSchema.parse({
     apply_id: args.apply_id,
@@ -986,33 +1321,67 @@ function buildRecordGetArgsFromQuery(
 async function executeRecordsList(
   args: z.infer<typeof listInputSchema>
 ): Promise<{ payload: z.infer<typeof listSuccessOutputSchema>; message: string }> {
-  const pageNum = args.page_num ?? 1
+  const queryId = randomUUID()
+  const pageNum = resolveStartPage(args.page_num, args.page_token, args.app_key)
   const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
+  const requestedPages = args.requested_pages ?? 1
+  const scanMaxPages = args.scan_max_pages ?? requestedPages
+  const effectiveFilters = appendTimeRangeFilter(args.filters, args.time_range)
   const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
   const includeAnswers = true
-  const payload = buildListPayload({
-    pageNum,
-    pageSize,
-    mode: args.mode,
-    type: args.type,
-    keyword: args.keyword,
-    queryLogic: args.query_logic,
-    applyIds: args.apply_ids,
-    sort: normalizedSort,
-    filters: args.filters
-  })
+  let currentPage = pageNum
+  let fetchedPages = 0
+  let hasMore = false
+  let nextPageNum: number | null = null
+  let resultAmount: number | null = null
+  let pageAmount: number | null = null
+  let responseMeta: ReturnType<typeof buildMeta> | null = null
+  const sourcePages: number[] = []
+  const collectedRawItems: unknown[] = []
 
-  const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
-  const result = asObject(response.result)
-  const rawItems = asArray(result?.result)
+  while (fetchedPages < requestedPages && fetchedPages < scanMaxPages) {
+    const payload = buildListPayload({
+      pageNum: currentPage,
+      pageSize,
+      mode: args.mode,
+      type: args.type,
+      keyword: args.keyword,
+      queryLogic: args.query_logic,
+      applyIds: args.apply_ids,
+      sort: normalizedSort,
+      filters: effectiveFilters
+    })
+    const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
+    responseMeta = responseMeta ?? buildMeta(response)
+
+    const result = asObject(response.result)
+    const rawItems = asArray(result?.result)
+    collectedRawItems.push(...rawItems)
+    sourcePages.push(currentPage)
+    fetchedPages += 1
+
+    resultAmount = resultAmount ?? toNonNegativeInt(result?.resultAmount)
+    pageAmount = pageAmount ?? toPositiveInt(result?.pageAmount)
+    hasMore = pageAmount !== null ? currentPage < pageAmount : rawItems.length === pageSize
+    nextPageNum = hasMore ? currentPage + 1 : null
+    if (!hasMore) {
+      break
+    }
+    currentPage = currentPage + 1
+  }
+
+  if (!responseMeta) {
+    throw new Error("Failed to fetch list pages")
+  }
+
+  const knownResultAmount = resultAmount ?? collectedRawItems.length
   const listLimit = resolveListItemLimit({
-    total: rawItems.length,
+    total: collectedRawItems.length,
     requestedMaxRows: args.max_rows,
-    requestedMaxItems: args.max_items,
-    includeAnswers
+    requestedMaxItems: args.max_items
   })
 
-  const items = rawItems
+  const items = collectedRawItems
     .slice(0, listLimit.limit)
     .map((raw) => normalizeRecordItem(raw, includeAnswers))
   const columnProjection = projectRecordItemsColumns({
@@ -1033,15 +1402,69 @@ async function executeRecordsList(
     limitBytes: MAX_LIST_ITEMS_BYTES
   })
   const truncationReason = mergeTruncationReasons(listLimit.reason, columnProjection.reason, fitted.reason)
+  const omittedItems = Math.max(0, knownResultAmount - fitted.items.length)
+  const isComplete =
+    !hasMore &&
+    omittedItems === 0 &&
+    fitted.omittedItems === 0 &&
+    fitted.omittedChars === 0
+  const nextPageToken =
+    hasMore && nextPageNum
+      ? encodeContinuationToken({
+          app_key: args.app_key,
+          next_page_num: nextPageNum,
+          page_size: pageSize
+        })
+      : null
+
+  const completeness: z.infer<typeof completenessSchema> = {
+    result_amount: knownResultAmount,
+    returned_items: fitted.items.length,
+    fetched_pages: fetchedPages,
+    requested_pages: requestedPages,
+    actual_scanned_pages: fetchedPages,
+    has_more: hasMore,
+    next_page_token: nextPageToken,
+    is_complete: isComplete,
+    partial: !isComplete,
+    omitted_items: omittedItems,
+    omitted_chars: fitted.omittedChars
+  }
+  const listState: ListQueryState = {
+    query_id: queryId,
+    app_key: args.app_key,
+    selected_columns: columnProjection.selectedColumns,
+    filters: echoFilters(effectiveFilters),
+    time_range: args.time_range
+      ? {
+          column: String(args.time_range.column),
+          from: args.time_range.from ?? null,
+          to: args.time_range.to ?? null,
+          timezone: args.time_range.timezone ?? null
+        }
+      : null
+  }
+
+  if (args.strict_full && !isComplete) {
+    throw new NeedMoreDataError(
+      "List result is incomplete. Increase requested_pages/max_rows or continue with next_page_token.",
+      {
+        code: "NEED_MORE_DATA",
+        completeness,
+        evidence: buildEvidencePayload(listState, sourcePages)
+      }
+    )
+  }
+
   const responsePayload: z.infer<typeof listSuccessOutputSchema> = {
     ok: true,
     data: {
       app_key: args.app_key,
       pagination: {
-        page_num: toPositiveInt(result?.pageNum) ?? pageNum,
-        page_size: toPositiveInt(result?.pageSize) ?? pageSize,
-        page_amount: toNonNegativeInt(result?.pageAmount),
-        result_amount: toNonNegativeInt(result?.resultAmount) ?? fitted.items.length
+        page_num: pageNum,
+        page_size: pageSize,
+        page_amount: pageAmount,
+        result_amount: knownResultAmount
       },
       items: fitted.items as z.infer<typeof recordItemSchema>[],
       applied_limits: {
@@ -1049,16 +1472,18 @@ async function executeRecordsList(
         row_cap: listLimit.limit,
         column_cap: args.max_columns ?? null,
         selected_columns: columnProjection.selectedColumns
-      }
+      },
+      completeness,
+      evidence: buildEvidencePayload(listState, sourcePages)
     },
-    meta: buildMeta(response)
+    meta: responseMeta
   }
 
   return {
     payload: responsePayload,
     message: buildRecordsListMessage({
       returned: fitted.items.length,
-      total: rawItems.length,
+      total: knownResultAmount,
       truncationReason
     })
   }
@@ -1067,6 +1492,7 @@ async function executeRecordsList(
 async function executeRecordGet(
   args: z.infer<typeof recordGetInputSchema>
 ): Promise<{ payload: z.infer<typeof recordGetSuccessOutputSchema>; message: string }> {
+  const queryId = randomUUID()
   const response = await client.getRecord(String(args.apply_id))
   const record = asObject(response.result) ?? {}
   const projection = projectAnswersForOutput({
@@ -1090,6 +1516,24 @@ async function executeRecordGet(
         applied_limits: {
           column_cap: args.max_columns ?? null,
           selected_columns: projection.selectedColumns
+        },
+        completeness: {
+          result_amount: 1,
+          returned_items: 1,
+          fetched_pages: 1,
+          requested_pages: 1,
+          actual_scanned_pages: 1,
+          has_more: false,
+          next_page_token: null,
+          is_complete: true,
+          partial: false,
+          omitted_items: 0,
+          omitted_chars: 0
+        },
+        evidence: {
+          query_id: queryId,
+          apply_id: String(args.apply_id),
+          selected_columns: projection.selectedColumns ?? []
         }
       },
       meta: buildMeta(response)
@@ -1117,11 +1561,15 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     throw new Error("select_columns is required for summary query")
   }
 
+  const queryId = randomUUID()
+  const strictFull = args.strict_full ?? true
   const includeNegative = args.stat_policy?.include_negative ?? true
   const includeNull = args.stat_policy?.include_null ?? false
-  const scanMaxPages = args.scan_max_pages ?? 50
+  const scanMaxPages = args.scan_max_pages ?? DEFAULT_SCAN_MAX_PAGES
+  const requestedPages = args.requested_pages ?? scanMaxPages
+  const startPage = resolveStartPage(args.page_num, args.page_token, args.app_key)
   const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
-  const rowCap = Math.min(args.max_rows ?? DEFAULT_PAGE_SIZE, 200)
+  const rowCap = Math.min(args.max_rows ?? DEFAULT_ROW_LIMIT, DEFAULT_ROW_LIMIT)
   const timezone = args.time_range?.timezone ?? "Asia/Shanghai"
 
   const form = await getFormCached(args.app_key, args.user_id, false)
@@ -1150,18 +1598,36 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     })
   }
 
-  let currentPage = args.page_num ?? 1
+  const listState: ListQueryState = {
+    query_id: queryId,
+    app_key: args.app_key,
+    selected_columns: effectiveColumns.map((item) => item.requested),
+    filters: echoFilters(summaryFilters),
+    time_range: timeColumn
+      ? {
+          column: timeColumn.requested,
+          from: args.time_range?.from ?? null,
+          to: args.time_range?.to ?? null,
+          timezone
+        }
+      : null
+  }
+
+  let currentPage = startPage
   let scannedPages = 0
   let scannedRecords = 0
-  let truncated = false
+  let hasMore = false
+  let nextPageNum: number | null = null
+  let resultAmount: number | null = null
   let summaryMeta: ReturnType<typeof buildMeta> | null = null
   let totalAmount = 0
   let missingCount = 0
+  const sourcePages: number[] = []
 
   const rows: Array<Record<string, unknown>> = []
   const byDay = new Map<string, { count: number; amount: number }>()
 
-  while (true) {
+  while (scannedPages < requestedPages && scannedPages < scanMaxPages) {
     const payload = buildListPayload({
       pageNum: currentPage,
       pageSize,
@@ -1176,11 +1642,14 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
     summaryMeta = summaryMeta ?? buildMeta(response)
     scannedPages += 1
+    sourcePages.push(currentPage)
 
     const result = asObject(response.result)
     const rawItems = asArray(result?.result)
     const pageAmount = toPositiveInt(result?.pageAmount)
-    const hasMoreByAmount = pageAmount !== null ? currentPage < pageAmount : rawItems.length === pageSize
+    resultAmount = resultAmount ?? toNonNegativeInt(result?.resultAmount)
+    hasMore = pageAmount !== null ? currentPage < pageAmount : rawItems.length === pageSize
+    nextPageNum = hasMore ? currentPage + 1 : null
 
     for (const rawItem of rawItems) {
       const record = asObject(rawItem) ?? {}
@@ -1224,16 +1693,11 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       byDay.set(dayKey, bucket)
     }
 
-    if (!hasMoreByAmount) {
+    if (!hasMore) {
       break
     }
 
-    if (scannedPages >= scanMaxPages) {
-      truncated = true
-      break
-    }
-
-    currentPage += 1
+    currentPage = currentPage + 1
   }
 
   const byDayStats = Array.from(byDay.entries())
@@ -1280,6 +1744,43 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     throw new Error("Failed to build summary metadata")
   }
 
+  const knownResultAmount = resultAmount ?? scannedRecords
+  const omittedItems = Math.max(0, knownResultAmount - scannedRecords)
+  const isComplete = !hasMore && omittedItems === 0
+  const nextPageToken =
+    hasMore && nextPageNum
+      ? encodeContinuationToken({
+          app_key: args.app_key,
+          next_page_num: nextPageNum,
+          page_size: pageSize
+        })
+      : null
+  const completeness: z.infer<typeof completenessSchema> = {
+    result_amount: knownResultAmount,
+    returned_items: scannedRecords,
+    fetched_pages: scannedPages,
+    requested_pages: requestedPages,
+    actual_scanned_pages: scannedPages,
+    has_more: hasMore,
+    next_page_token: nextPageToken,
+    is_complete: isComplete,
+    partial: !isComplete,
+    omitted_items: omittedItems,
+    omitted_chars: 0
+  }
+  const evidence = buildEvidencePayload(listState, sourcePages)
+
+  if (strictFull && !isComplete) {
+    throw new NeedMoreDataError(
+      "Summary is incomplete. Continue with next_page_token or increase requested_pages/scan_max_pages.",
+      {
+        code: "NEED_MORE_DATA",
+        completeness,
+        evidence
+      }
+    )
+  }
+
   return {
     data: {
       summary: {
@@ -1289,6 +1790,8 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
         missing_count: missingCount
       },
       rows,
+      completeness,
+      evidence,
       meta: {
         field_mapping: fieldMapping,
         filters: {
@@ -1309,7 +1812,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
         execution: {
           scanned_records: scannedRecords,
           scanned_pages: scannedPages,
-          truncated,
+          truncated: !isComplete,
           row_cap: rowCap,
           column_cap: args.max_columns ?? null,
           scan_max_pages: scanMaxPages
@@ -1317,7 +1820,245 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       }
     },
     meta: summaryMeta,
-    message: `Summarized ${scannedRecords} records`
+    message: isComplete
+      ? `Summarized ${scannedRecords} records`
+      : `Summarized ${scannedRecords}/${knownResultAmount} records (partial)`
+  }
+}
+
+async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema>): Promise<{
+  payload: z.infer<typeof aggregateOutputSchema>
+  message: string
+}> {
+  const queryId = randomUUID()
+  const strictFull = args.strict_full ?? true
+  const includeNegative = args.stat_policy?.include_negative ?? true
+  const includeNull = args.stat_policy?.include_null ?? false
+  const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
+  const scanMaxPages = args.scan_max_pages ?? DEFAULT_SCAN_MAX_PAGES
+  const requestedPages = args.requested_pages ?? scanMaxPages
+  const startPage = resolveStartPage(args.page_num, args.page_token, args.app_key)
+  const maxGroups = args.max_groups ?? 200
+  const timezone = args.time_range?.timezone ?? "Asia/Shanghai"
+
+  const form = await getFormCached(args.app_key, args.user_id, false)
+  const index = buildFieldIndex(form.result)
+  const groupColumns = resolveSummaryColumns(args.group_by, index, "group_by")
+  const amountColumn =
+    args.amount_column !== undefined
+      ? resolveSummaryColumn(args.amount_column, index, "amount_column")
+      : null
+  const timeColumn = args.time_range ? resolveSummaryColumn(args.time_range.column, index, "time_range.column") : null
+
+  const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
+  const aggregateFilters = [...(args.filters ?? [])]
+  if (timeColumn && (args.time_range?.from || args.time_range?.to)) {
+    aggregateFilters.push({
+      que_id: timeColumn.que_id,
+      ...(args.time_range.from ? { min_value: args.time_range.from } : {}),
+      ...(args.time_range.to ? { max_value: args.time_range.to } : {})
+    })
+  }
+
+  const listState: ListQueryState = {
+    query_id: queryId,
+    app_key: args.app_key,
+    selected_columns: groupColumns.map((item) => item.requested),
+    filters: echoFilters(aggregateFilters),
+    time_range: timeColumn
+      ? {
+          column: timeColumn.requested,
+          from: args.time_range?.from ?? null,
+          to: args.time_range?.to ?? null,
+          timezone
+        }
+      : null
+  }
+
+  let currentPage = startPage
+  let scannedPages = 0
+  let scannedRecords = 0
+  let hasMore = false
+  let nextPageNum: number | null = null
+  let resultAmount: number | null = null
+  let responseMeta: ReturnType<typeof buildMeta> | null = null
+  let totalAmount = 0
+  const sourcePages: number[] = []
+  const groupStats = new Map<string, { group: Record<string, unknown>; count: number; amount: number }>()
+
+  while (scannedPages < requestedPages && scannedPages < scanMaxPages) {
+    const payload = buildListPayload({
+      pageNum: currentPage,
+      pageSize,
+      mode: args.mode,
+      type: args.type,
+      keyword: args.keyword,
+      queryLogic: args.query_logic,
+      applyIds: args.apply_ids,
+      sort: normalizedSort,
+      filters: aggregateFilters
+    })
+    const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
+    responseMeta = responseMeta ?? buildMeta(response)
+    scannedPages += 1
+    sourcePages.push(currentPage)
+
+    const result = asObject(response.result)
+    const rawItems = asArray(result?.result)
+    const pageAmount = toPositiveInt(result?.pageAmount)
+    resultAmount = resultAmount ?? toNonNegativeInt(result?.resultAmount)
+    hasMore = pageAmount !== null ? currentPage < pageAmount : rawItems.length === pageSize
+    nextPageNum = hasMore ? currentPage + 1 : null
+
+    for (const rawItem of rawItems) {
+      const record = asObject(rawItem) ?? {}
+      const answers = asArray(record.answers)
+      scannedRecords += 1
+
+      const group: Record<string, unknown> = {}
+      for (const column of groupColumns) {
+        group[column.requested] = extractSummaryColumnValue(answers, column)
+      }
+      const groupKey = stableJson(group)
+      const bucket = groupStats.get(groupKey) ?? { group, count: 0, amount: 0 }
+      bucket.count += 1
+
+      if (amountColumn) {
+        const amountValue = extractSummaryColumnValue(answers, amountColumn)
+        const numericAmount = toFiniteAmount(amountValue)
+        if (numericAmount === null) {
+          if (includeNull) {
+            // Keep group count while amount contributes 0.
+          }
+        } else if (includeNegative || numericAmount >= 0) {
+          bucket.amount += numericAmount
+          totalAmount += numericAmount
+        }
+      }
+
+      groupStats.set(groupKey, bucket)
+    }
+
+    if (!hasMore) {
+      break
+    }
+    currentPage = currentPage + 1
+  }
+
+  if (!responseMeta) {
+    throw new Error("Failed to fetch aggregate pages")
+  }
+
+  const knownResultAmount = resultAmount ?? scannedRecords
+  const omittedItems = Math.max(0, knownResultAmount - scannedRecords)
+  const isComplete = !hasMore && omittedItems === 0
+  const nextPageToken =
+    hasMore && nextPageNum
+      ? encodeContinuationToken({
+          app_key: args.app_key,
+          next_page_num: nextPageNum,
+          page_size: pageSize
+        })
+      : null
+  const completeness: z.infer<typeof completenessSchema> = {
+    result_amount: knownResultAmount,
+    returned_items: scannedRecords,
+    fetched_pages: scannedPages,
+    requested_pages: requestedPages,
+    actual_scanned_pages: scannedPages,
+    has_more: hasMore,
+    next_page_token: nextPageToken,
+    is_complete: isComplete,
+    partial: !isComplete,
+    omitted_items: omittedItems,
+    omitted_chars: 0
+  }
+  const evidence = buildEvidencePayload(listState, sourcePages)
+
+  if (strictFull && !isComplete) {
+    throw new NeedMoreDataError(
+      "Aggregate result is incomplete. Continue with next_page_token or increase requested_pages/scan_max_pages.",
+      {
+        code: "NEED_MORE_DATA",
+        completeness,
+        evidence
+      }
+    )
+  }
+
+  const groups = Array.from(groupStats.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, maxGroups)
+    .map((bucket) => ({
+      group: bucket.group,
+      count: bucket.count,
+      count_ratio: scannedRecords > 0 ? bucket.count / scannedRecords : 0,
+      amount_total: amountColumn ? bucket.amount : null,
+      amount_ratio:
+        amountColumn && totalAmount !== 0
+          ? bucket.amount / totalAmount
+          : amountColumn
+            ? 0
+            : null
+    }))
+
+  const fieldMapping = [
+    ...groupColumns.map((item) => ({
+      role: "group_by" as const,
+      requested: item.requested,
+      que_id: item.que_id,
+      que_title: item.que_title,
+      que_type: item.que_type
+    })),
+    ...(amountColumn
+      ? [
+          {
+            role: "amount" as const,
+            requested: amountColumn.requested,
+            que_id: amountColumn.que_id,
+            que_title: amountColumn.que_title,
+            que_type: amountColumn.que_type
+          }
+        ]
+      : []),
+    ...(timeColumn
+      ? [
+          {
+            role: "time" as const,
+            requested: timeColumn.requested,
+            que_id: timeColumn.que_id,
+            que_title: timeColumn.que_title,
+            que_type: timeColumn.que_type
+          }
+        ]
+      : [])
+  ]
+
+  return {
+    payload: {
+      ok: true,
+      data: {
+        app_key: args.app_key,
+        summary: {
+          total_count: scannedRecords,
+          total_amount: amountColumn ? totalAmount : null
+        },
+        groups,
+        completeness,
+        evidence,
+        meta: {
+          field_mapping: fieldMapping,
+          stat_policy: {
+            include_negative: includeNegative,
+            include_null: includeNull
+          }
+        }
+      },
+      meta: responseMeta
+    },
+    message: isComplete
+      ? `Aggregated ${scannedRecords} records`
+      : `Aggregated ${scannedRecords}/${knownResultAmount} records (partial)`
   }
 }
 
@@ -1859,7 +2600,6 @@ function resolveListItemLimit(params: {
   total: number
   requestedMaxRows?: number
   requestedMaxItems?: number
-  includeAnswers: boolean
 }): { limit: number; reason: string | null } {
   if (params.total <= 0) {
     return { limit: 0, reason: null }
@@ -1886,10 +2626,10 @@ function resolveListItemLimit(params: {
     return { limit, reason: null }
   }
 
-  if (params.includeAnswers && params.total > DEFAULT_MAX_ITEMS_WITH_ANSWERS) {
+  if (params.total > DEFAULT_ROW_LIMIT) {
     return {
-      limit: DEFAULT_MAX_ITEMS_WITH_ANSWERS,
-      reason: `auto-limited to ${DEFAULT_MAX_ITEMS_WITH_ANSWERS} items because include_answers=true`
+      limit: DEFAULT_ROW_LIMIT,
+      reason: `default-limited to ${DEFAULT_ROW_LIMIT} items`
     }
   }
 
@@ -1985,20 +2725,29 @@ function projectAnswersForOutput(params: {
 function fitListItemsWithinSize(params: {
   items: Array<Record<string, unknown>>
   limitBytes: number
-}): { items: Array<Record<string, unknown>>; reason: string | null } {
+}): {
+  items: Array<Record<string, unknown>>
+  reason: string | null
+  omittedItems: number
+  omittedChars: number
+} {
   let candidate = params.items
-  let size = jsonSizeBytes(candidate)
+  const originalSize = jsonSizeBytes(candidate)
+  let size = originalSize
   if (size <= params.limitBytes) {
-    return { items: candidate, reason: null }
+    return { items: candidate, reason: null, omittedItems: 0, omittedChars: 0 }
   }
 
+  const originalCount = candidate.length
   while (candidate.length > 1) {
     candidate = candidate.slice(0, candidate.length - 1)
     size = jsonSizeBytes(candidate)
     if (size <= params.limitBytes) {
       return {
         items: candidate,
-        reason: `auto-limited to ${candidate.length} items to keep response <= ${params.limitBytes} bytes`
+        reason: `auto-limited to ${candidate.length} items to keep response <= ${params.limitBytes} bytes`,
+        omittedItems: Math.max(0, originalCount - candidate.length),
+        omittedChars: Math.max(0, originalSize - size)
       }
     }
   }
@@ -2083,6 +2832,21 @@ function normalizeQueId(queId: unknown): string | number {
   throw new Error(`Resolved que_id has unsupported type: ${typeof queId}`)
 }
 
+function stableJson(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "null"
+  }
+  if (typeof value !== "object") {
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJson(item)).join(",")}]`
+  }
+  const obj = value as Record<string, unknown>
+  const keys = Object.keys(obj).sort()
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableJson(obj[key])}`).join(",")}}`
+}
+
 function jsonSizeBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8")
 }
@@ -2118,6 +2882,15 @@ function errorResult(error: unknown) {
 }
 
 function toErrorPayload(error: unknown): Record<string, unknown> {
+  if (error instanceof NeedMoreDataError) {
+    return {
+      ok: false,
+      code: error.code,
+      status: "need_more_data",
+      message: error.message,
+      details: error.details
+    }
+  }
   if (error instanceof QingflowApiError) {
     return {
       ok: false,

@@ -606,6 +606,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     const names = tools.tools.map((item) => item.name)
     assert.ok(names.includes("qf_query"))
     assert.ok(names.includes("qf_records_list"))
+    assert.ok(names.includes("qf_records_aggregate"))
     assert.ok(names.includes("qf_record_create"))
   })
 
@@ -634,6 +635,12 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(listed.data.items.length, 3)
     assert.deepEqual(listed.data.applied_limits.selected_columns, ["1001", "金额"])
     assert.equal(listed.data.applied_limits.row_cap, 3)
+    assert.equal(listed.data.completeness.result_amount, 6)
+    assert.equal(listed.data.completeness.returned_items, 3)
+    assert.equal(listed.data.completeness.is_complete, false)
+    assert.equal(listed.data.completeness.partial, true)
+    assert.equal(listed.data.evidence.app_key, APP_KEY)
+    assert.equal(listed.data.evidence.source_pages.length, 1)
 
     for (const item of listed.data.items) {
       const answers = Array.isArray(item.answers) ? item.answers : []
@@ -650,6 +657,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       app_key: APP_KEY,
       mode: "all",
       page_size: 3,
+      max_rows: 3,
       sort: [{ que_id: "下单日期", ascend: false }],
       select_columns: [1003]
     })
@@ -658,6 +666,34 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(listed.data.items.length, 3)
     const firstDay = firstAnswerValue(listed.data.items[0])
     assert.equal(firstDay, "2026-02-01")
+  })
+
+  await t.test("qf_records_list returns deterministic pagination token", async () => {
+    const page1 = await callTool(mcp.client, "qf_records_list", {
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: 2,
+      requested_pages: 1,
+      max_rows: 50,
+      select_columns: [1001]
+    })
+
+    assert.equal(page1.ok, true)
+    assert.equal(page1.data.completeness.has_more, true)
+    assert.equal(typeof page1.data.completeness.next_page_token, "string")
+    assert.equal(page1.data.completeness.actual_scanned_pages, 1)
+
+    const page2 = await callTool(mcp.client, "qf_records_list", {
+      app_key: APP_KEY,
+      page_token: page1.data.completeness.next_page_token,
+      page_size: 2,
+      requested_pages: 1,
+      max_rows: 50,
+      select_columns: [1001]
+    })
+
+    assert.equal(page2.ok, true)
+    assert.equal(page2.data.evidence.source_pages[0], 2)
   })
 
   await t.test("qf_record_get supports select_columns/max_columns", async () => {
@@ -679,6 +715,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       app_key: APP_KEY,
       mode: "all",
       page_size: 2,
+      max_rows: 2,
       select_columns: [1001]
     })
 
@@ -686,6 +723,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(queryList.data.mode, "list")
     assert.equal(queryList.data.source_tool, "qf_records_list")
     assert.equal(queryList.data.list.items.length, 2)
+    assert.equal(queryList.data.list.completeness.is_complete, false)
+    assert.equal(queryList.data.list.completeness.partial, true)
 
     const queryRecord = await callTool(mcp.client, "qf_query", {
       apply_id: "5001",
@@ -696,6 +735,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(queryRecord.data.mode, "record")
     assert.equal(queryRecord.data.source_tool, "qf_record_get")
     assert.equal(queryRecord.data.record.apply_id, "5001")
+    assert.equal(queryRecord.data.record.completeness.is_complete, true)
   })
 
   await t.test("qf_query list mode applies time_range as filter", async () => {
@@ -704,6 +744,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       app_key: APP_KEY,
       mode: "all",
       page_size: 20,
+      max_rows: 20,
       select_columns: [1001],
       time_range: {
         column: 1003,
@@ -746,6 +787,9 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(summary.data.summary.summary.total_amount, 330)
     assert.equal(summary.data.summary.summary.missing_count, 1)
     assert.equal(summary.data.summary.rows.length, 3)
+    assert.equal(summary.data.summary.completeness.is_complete, true)
+    assert.equal(summary.data.summary.completeness.actual_scanned_pages, 3)
+    assert.equal(summary.data.summary.evidence.source_pages.length, 3)
 
     for (const row of summary.data.summary.rows) {
       assert.deepEqual(Object.keys(row), ["1001"])
@@ -762,11 +806,84 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       query_mode: "list",
       app_key: APP_KEY,
       mode: "all",
-      page_size: 2
+      page_size: 2,
+      max_rows: 2
     })
 
     assert.equal(failed.ok, false)
     assert.match(failed.message, /select_columns is required for list query/)
+  })
+
+  await t.test("qf_query list mode uses default row limit when max_rows is omitted", async () => {
+    const listed = await callTool(mcp.client, "qf_query", {
+      query_mode: "list",
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: 2,
+      select_columns: [1001]
+    })
+
+    assert.equal(listed.ok, true)
+    assert.equal(listed.data.mode, "list")
+    assert.equal(listed.data.list.completeness.returned_items, 2)
+    assert.equal(listed.data.list.completeness.is_complete, false)
+  })
+
+  await t.test("qf_records_list strict_full fails when result is incomplete", async () => {
+    const failed = await callTool(mcp.client, "qf_records_list", {
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: 20,
+      max_rows: 2,
+      strict_full: true,
+      select_columns: [1001]
+    })
+
+    assert.equal(failed.ok, false)
+    assert.equal(failed.code, "NEED_MORE_DATA")
+    assert.equal(failed.status, "need_more_data")
+    assert.equal(failed.details.completeness.is_complete, false)
+  })
+
+  await t.test("qf_query summary strict_full fails when scan is incomplete", async () => {
+    const failed = await callTool(mcp.client, "qf_query", {
+      query_mode: "summary",
+      app_key: APP_KEY,
+      mode: "all",
+      select_columns: [1001],
+      amount_column: 1002,
+      page_size: 2,
+      scan_max_pages: 1,
+      requested_pages: 1,
+      max_rows: 3,
+      strict_full: true
+    })
+
+    assert.equal(failed.ok, false)
+    assert.equal(failed.code, "NEED_MORE_DATA")
+    assert.equal(failed.details.completeness.is_complete, false)
+    assert.equal(failed.details.completeness.has_more, true)
+  })
+
+  await t.test("qf_records_aggregate returns grouped metrics with evidence", async () => {
+    const aggregated = await callTool(mcp.client, "qf_records_aggregate", {
+      app_key: APP_KEY,
+      mode: "all",
+      group_by: [1003],
+      amount_column: 1002,
+      page_size: 2,
+      requested_pages: 10,
+      scan_max_pages: 10,
+      strict_full: true
+    })
+
+    assert.equal(aggregated.ok, true)
+    assert.equal(aggregated.data.summary.total_count, 6)
+    assert.equal(aggregated.data.summary.total_amount, 350)
+    assert.equal(aggregated.data.completeness.is_complete, true)
+    assert.ok(Array.isArray(aggregated.data.groups))
+    assert.ok(aggregated.data.groups.length > 0)
+    assert.equal(aggregated.data.evidence.source_pages.length, 3)
   })
 
   await t.test("create + update + operation are still working", async () => {
