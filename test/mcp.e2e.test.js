@@ -24,7 +24,7 @@ function buildForm() {
     questionBaseInfos: [
       { queId: 1001, queTitle: "客户名称", queType: 2, subQuestionBaseInfos: [] },
       { queId: 1002, queTitle: "金额", queType: 6, subQuestionBaseInfos: [] },
-      { queId: 1003, queTitle: "下单日期", queType: 3, subQuestionBaseInfos: [] }
+      { queId: 1003, queTitle: "下单日期", queType: 4, subQuestionBaseInfos: [] }
     ],
     questionRelations: []
   }
@@ -746,6 +746,22 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(listed.data.list.completeness.returned_items, 2)
   })
 
+  await t.test("qf_query list mode accepts camelCase aliases", async () => {
+    const listed = await callTool(mcp.client, "qf_query", {
+      queryMode: "list",
+      appKey: APP_KEY,
+      mode: "all",
+      pageSize: 2,
+      maxRows: 2,
+      selectColumns: [1001]
+    })
+
+    assert.equal(listed.ok, true)
+    assert.equal(listed.data.mode, "list")
+    assert.equal(listed.data.list.items.length, 2)
+    assert.equal(listed.data.list.completeness.returned_items, 2)
+  })
+
   await t.test("qf_records_list returns deterministic pagination token", async () => {
     const page1 = await callTool(mcp.client, "qf_records_list", {
       app_key: APP_KEY,
@@ -837,6 +853,27 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(queryList.data.list.items.length, 2)
   })
 
+  await t.test("qf_records_list rejects date-like range on non-date filter field", async () => {
+    const failed = await callTool(mcp.client, "qf_records_list", {
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: 20,
+      max_rows: 20,
+      select_columns: [1001],
+      filters: [
+        {
+          que_id: 1002,
+          min_value: "2026-01-01",
+          max_value: "2026-01-31"
+        }
+      ]
+    })
+
+    assert.equal(failed.ok, false)
+    assert.equal(failed.error_code, "FILTER_FIELD_TYPE_MISMATCH")
+    assert.equal(typeof failed.fix_hint, "string")
+  })
+
   await t.test("qf_query summary returns computed aggregates + strict rows", async () => {
     const summary = await callTool(mcp.client, "qf_query", {
       query_mode: "summary",
@@ -877,6 +914,25 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.deepEqual(roles, ["amount", "row", "time"])
     assert.equal(summary.data.summary.meta.execution.scanned_pages, 3)
     assert.equal(summary.data.summary.meta.execution.truncated, false)
+  })
+
+  await t.test("qf_query summary tolerates double-stringified amount_column", async () => {
+    const summary = await callTool(mcp.client, "qf_query", {
+      query_mode: "summary",
+      app_key: APP_KEY,
+      mode: "all",
+      select_columns: "\"[1001]\"",
+      amount_column: "\"1002\"",
+      page_size: "\"2\"",
+      scan_max_pages: "\"10\"",
+      requested_pages: "\"10\"",
+      strict_full: "\"false\""
+    })
+
+    assert.equal(summary.ok, true)
+    assert.equal(summary.data.mode, "summary")
+    assert.equal(summary.data.summary.summary.total_count, 6)
+    assert.equal(summary.data.summary.summary.total_amount, 350)
   })
 
   await t.test("qf_query list mode missing select_columns returns structured error", async () => {
@@ -980,6 +1036,23 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       requested_pages: "10",
       scan_max_pages: "10",
       strict_full: "true"
+    })
+
+    assert.equal(aggregated.ok, true)
+    assert.equal(aggregated.data.summary.total_count, 6)
+    assert.equal(aggregated.completeness.is_complete, true)
+  })
+
+  await t.test("qf_records_aggregate accepts camelCase aliases", async () => {
+    const aggregated = await callTool(mcp.client, "qf_records_aggregate", {
+      appKey: APP_KEY,
+      mode: "all",
+      groupBy: [1003],
+      amountColumns: 1002,
+      pageSize: 2,
+      requestedPages: 10,
+      scanMaxPages: 10,
+      strictFull: true
     })
 
     assert.equal(aggregated.ok, true)

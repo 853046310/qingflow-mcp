@@ -121,7 +121,7 @@ const client = new QingflowClient({
 
 const server = new McpServer({
   name: "qingflow-mcp",
-  version: "0.3.3"
+  version: "0.3.4"
 })
 
 const jsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()])
@@ -1498,29 +1498,76 @@ function missingRequiredFieldError(params: {
   })
 }
 
+const COMMON_INPUT_ALIASES: Record<string, string> = {
+  appKey: "app_key",
+  userId: "user_id",
+  pageNum: "page_num",
+  pageSize: "page_size",
+  pageToken: "page_token",
+  requestedPages: "requested_pages",
+  scanMaxPages: "scan_max_pages",
+  queryMode: "query_mode",
+  queryLogic: "query_logic",
+  applyId: "apply_id",
+  applyIds: "apply_ids",
+  maxRows: "max_rows",
+  maxItems: "max_items",
+  maxColumns: "max_columns",
+  selectColumns: "select_columns",
+  keepColumns: "keep_columns",
+  keep_columns: "select_columns",
+  includeAnswers: "include_answers",
+  amountColumn: "amount_column",
+  amountColumns: "amount_column",
+  amount_columns: "amount_column",
+  timeRange: "time_range",
+  statPolicy: "stat_policy",
+  groupBy: "group_by",
+  strictFull: "strict_full",
+  forceRefresh: "force_refresh",
+  forceRefreshForm: "force_refresh_form",
+  applyUser: "apply_user"
+}
+
+function applyAliases(
+  obj: Record<string, unknown>,
+  aliases: Record<string, string>
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...obj }
+  for (const [alias, canonical] of Object.entries(aliases)) {
+    if (out[canonical] === undefined && out[alias] !== undefined) {
+      out[canonical] = out[alias]
+    }
+  }
+  return out
+}
+
 function normalizeListInput(raw: unknown): unknown {
   const parsedRoot = parseJsonLikeDeep(raw)
   const obj = asObject(parsedRoot)
   if (!obj) {
     return parsedRoot
   }
+  const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
+  const selectColumns = normalizedObj.select_columns ?? normalizedObj.keep_columns
+
   return {
-    ...obj,
-    page_num: coerceNumberLike(obj.page_num),
-    page_size: coerceNumberLike(obj.page_size),
-    requested_pages: coerceNumberLike(obj.requested_pages),
-    scan_max_pages: coerceNumberLike(obj.scan_max_pages),
-    type: coerceNumberLike(obj.type),
-    max_rows: coerceNumberLike(obj.max_rows),
-    max_items: coerceNumberLike(obj.max_items),
-    max_columns: coerceNumberLike(obj.max_columns),
-    strict_full: coerceBooleanLike(obj.strict_full),
-    include_answers: coerceBooleanLike(obj.include_answers),
-    apply_ids: normalizeIdArrayInput(obj.apply_ids),
-    sort: normalizeSortInput(obj.sort),
-    filters: normalizeFiltersInput(obj.filters),
-    select_columns: normalizeSelectorListInput(obj.select_columns),
-    time_range: normalizeTimeRangeInput(obj.time_range)
+    ...normalizedObj,
+    page_num: coerceNumberLike(normalizedObj.page_num),
+    page_size: coerceNumberLike(normalizedObj.page_size),
+    requested_pages: coerceNumberLike(normalizedObj.requested_pages),
+    scan_max_pages: coerceNumberLike(normalizedObj.scan_max_pages),
+    type: coerceNumberLike(normalizedObj.type),
+    max_rows: coerceNumberLike(normalizedObj.max_rows),
+    max_items: coerceNumberLike(normalizedObj.max_items),
+    max_columns: coerceNumberLike(normalizedObj.max_columns),
+    strict_full: coerceBooleanLike(normalizedObj.strict_full),
+    include_answers: coerceBooleanLike(normalizedObj.include_answers),
+    apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
+    sort: normalizeSortInput(normalizedObj.sort),
+    filters: normalizeFiltersInput(normalizedObj.filters),
+    select_columns: normalizeSelectorListInput(selectColumns),
+    time_range: normalizeTimeRangeInput(normalizedObj.time_range)
   }
 }
 
@@ -1530,11 +1577,14 @@ function normalizeRecordGetInput(raw: unknown): unknown {
   if (!obj) {
     return parsedRoot
   }
+  const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
+  const selectColumns = normalizedObj.select_columns ?? normalizedObj.keep_columns
+
   return {
-    ...obj,
-    apply_id: coerceNumberLike(obj.apply_id),
-    max_columns: coerceNumberLike(obj.max_columns),
-    select_columns: normalizeSelectorListInput(obj.select_columns)
+    ...normalizedObj,
+    apply_id: coerceNumberLike(normalizedObj.apply_id),
+    max_columns: coerceNumberLike(normalizedObj.max_columns),
+    select_columns: normalizeSelectorListInput(selectColumns)
   }
 }
 
@@ -1544,24 +1594,29 @@ function normalizeQueryInput(raw: unknown): unknown {
   if (!obj) {
     return parsedRoot
   }
+  const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
+  const selectColumns = normalizedObj.select_columns ?? normalizedObj.keep_columns
+
   return {
-    ...obj,
-    page_num: coerceNumberLike(obj.page_num),
-    page_size: coerceNumberLike(obj.page_size),
-    requested_pages: coerceNumberLike(obj.requested_pages),
-    scan_max_pages: coerceNumberLike(obj.scan_max_pages),
-    type: coerceNumberLike(obj.type),
-    max_rows: coerceNumberLike(obj.max_rows),
-    max_items: coerceNumberLike(obj.max_items),
-    max_columns: coerceNumberLike(obj.max_columns),
-    apply_id: coerceNumberLike(obj.apply_id),
-    strict_full: coerceBooleanLike(obj.strict_full),
-    include_answers: coerceBooleanLike(obj.include_answers),
-    apply_ids: normalizeIdArrayInput(obj.apply_ids),
-    sort: normalizeSortInput(obj.sort),
-    filters: normalizeFiltersInput(obj.filters),
-    select_columns: normalizeSelectorListInput(obj.select_columns),
-    time_range: normalizeTimeRangeInput(obj.time_range)
+    ...normalizedObj,
+    page_num: coerceNumberLike(normalizedObj.page_num),
+    page_size: coerceNumberLike(normalizedObj.page_size),
+    requested_pages: coerceNumberLike(normalizedObj.requested_pages),
+    scan_max_pages: coerceNumberLike(normalizedObj.scan_max_pages),
+    type: coerceNumberLike(normalizedObj.type),
+    max_rows: coerceNumberLike(normalizedObj.max_rows),
+    max_items: coerceNumberLike(normalizedObj.max_items),
+    max_columns: coerceNumberLike(normalizedObj.max_columns),
+    apply_id: coerceNumberLike(normalizedObj.apply_id),
+    strict_full: coerceBooleanLike(normalizedObj.strict_full),
+    include_answers: coerceBooleanLike(normalizedObj.include_answers),
+    amount_column: coerceNumberLike(normalizedObj.amount_column),
+    apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
+    sort: normalizeSortInput(normalizedObj.sort),
+    filters: normalizeFiltersInput(normalizedObj.filters),
+    select_columns: normalizeSelectorListInput(selectColumns),
+    time_range: normalizeTimeRangeInput(normalizedObj.time_range),
+    stat_policy: normalizeStatPolicyInput(normalizedObj.stat_policy)
   }
 }
 
@@ -1571,21 +1626,24 @@ function normalizeAggregateInput(raw: unknown): unknown {
   if (!obj) {
     return parsedRoot
   }
+  const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
+
   return {
-    ...obj,
-    page_num: coerceNumberLike(obj.page_num),
-    page_size: coerceNumberLike(obj.page_size),
-    requested_pages: coerceNumberLike(obj.requested_pages),
-    scan_max_pages: coerceNumberLike(obj.scan_max_pages),
-    type: coerceNumberLike(obj.type),
-    max_groups: coerceNumberLike(obj.max_groups),
-    strict_full: coerceBooleanLike(obj.strict_full),
-    group_by: normalizeSelectorListInput(obj.group_by),
-    amount_column: coerceNumberLike(obj.amount_column),
-    apply_ids: normalizeIdArrayInput(obj.apply_ids),
-    sort: normalizeSortInput(obj.sort),
-    filters: normalizeFiltersInput(obj.filters),
-    time_range: normalizeTimeRangeInput(obj.time_range)
+    ...normalizedObj,
+    page_num: coerceNumberLike(normalizedObj.page_num),
+    page_size: coerceNumberLike(normalizedObj.page_size),
+    requested_pages: coerceNumberLike(normalizedObj.requested_pages),
+    scan_max_pages: coerceNumberLike(normalizedObj.scan_max_pages),
+    type: coerceNumberLike(normalizedObj.type),
+    max_groups: coerceNumberLike(normalizedObj.max_groups),
+    strict_full: coerceBooleanLike(normalizedObj.strict_full),
+    group_by: normalizeSelectorListInput(normalizedObj.group_by),
+    amount_column: coerceNumberLike(normalizedObj.amount_column),
+    apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
+    sort: normalizeSortInput(normalizedObj.sort),
+    filters: normalizeFiltersInput(normalizedObj.filters),
+    time_range: normalizeTimeRangeInput(normalizedObj.time_range),
+    stat_policy: normalizeStatPolicyInput(normalizedObj.stat_policy)
   }
 }
 
@@ -1706,10 +1764,11 @@ function normalizeSortInput(value: unknown): unknown {
     if (!obj) {
       return item
     }
+    const normalizedObj = applyAliases(obj, { queId: "que_id", isAscend: "ascend" })
     return {
-      ...obj,
-      que_id: coerceNumberLike(obj.que_id),
-      ascend: coerceBooleanLike(obj.ascend)
+      ...normalizedObj,
+      que_id: coerceNumberLike(normalizedObj.que_id),
+      ascend: coerceBooleanLike(normalizedObj.ascend)
     }
   })
 }
@@ -1725,11 +1784,20 @@ function normalizeFiltersInput(value: unknown): unknown {
     if (!obj) {
       return item
     }
+    const normalizedObj = applyAliases(obj, {
+      queId: "que_id",
+      searchKey: "search_key",
+      searchKeys: "search_keys",
+      minValue: "min_value",
+      maxValue: "max_value",
+      searchOptions: "search_options",
+      searchUserIds: "search_user_ids"
+    })
     return {
-      ...obj,
-      que_id: coerceNumberLike(obj.que_id),
-      scope: coerceNumberLike(obj.scope),
-      search_options: normalizeIdArrayInput(obj.search_options)
+      ...normalizedObj,
+      que_id: coerceNumberLike(normalizedObj.que_id),
+      scope: coerceNumberLike(normalizedObj.scope),
+      search_options: normalizeIdArrayInput(normalizedObj.search_options)
     }
   })
 }
@@ -1740,9 +1808,31 @@ function normalizeTimeRangeInput(value: unknown): unknown {
   if (!obj) {
     return parsed
   }
+  const normalizedObj = applyAliases(obj, {
+    queId: "column",
+    que_id: "column",
+    timeZone: "timezone"
+  })
   return {
-    ...obj,
-    column: coerceNumberLike(obj.column)
+    ...normalizedObj,
+    column: coerceNumberLike(normalizedObj.column)
+  }
+}
+
+function normalizeStatPolicyInput(value: unknown): unknown {
+  const parsed = parseJsonLikeDeep(value)
+  const obj = asObject(parsed)
+  if (!obj) {
+    return parsed
+  }
+  const normalizedObj = applyAliases(obj, {
+    includeNegative: "include_negative",
+    includeNull: "include_null"
+  })
+  return {
+    ...normalizedObj,
+    include_negative: coerceBooleanLike(normalizedObj.include_negative),
+    include_null: coerceBooleanLike(normalizedObj.include_null)
   }
 }
 
@@ -1949,6 +2039,128 @@ function appendTimeRangeFilter(
   return filters.length > 0 ? filters : undefined
 }
 
+function isLikelyDateLiteral(value: string | undefined): boolean {
+  if (!value) {
+    return false
+  }
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return false
+  }
+  return /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?$/.test(trimmed)
+}
+
+function isDateLikeQueType(queType: unknown): boolean {
+  if (typeof queType === "number" && Number.isInteger(queType)) {
+    return queType === 4
+  }
+  if (typeof queType === "string") {
+    const trimmed = queType.trim().toLowerCase()
+    if (trimmed === "date" || trimmed === "datetime") {
+      return true
+    }
+    if (/^\d+$/.test(trimmed)) {
+      return Number(trimmed) === 4
+    }
+  }
+  return false
+}
+
+function pickDateFieldSuggestion(index: FieldIndex): { que_id: string | number; que_title: string | null } | null {
+  for (const field of index.byId.values()) {
+    if (!isDateLikeQueType(field.queType) || field.queId === undefined || field.queId === null) {
+      continue
+    }
+    const normalizedQueId = normalizeQueId(field.queId)
+    if (typeof normalizedQueId === "number" && normalizedQueId <= 0) {
+      continue
+    }
+    return {
+      que_id: normalizedQueId,
+      que_title: asNullableString(field.queTitle)
+    }
+  }
+  return null
+}
+
+function hasDateLikeRangeFilters(
+  filters:
+    | Array<{
+        que_id?: string | number
+        min_value?: string
+        max_value?: string
+      }>
+    | undefined
+): boolean {
+  return (filters ?? []).some(
+    (item) =>
+      item.que_id !== undefined &&
+      (isLikelyDateLiteral(item.min_value) || isLikelyDateLiteral(item.max_value))
+  )
+}
+
+function validateDateRangeFilters(
+  filters:
+    | Array<{
+        que_id?: string | number
+        min_value?: string
+        max_value?: string
+      }>
+    | undefined,
+  index: FieldIndex,
+  tool: string
+): void {
+  for (const filter of filters ?? []) {
+    if (
+      filter.que_id === undefined ||
+      (!isLikelyDateLiteral(filter.min_value) && !isLikelyDateLiteral(filter.max_value))
+    ) {
+      continue
+    }
+
+    let resolved: FormField | null
+    try {
+      resolved = resolveFieldByKey(String(filter.que_id), index)
+    } catch (error) {
+      throw new InputValidationError({
+        message: `Cannot resolve filter field "${String(filter.que_id)}"`,
+        errorCode: "INVALID_FILTER_FIELD",
+        fixHint: "Use qf_form_get to confirm exact que_id/que_title before passing filters.",
+        details: {
+          tool,
+          filter,
+          reason: error instanceof Error ? error.message : String(error)
+        }
+      })
+    }
+
+    if (!resolved || resolved.queType === undefined || resolved.queType === null) {
+      continue
+    }
+    if (isDateLikeQueType(resolved.queType)) {
+      continue
+    }
+
+    const suggestion = pickDateFieldSuggestion(index)
+    throw new InputValidationError({
+      message: `Date-like filter range targets non-date field "${String(filter.que_id)}"`,
+      errorCode: "FILTER_FIELD_TYPE_MISMATCH",
+      fixHint: suggestion
+        ? `Use a date field for date range filters, e.g. que_id=${String(suggestion.que_id)} (${suggestion.que_title ?? "date field"}).`
+        : "Use a date field (queType=4) for date range filters.",
+      details: {
+        tool,
+        filter,
+        resolved_field: {
+          que_id: resolved.queId ?? null,
+          que_title: asNullableString(resolved.queTitle),
+          que_type: resolved.queType
+        }
+      }
+    })
+  }
+}
+
 function buildRecordGetArgsFromQuery(
   args: z.infer<typeof queryInputSchema>
 ): z.infer<typeof recordGetInputSchema> {
@@ -1999,6 +2211,11 @@ async function executeRecordsList(
   const requestedPages = args.requested_pages ?? 1
   const scanMaxPages = args.scan_max_pages ?? requestedPages
   const effectiveFilters = appendTimeRangeFilter(args.filters, args.time_range)
+  if (hasDateLikeRangeFilters(effectiveFilters)) {
+    const form = await getFormCached(args.app_key, args.user_id, false)
+    const index = buildFieldIndex(form.result)
+    validateDateRangeFilters(effectiveFilters, index, "qf_records_list")
+  }
   const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
   const includeAnswers = true
   const startedAt = Date.now()
@@ -2325,6 +2542,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       ...(args.time_range.to ? { max_value: args.time_range.to } : {})
     })
   }
+  validateDateRangeFilters(summaryFilters, index, "qf_query(summary)")
 
   const listState: ListQueryState = {
     query_id: queryId,
@@ -2594,6 +2812,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       ...(args.time_range.to ? { max_value: args.time_range.to } : {})
     })
   }
+  validateDateRangeFilters(aggregateFilters, index, "qf_records_aggregate")
 
   const listState: ListQueryState = {
     query_id: queryId,
