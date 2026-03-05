@@ -5,12 +5,11 @@
 ## 1. 总体约定
 
 1. 所有工具返回可解析 JSON（成功时在 `structuredContent`，失败时在 `content[0].text` 的 JSON 字符串）。
-2. 读工具以“可证明”为目标，统一返回：
-   - `completeness`：完整性信息
-   - `evidence`：证据链信息
-   - `error_code` / `fix_hint`：成功时为 `null`，失败时给出结构化错误与修复建议
-   - `next_page_token`：顶层续拉 token（无则 `null`）
-3. 统计结论必须看 `is_complete`：
+2. 读工具以“可证明”为目标，支持两种输出模式：
+   - `output_profile=compact`（默认）：仅返回核心数据与 `next_page_token`
+   - `output_profile=verbose`：额外返回 `completeness`、`evidence`、`meta` 等可审计字段
+   - `error_code` / `fix_hint`：在 `verbose` 成功响应中为 `null`，失败时给出结构化错误与修复建议
+3. 统计结论必须看 `is_complete`（`verbose` 模式）：
    - `is_complete=true` 才能直接用于最终统计结论
    - `is_complete=false` 只能视为样本/部分结果
 4. 默认硬限制：
@@ -27,9 +26,9 @@
    - 默认工具执行预算：`QINGFLOW_EXECUTION_BUDGET_MS=20000`
    - 默认 `scan_max_pages=10`，避免在 25s tool timeout 场景下超时。
 
-## 2. 完整性协议（completeness）
+## 2. 完整性协议（completeness，`output_profile=verbose`）
 
-读工具（`qf_records_list` / `qf_query(list|summary)` / `qf_records_aggregate` / `qf_record_get`）会返回：
+读工具（`qf_records_list` / `qf_query(list|summary)` / `qf_records_aggregate` / `qf_record_get`）在 `verbose` 模式返回：
 
 - `result_amount`: 服务端已知总条数
 - `returned_items`: 本次返回条数
@@ -43,9 +42,9 @@
 - `omitted_items`: 由于限流/截断未返回的条数
 - `omitted_chars`: 由于大小保护省略的字符量估算
 
-## 3. 证据链协议（evidence）
+## 3. 证据链协议（evidence，`output_profile=verbose`）
 
-读工具会返回：
+读工具在 `verbose` 模式返回：
 
 - `query_id`: 本次查询唯一 ID
 - `app_key`: 查询应用
@@ -101,6 +100,7 @@
   - 行列限制：`max_rows` / `max_items`（默认 200）、`max_columns`
   - 分页：`page_num` / `page_token`, `page_size`, `requested_pages`, `scan_max_pages`
   - 完整性策略：`strict_full`
+  - 输出模式：`output_profile`（`compact`|`verbose`，默认 `compact`）
 
 约束：
 - `include_answers=false` 不允许
@@ -114,7 +114,7 @@
 
 关键入参：
 - 必填：`apply_id`, `select_columns`
-- 可选：`max_columns`
+- 可选：`max_columns`, `output_profile`（默认 `compact`）
 
 约束：
 - `select_columns <= 10`
@@ -138,6 +138,7 @@
 说明：
 - `list` 模式中 `time_range` 会自动下推为筛选条件。
 - `summary` 默认 `strict_full=true`。
+- `output_profile` 默认 `compact`，可切换 `verbose` 以拿完整审计字段。
 
 ## 6.6 `qf_records_aggregate`
 
@@ -155,7 +156,7 @@
 返回核心：
 - `summary`: 总数/总金额
 - `groups`: 分组统计（count、amount、占比）
-- `completeness` + `evidence`
+- `completeness` + `evidence`（`output_profile=verbose`）
 
 ## 6.7 `qf_record_create` / `qf_record_update` / `qf_operation_get`
 

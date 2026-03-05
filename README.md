@@ -161,17 +161,20 @@ Summary mode output:
 
 1. `summary`: aggregated stats (`total_count`, `total_amount`, `by_day`, `missing_count`).
 2. `rows`: strict column rows (only requested `select_columns`).
-3. `meta`: field mapping, filter scope, stat policy, execution limits.
+3. `meta`: field mapping, filter scope, stat policy, execution limits (`output_profile=verbose` only).
 
 Return shape:
 
-1. success: structured payload `{ "ok": true, "data": ..., "meta": ... }`
+1. success: structured payload `{ "ok": true, "data": ... }` (`meta` only in `output_profile=verbose`)
 2. failure: MCP `isError=true`, and text content is JSON payload like `{ "ok": false, "message": ..., ... }`
 3. incomplete strict queries fail with `{ "code": "NEED_MORE_DATA", "status": "need_more_data", ... }`
 
 Deterministic read protocol (list/summary/aggregate):
 
-1. `completeness` is always returned:
+1. output profile:
+   - default `output_profile=compact`: return core data only (`rows/row/groups/summary` + `next_page_token`)
+   - `output_profile=verbose`: include full contract (`completeness` + `evidence` + `meta`)
+2. when `output_profile=verbose`, `completeness` fields are:
    - `result_amount`
    - `returned_items`
    - `fetched_pages`
@@ -183,15 +186,14 @@ Deterministic read protocol (list/summary/aggregate):
    - `partial`
    - `omitted_items`
    - `omitted_chars`
-2. `evidence` is always returned:
+3. when `output_profile=verbose`, `evidence` fields are:
    - `query_id`
    - `app_key`
    - `filters`
    - `selected_columns`
    - `time_range`
    - `source_pages`
-3. `strict_full=true` makes incomplete results fail fast with `NEED_MORE_DATA`.
-4. Success payloads also expose top-level `error_code=null`, `fix_hint=null`, `next_page_token`.
+4. `strict_full=true` makes incomplete results fail fast with `NEED_MORE_DATA`.
 5. Error payloads expose `error_code` and `fix_hint` for actionable retries.
 6. Parameter tolerance supports stringified JSON and numeric/boolean strings for key query fields.
 
@@ -201,12 +203,12 @@ Strict mode (`qf_records_list`):
 
 1. `select_columns` is required.
 2. `include_answers=false` is not allowed.
-3. Output `items[].answers` contains only selected columns, not full answers.
+3. Output is flat `rows[]` (no raw `answers` payload).
 
 1. For `qf_records_list.sort[].que_id`, use a real field `que_id` (numeric) or exact field title from `qf_form_get`.
 2. Avoid aliases like `create_time`; Qingflow often rejects them.
 3. Use `max_rows` (or `max_items`) to cap returned rows. Default row cap is 200.
-4. Use `max_columns` to cap answers per row when `include_answers=true`.
+4. Use `max_columns` to cap returned columns per row.
 5. Use `select_columns` to return only specific columns (supports `que_id` or exact field title).
 6. The server may still trim by response-size guardrail (`QINGFLOW_LIST_MAX_ITEMS_BYTES`) when payload is too large.
 7. Use `requested_pages` and `scan_max_pages` for deterministic page scan.
@@ -226,6 +228,7 @@ Example:
   "max_rows": 10,
   "max_columns": 5,
   "select_columns": [1, "客户名称", "1003"],
+  "output_profile": "compact",
   "strict_full": false
 }
 ```
@@ -236,7 +239,8 @@ For single record details (`qf_record_get`), the same column controls are suppor
 {
   "apply_id": "497600278750478338",
   "max_columns": 5,
-  "select_columns": [1, "客户名称"]
+  "select_columns": [1, "客户名称"],
+  "output_profile": "compact"
 }
 ```
 

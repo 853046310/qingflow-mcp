@@ -570,6 +570,48 @@ async function runCliCommand(baseUrl, args) {
 }
 
 async function callTool(client, name, args) {
+  const readTools = new Set(["qf_records_list", "qf_record_get", "qf_query", "qf_records_aggregate"])
+  const normalizedArgs =
+    readTools.has(name) && args && typeof args === "object" && args.output_profile === undefined
+      ? { ...args, output_profile: "verbose" }
+      : args
+  const result = await client.callTool({
+    name,
+    arguments: normalizedArgs
+  })
+
+  if (result.structuredContent && typeof result.structuredContent === "object") {
+    return result.structuredContent
+  }
+
+  // Compatibility fallback for clients that return only text content.
+  const textItems = Array.isArray(result.content)
+    ? result.content.filter((item) => item?.type === "text" && typeof item?.text === "string")
+    : []
+  for (const item of textItems) {
+    try {
+      const parsed = JSON.parse(item.text)
+      if (parsed && typeof parsed === "object") {
+        return parsed
+      }
+    } catch {
+      // ignore non-JSON text
+    }
+  }
+
+  const debug = JSON.stringify(
+    {
+      keys: Object.keys(result ?? {}),
+      hasContent: Array.isArray(result?.content),
+      contentPreview: Array.isArray(result?.content) ? result.content.slice(0, 1) : null
+    },
+    null,
+    2
+  )
+  throw new Error(`Tool ${name} returned no structured JSON payload: ${debug}`)
+}
+
+async function callToolRaw(client, name, args) {
   const result = await client.callTool({
     name,
     arguments: args
@@ -606,12 +648,29 @@ async function callTool(client, name, args) {
   throw new Error(`Tool ${name} returned no structured JSON payload: ${debug}`)
 }
 
-function firstAnswerValue(recordItem) {
-  const answers = Array.isArray(recordItem?.answers) ? recordItem.answers : []
-  if (answers.length === 0) {
+function firstRowValue(row) {
+  if (!row || typeof row !== "object") {
     return null
   }
-  return extractAnswerValue(answers, normalizeQueId(answers[0].queId) ?? -1)
+  for (const [key, value] of Object.entries(row)) {
+    if (key === "apply_id") {
+      continue
+    }
+    return value
+  }
+  return null
+}
+
+function rowValueByCandidates(row, candidates) {
+  if (!row || typeof row !== "object") {
+    return null
+  }
+  for (const key of candidates) {
+    if (row[key] !== undefined) {
+      return row[key]
+    }
+  }
+  return null
 }
 
 test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
@@ -685,8 +744,31 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(item.limits.select_columns_max, 10)
     assert.ok(Array.isArray(item.aliases.select_columns))
     assert.ok(item.aliases.select_columns.includes("selectColumns"))
+    assert.ok(Array.isArray(item.aliases.output_profile))
+    assert.ok(item.aliases.output_profile.includes("outputProfile"))
+    assert.equal(item.limits.output_profile, "compact|verbose (default compact)")
     assert.equal(item.minimal_example.app_key, "21b3d559")
     assert.ok(Array.isArray(item.minimal_example.select_columns))
+  })
+
+  await t.test("qf_records_list defaults to compact output profile", async () => {
+    const listed = await callToolRaw(mcp.client, "qf_records_list", {
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: 20,
+      max_rows: 3,
+      select_columns: [1001, 1002]
+    })
+
+    assert.equal(listed.ok, true)
+    assert.equal(listed.output_profile, "compact")
+    assert.equal(listed.data.rows.length, 3)
+    assert.equal(listed.next_page_token, null)
+    assert.equal(listed.data.completeness, undefined)
+    assert.equal(listed.data.evidence, undefined)
+    assert.equal(listed.completeness, undefined)
+    assert.equal(listed.evidence, undefined)
+    assert.equal(listed.meta, undefined)
   })
 
   await t.test("qf_records_list applies strict row/column projection", async () => {
@@ -700,8 +782,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(listed.ok, true)
-    assert.equal(listed.data.items.length, 3)
-    assert.deepEqual(listed.data.applied_limits.selected_columns, ["1001", "金额"])
+    assert.equal(listed.data.rows.length, 3)
+    assert.deepEqual(listed.data.applied_limits.selected_columns, ["1001"])
     assert.equal(listed.data.applied_limits.row_cap, 3)
     assert.equal(listed.data.completeness.result_amount, 6)
     assert.equal(listed.data.completeness.returned_items, 3)
@@ -709,15 +791,10 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(listed.data.completeness.partial, true)
     assert.equal(listed.data.evidence.app_key, APP_KEY)
     assert.equal(listed.data.evidence.source_pages.length, 1)
-
-    for (const item of listed.data.items) {
-      const answers = Array.isArray(item.answers) ? item.answers : []
-      assert.ok(answers.length <= 1)
-      if (answers[0]) {
-        const queId = normalizeQueId(answers[0].queId)
-        assert.ok(queId === 1001 || queId === 1002)
-      }
-    }
+    assert.ok(Array.isArray(listed.data.rows))
+    assert.equal(listed.data.rows.length, 3)
+    assert.ok("apply_id" in listed.data.rows[0])
+    assert.equal(firstRowValue(listed.data.rows[0]), "客户A")
   })
 
   await t.test("qf_records_list resolves sort by field title", async () => {
@@ -731,8 +808,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(listed.ok, true)
-    assert.equal(listed.data.items.length, 3)
-    const firstDay = firstAnswerValue(listed.data.items[0])
+    assert.equal(listed.data.rows.length, 3)
+    const firstDay = rowValueByCandidates(listed.data.rows[0], ["下单日期", "1003"])
     assert.equal(firstDay, "2026-02-01")
   })
 
@@ -747,7 +824,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(listed.ok, true)
-    assert.equal(listed.data.items.length, 2)
+    assert.equal(listed.data.rows.length, 2)
     assert.equal(listed.completeness.returned_items, 2)
   })
 
@@ -765,7 +842,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
 
     assert.equal(listed.ok, true)
     assert.equal(listed.data.mode, "list")
-    assert.equal(listed.data.list.items.length, 2)
+    assert.equal(listed.data.list.rows.length, 2)
     assert.equal(listed.data.list.completeness.returned_items, 2)
   })
 
@@ -781,7 +858,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
 
     assert.equal(listed.ok, true)
     assert.equal(listed.data.mode, "list")
-    assert.equal(listed.data.list.items.length, 2)
+    assert.equal(listed.data.list.rows.length, 2)
     assert.equal(listed.data.list.completeness.returned_items, 2)
   })
 
@@ -808,7 +885,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(listed.ok, true)
     assert.equal(listed.data.mode, "list")
     assert.equal(listed.data.list.pagination.result_amount, 2)
-    assert.equal(listed.data.list.items.length, 2)
+    assert.equal(listed.data.list.rows.length, 2)
   })
 
   await t.test("qf_records_list returns deterministic pagination token", async () => {
@@ -847,10 +924,10 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(record.ok, true)
-    assert.equal(record.data.answer_count, 1)
-    assert.deepEqual(record.data.applied_limits.selected_columns, ["1001", "1002"])
-    const answer = record.data.record.answers[0]
-    assert.equal(normalizeQueId(answer.queId), 1001)
+    assert.deepEqual(record.data.applied_limits.selected_columns, ["1001"])
+    assert.ok(record.data.row)
+    assert.ok("apply_id" in record.data.row)
+    assert.equal(rowValueByCandidates(record.data.row, ["客户名称", "1001"]), "客户A")
   })
 
   await t.test("qf_query auto routes to list and record", async () => {
@@ -865,7 +942,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(queryList.ok, true)
     assert.equal(queryList.data.mode, "list")
     assert.equal(queryList.data.source_tool, "qf_records_list")
-    assert.equal(queryList.data.list.items.length, 2)
+    assert.equal(queryList.data.list.rows.length, 2)
     assert.equal(queryList.data.list.completeness.is_complete, false)
     assert.equal(queryList.data.list.completeness.partial, true)
 
@@ -879,6 +956,28 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(queryRecord.data.source_tool, "qf_record_get")
     assert.equal(queryRecord.data.record.apply_id, "5001")
     assert.equal(queryRecord.data.record.completeness.is_complete, true)
+    assert.equal(rowValueByCandidates(queryRecord.data.record.row, ["金额", "1002"]), 100)
+  })
+
+  await t.test("qf_query defaults to compact output profile", async () => {
+    const queryList = await callToolRaw(mcp.client, "qf_query", {
+      query_mode: "list",
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: 20,
+      max_rows: 2,
+      select_columns: [1001]
+    })
+
+    assert.equal(queryList.ok, true)
+    assert.equal(queryList.output_profile, "compact")
+    assert.equal(queryList.data.mode, "list")
+    assert.equal(queryList.data.list.rows.length, 2)
+    assert.equal(queryList.data.list.completeness, undefined)
+    assert.equal(queryList.data.list.evidence, undefined)
+    assert.equal(queryList.completeness, undefined)
+    assert.equal(queryList.evidence, undefined)
+    assert.equal(queryList.meta, undefined)
   })
 
   await t.test("qf_query list mode applies time_range as filter", async () => {
@@ -899,7 +998,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(queryList.ok, true)
     assert.equal(queryList.data.mode, "list")
     assert.equal(queryList.data.list.pagination.result_amount, 2)
-    assert.equal(queryList.data.list.items.length, 2)
+    assert.equal(queryList.data.list.rows.length, 2)
   })
 
   await t.test("qf_records_list rejects date-like range on non-date filter field", async () => {
@@ -1176,7 +1275,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       select_columns: [1002]
     })
     assert.equal(beforeUpdate.ok, true)
-    assert.equal(firstAnswerValue(beforeUpdate.data.record), 123)
+    assert.equal(rowValueByCandidates(beforeUpdate.data.row, ["金额", "1002"]), 123)
 
     const updated = await callTool(mcp.client, "qf_record_update", {
       apply_id: applyId,
@@ -1200,6 +1299,6 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       select_columns: [1002]
     })
     assert.equal(afterUpdate.ok, true)
-    assert.equal(firstAnswerValue(afterUpdate.data.record), 456)
+    assert.equal(rowValueByCandidates(afterUpdate.data.row, ["金额", "1002"]), 456)
   })
 })

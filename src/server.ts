@@ -98,10 +98,11 @@ const formCache = new Map<string, FormCacheEntry>()
 const DEFAULT_PAGE_SIZE = 50
 const DEFAULT_SCAN_MAX_PAGES = 10
 const DEFAULT_ROW_LIMIT = 200
+const DEFAULT_OUTPUT_PROFILE = "compact" as const
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
-const SERVER_VERSION = "0.3.8"
+const SERVER_VERSION = "0.3.9"
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -184,6 +185,8 @@ const apiMetaSchema = z.object({
   provider_err_msg: z.string().nullable(),
   base_url: z.string()
 })
+const outputProfileSchema = z.enum(["compact", "verbose"])
+type OutputProfile = z.infer<typeof outputProfileSchema>
 
 const completenessSchema = z.object({
   result_amount: z.number().int().nonnegative(),
@@ -216,11 +219,12 @@ const evidenceSchema = z.object({
 })
 
 const queryContractFields = {
-  completeness: completenessSchema,
-  evidence: z.record(z.unknown()),
-  error_code: z.null(),
-  fix_hint: z.null(),
-  next_page_token: z.string().nullable()
+  output_profile: outputProfileSchema.optional(),
+  completeness: completenessSchema.optional(),
+  evidence: z.record(z.unknown()).optional(),
+  error_code: z.null().optional(),
+  fix_hint: z.null().optional(),
+  next_page_token: z.string().nullable().optional()
 }
 
 const appSchema = z.object({
@@ -234,15 +238,6 @@ const fieldSummarySchema = z.object({
   que_type: z.unknown(),
   has_sub_fields: z.boolean(),
   sub_field_count: z.number().int().nonnegative()
-})
-
-const recordItemSchema = z.object({
-  apply_id: z.union([z.string(), z.number(), z.null()]),
-  app_key: z.string().nullable(),
-  apply_num: z.union([z.number(), z.string(), z.null()]),
-  apply_time: z.string().nullable(),
-  last_update_time: z.string().nullable(),
-  answers: z.array(z.unknown()).optional()
 })
 
 const operationResultSchema = z.object({
@@ -390,7 +385,8 @@ const listInputSchema = z
       .max(10)
       .optional(),
     include_answers: z.boolean().optional(),
-    strict_full: z.boolean().optional()
+    strict_full: z.boolean().optional(),
+    output_profile: outputProfileSchema.optional()
     })
   )
   .refine((value) => value.include_answers !== false, {
@@ -410,7 +406,7 @@ const listSuccessOutputSchema = z.object({
       page_amount: z.number().int().nonnegative().nullable(),
       result_amount: z.number().int().nonnegative()
     }),
-    items: z.array(recordItemSchema),
+    rows: z.array(z.record(z.unknown())),
     applied_limits: z
       .object({
         include_answers: z.boolean(),
@@ -419,11 +415,11 @@ const listSuccessOutputSchema = z.object({
         selected_columns: z.array(z.string())
       })
       .optional(),
-    completeness: completenessSchema,
-    evidence: evidenceSchema
+    completeness: completenessSchema.optional(),
+    evidence: evidenceSchema.optional()
   }),
   ...queryContractFields,
-  meta: apiMetaSchema
+  meta: apiMetaSchema.optional()
 })
 const listOutputSchema = listSuccessOutputSchema
 
@@ -436,7 +432,8 @@ const recordGetInputSchema = z.preprocess(
       .array(z.union([z.string().min(1), z.number().int()]))
       .min(1)
       .max(10)
-      .optional()
+      .optional(),
+    output_profile: outputProfileSchema.optional()
   })
 )
 
@@ -444,23 +441,22 @@ const recordGetSuccessOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     apply_id: z.union([z.string(), z.number(), z.null()]),
-    answer_count: z.number().int().nonnegative(),
-    record: z.unknown(),
+    row: z.record(z.unknown()),
     applied_limits: z
       .object({
         column_cap: z.number().int().positive().nullable(),
         selected_columns: z.array(z.string()).nullable()
       })
       .optional(),
-    completeness: completenessSchema,
+    completeness: completenessSchema.optional(),
     evidence: z.object({
       query_id: z.string(),
       apply_id: z.string(),
       selected_columns: z.array(z.string())
-    })
+    }).optional()
   }),
   ...queryContractFields,
-  meta: apiMetaSchema
+  meta: apiMetaSchema.optional()
 })
 const recordGetOutputSchema = recordGetSuccessOutputSchema
 
@@ -608,7 +604,8 @@ const queryInputSchema = z
         })
         .optional(),
       scan_max_pages: z.number().int().positive().max(500).optional(),
-      strict_full: z.boolean().optional()
+      strict_full: z.boolean().optional(),
+      output_profile: outputProfileSchema.optional()
     })
   )
   .refine((value) => !(value.page_num !== undefined && value.page_token !== undefined), {
@@ -629,8 +626,8 @@ const querySummaryOutputSchema = z.object({
     missing_count: z.number().int().nonnegative()
   }),
   rows: z.array(z.record(z.unknown())),
-  completeness: completenessSchema,
-  evidence: evidenceSchema,
+  completeness: completenessSchema.optional(),
+  evidence: evidenceSchema.optional(),
   meta: z.object({
     field_mapping: z.array(
       z.object({
@@ -664,7 +661,7 @@ const querySummaryOutputSchema = z.object({
       column_cap: z.number().int().positive().nullable(),
       scan_max_pages: z.number().int().positive()
     })
-  })
+  }).optional()
 })
 
 const querySuccessOutputSchema = z.object({
@@ -677,7 +674,7 @@ const querySuccessOutputSchema = z.object({
     summary: querySummaryOutputSchema.optional()
   }),
   ...queryContractFields,
-  meta: apiMetaSchema
+  meta: apiMetaSchema.optional()
 })
 const queryOutputSchema = querySuccessOutputSchema
 
@@ -751,7 +748,8 @@ const aggregateInputSchema = z
       })
       .optional(),
     max_groups: z.number().int().positive().max(2000).optional(),
-    strict_full: z.boolean().optional()
+    strict_full: z.boolean().optional(),
+    output_profile: outputProfileSchema.optional()
     })
   )
   .refine((value) => !(value.page_num !== undefined && value.page_token !== undefined), {
@@ -775,8 +773,8 @@ const aggregateOutputSchema = z.object({
         amount_ratio: z.number().nullable()
       })
     ),
-    completeness: completenessSchema,
-    evidence: evidenceSchema,
+    completeness: completenessSchema.optional(),
+    evidence: evidenceSchema.optional(),
     meta: z.object({
       field_mapping: z.array(
         z.object({
@@ -791,10 +789,10 @@ const aggregateOutputSchema = z.object({
         include_negative: z.boolean(),
         include_null: z.boolean()
       })
-    })
+    }).optional()
   }),
   ...queryContractFields,
-  meta: apiMetaSchema
+  meta: apiMetaSchema.optional()
 })
 
 server.registerTool(
@@ -1015,8 +1013,8 @@ server.registerTool(
       if (routedMode === "record") {
         const recordArgs = buildRecordGetArgsFromQuery(args)
         const executed = await executeRecordGet(recordArgs)
-        const completeness = executed.payload.completeness
-        const evidence = executed.payload.evidence
+        const completeness = executed.completeness
+        const evidence = executed.evidence
         return okResult(
           {
             ok: true,
@@ -1025,12 +1023,21 @@ server.registerTool(
               source_tool: "qf_record_get",
               record: executed.payload.data
             },
-            completeness,
-            evidence,
-            error_code: null,
-            fix_hint: null,
+            output_profile: executed.outputProfile,
+            ...(isVerboseProfile(executed.outputProfile)
+              ? {
+                  completeness,
+                  evidence,
+                  error_code: null,
+                  fix_hint: null
+                }
+              : {}),
             next_page_token: completeness.next_page_token,
-            meta: executed.payload.meta
+            ...(isVerboseProfile(executed.outputProfile)
+              ? {
+                  meta: executed.payload.meta
+                }
+              : {})
           },
           executed.message
         )
@@ -1038,8 +1045,8 @@ server.registerTool(
 
       if (routedMode === "summary") {
         const executed = await executeRecordsSummary(args)
-        const completeness = executed.data.completeness
-        const evidence = executed.data.evidence
+        const completeness = executed.completeness
+        const evidence = executed.evidence
         return okResult(
           {
             ok: true,
@@ -1048,12 +1055,21 @@ server.registerTool(
               source_tool: "qf_records_summary",
               summary: executed.data
             },
-            completeness,
-            evidence,
-            error_code: null,
-            fix_hint: null,
+            output_profile: executed.outputProfile,
+            ...(isVerboseProfile(executed.outputProfile)
+              ? {
+                  completeness,
+                  evidence,
+                  error_code: null,
+                  fix_hint: null
+                }
+              : {}),
             next_page_token: completeness.next_page_token,
-            meta: executed.meta
+            ...(isVerboseProfile(executed.outputProfile)
+              ? {
+                  meta: executed.meta
+                }
+              : {})
           },
           executed.message
         )
@@ -1061,8 +1077,8 @@ server.registerTool(
 
       const listArgs = buildListArgsFromQuery(args)
       const executed = await executeRecordsList(listArgs)
-      const completeness = executed.payload.completeness
-      const evidence = executed.payload.evidence
+      const completeness = executed.completeness
+      const evidence = executed.evidence
       return okResult(
         {
           ok: true,
@@ -1071,12 +1087,21 @@ server.registerTool(
             source_tool: "qf_records_list",
             list: executed.payload.data
           },
-          completeness,
-          evidence,
-          error_code: null,
-          fix_hint: null,
+          output_profile: executed.outputProfile,
+          ...(isVerboseProfile(executed.outputProfile)
+            ? {
+                completeness,
+                evidence,
+                error_code: null,
+                fix_hint: null
+              }
+            : {}),
           next_page_token: completeness.next_page_token,
-          meta: executed.payload.meta
+          ...(isVerboseProfile(executed.outputProfile)
+            ? {
+                meta: executed.payload.meta
+              }
+            : {})
         },
         executed.message
       )
@@ -1569,6 +1594,14 @@ function buildMeta(response: QingflowResponse<unknown>) {
   }
 }
 
+function resolveOutputProfile(value: unknown): OutputProfile {
+  return value === "verbose" ? "verbose" : DEFAULT_OUTPUT_PROFILE
+}
+
+function isVerboseProfile(profile: OutputProfile): boolean {
+  return profile === "verbose"
+}
+
 function missingRequiredFieldError(params: {
   field: string
   tool: string
@@ -1621,6 +1654,9 @@ const COMMON_INPUT_ALIASES: Record<string, string> = {
   statPolicy: "stat_policy",
   groupBy: "group_by",
   strictFull: "strict_full",
+  outputProfile: "output_profile",
+  responseProfile: "output_profile",
+  profile: "output_profile",
   forceRefresh: "force_refresh",
   forceRefreshForm: "force_refresh_form",
   applyUser: "apply_user"
@@ -1717,7 +1753,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         max_rows_max: 200,
         max_items_max: 200,
         max_columns_max: 10,
-        select_columns_max: 10
+        select_columns_max: 10,
+        output_profile: "compact|verbose (default compact)"
       },
       aliases: collectAliasHints(
         [
@@ -1732,13 +1769,15 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
           "max_items",
           "max_columns",
           "select_columns",
+          "output_profile",
           "strict_full",
           "include_answers",
           "time_range"
         ],
         {
           select_columns: ["columns", "selected_columns", "selectedColumns"],
-          max_rows: ["limit", "row_limit", "rowLimit"]
+          max_rows: ["limit", "row_limit", "rowLimit"],
+          output_profile: ["outputProfile", "responseProfile", "profile"]
         }
       ),
       minimal_example: {
@@ -1746,7 +1785,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         mode: "all",
         page_size: 50,
         max_rows: 20,
-        select_columns: [0, "客户名称", "报价总金额"]
+        select_columns: [0, "客户名称", "报价总金额"],
+        output_profile: "compact"
       }
     },
     {
@@ -1754,15 +1794,21 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       required: ["apply_id", "select_columns"],
       limits: {
         max_columns_max: 10,
-        select_columns_max: 10
+        select_columns_max: 10,
+        output_profile: "compact|verbose (default compact)"
       },
-      aliases: collectAliasHints(["apply_id", "max_columns", "select_columns"], {
-        select_columns: ["columns", "selected_columns", "selectedColumns"]
-      }),
+      aliases: collectAliasHints(
+        ["apply_id", "max_columns", "select_columns", "output_profile"],
+        {
+          select_columns: ["columns", "selected_columns", "selectedColumns"],
+          output_profile: ["outputProfile", "responseProfile", "profile"]
+        }
+      ),
       minimal_example: {
         apply_id: "497600278750478338",
         select_columns: [0, "客户名称"],
-        max_columns: 5
+        max_columns: 5,
+        output_profile: "compact"
       }
     },
     {
@@ -1780,7 +1826,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         max_rows_max: 200,
         max_items_max: 200,
         max_columns_max: 10,
-        select_columns_max: 10
+        select_columns_max: 10,
+        output_profile: "compact|verbose (default compact)"
       },
       aliases: collectAliasHints(
         [
@@ -1796,6 +1843,7 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
           "max_items",
           "max_columns",
           "select_columns",
+          "output_profile",
           "amount_column",
           "time_range",
           "stat_policy",
@@ -1805,7 +1853,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
           select_columns: ["columns", "selected_columns", "selectedColumns"],
           max_rows: ["limit", "row_limit", "rowLimit"],
           amount_column: ["amount_que_ids", "amountQueIds", "amountColumns"],
-          time_range: ["date_field + date_from + date_to"]
+          time_range: ["date_field + date_from + date_to"],
+          output_profile: ["outputProfile", "responseProfile", "profile"]
         }
       ),
       minimal_example: {
@@ -1815,6 +1864,7 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         page_size: 50,
         max_rows: 20,
         select_columns: [0, "客户名称", "报价总金额"],
+        output_profile: "compact",
         time_range: {
           column: 6299264,
           from: "2026-03-05",
@@ -1830,7 +1880,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         requested_pages_max: 500,
         scan_max_pages_max: 500,
         max_groups_max: 2000,
-        group_by_max: 20
+        group_by_max: 20,
+        output_profile: "compact|verbose (default compact)"
       },
       aliases: collectAliasHints(
         [
@@ -1842,13 +1893,15 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
           "page_size",
           "requested_pages",
           "scan_max_pages",
+          "output_profile",
           "time_range",
           "stat_policy",
           "strict_full"
         ],
         {
           amount_column: ["amount_que_ids", "amountQueIds", "amountColumns"],
-          time_range: ["date_field + date_from + date_to"]
+          time_range: ["date_field + date_from + date_to"],
+          output_profile: ["outputProfile", "responseProfile", "profile"]
         }
       ),
       minimal_example: {
@@ -1856,6 +1909,7 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         mode: "all",
         group_by: [9500572],
         amount_column: 6299263,
+        output_profile: "compact",
         time_range: {
           column: 6299264,
           from: "2026-03-05",
@@ -1965,6 +2019,7 @@ function normalizeListInput(raw: unknown): unknown {
     max_columns: coerceNumberLike(normalizedObj.max_columns),
     strict_full: coerceBooleanLike(normalizedObj.strict_full),
     include_answers: coerceBooleanLike(normalizedObj.include_answers),
+    output_profile: normalizeOutputProfileInput(normalizedObj.output_profile),
     apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
     sort: normalizeSortInput(normalizedObj.sort),
     filters: normalizeFiltersInput(normalizedObj.filters),
@@ -1986,7 +2041,8 @@ function normalizeRecordGetInput(raw: unknown): unknown {
     ...normalizedObj,
     apply_id: coerceNumberLike(normalizedObj.apply_id),
     max_columns: coerceNumberLike(normalizedObj.max_columns),
-    select_columns: normalizeSelectorListInput(selectColumns)
+    select_columns: normalizeSelectorListInput(selectColumns),
+    output_profile: normalizeOutputProfileInput(normalizedObj.output_profile)
   }
 }
 
@@ -2013,6 +2069,7 @@ function normalizeQueryInput(raw: unknown): unknown {
     apply_id: coerceNumberLike(normalizedObj.apply_id),
     strict_full: coerceBooleanLike(normalizedObj.strict_full),
     include_answers: coerceBooleanLike(normalizedObj.include_answers),
+    output_profile: normalizeOutputProfileInput(normalizedObj.output_profile),
     amount_column: normalizeAmountColumnInput(normalizedObj.amount_column),
     apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
     sort: normalizeSortInput(normalizedObj.sort),
@@ -2041,6 +2098,7 @@ function normalizeAggregateInput(raw: unknown): unknown {
     type: coerceNumberLike(normalizedObj.type),
     max_groups: coerceNumberLike(normalizedObj.max_groups),
     strict_full: coerceBooleanLike(normalizedObj.strict_full),
+    output_profile: normalizeOutputProfileInput(normalizedObj.output_profile),
     group_by: normalizeSelectorListInput(normalizedObj.group_by),
     amount_column: normalizeAmountColumnInput(normalizedObj.amount_column),
     apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
@@ -2081,6 +2139,24 @@ function coerceBooleanLike(value: unknown): unknown {
     if (trimmed === "false") {
       return false
     }
+  }
+  return parsed
+}
+
+function normalizeOutputProfileInput(value: unknown): unknown {
+  const parsed = parseJsonLikeDeep(value)
+  if (typeof parsed !== "string") {
+    return parsed
+  }
+  const normalized = parsed.trim().toLowerCase()
+  if (!normalized) {
+    return parsed
+  }
+  if (normalized === "compact" || normalized === "lite" || normalized === "minimal") {
+    return "compact"
+  }
+  if (normalized === "verbose" || normalized === "full" || normalized === "debug") {
+    return "verbose"
   }
   return parsed
 }
@@ -2653,7 +2729,8 @@ function buildListArgsFromQuery(args: z.infer<typeof queryInputSchema>): z.infer
     max_columns: args.max_columns,
     select_columns: args.select_columns,
     include_answers: args.include_answers,
-    strict_full: args.strict_full
+    strict_full: args.strict_full,
+    output_profile: args.output_profile
   })
 }
 
@@ -2910,13 +2987,20 @@ function buildRecordGetArgsFromQuery(
   return recordGetInputSchema.parse({
     apply_id: args.apply_id,
     max_columns: args.max_columns,
-    select_columns: args.select_columns
+    select_columns: args.select_columns,
+    output_profile: args.output_profile
   })
 }
 
 async function executeRecordsList(
   args: z.infer<typeof listInputSchema>
-): Promise<{ payload: z.infer<typeof listSuccessOutputSchema>; message: string }> {
+): Promise<{
+  payload: z.infer<typeof listSuccessOutputSchema>
+  message: string
+  completeness: z.infer<typeof completenessSchema>
+  evidence: z.infer<typeof evidenceSchema>
+  outputProfile: OutputProfile
+}> {
   if (!args.app_key) {
     throw missingRequiredFieldError({
       field: "app_key",
@@ -2932,6 +3016,7 @@ async function executeRecordsList(
         "Provide select_columns as an array (<=10), for example: {\"select_columns\":[0,\"客户全称\",\"报价总金额\"]}"
     })
   }
+  const outputProfile = resolveOutputProfile(args.output_profile)
 
   const queryId = randomUUID()
   const pageNum = resolveStartPage(args.page_num, args.page_token, args.app_key)
@@ -3009,6 +3094,7 @@ async function executeRecordsList(
   const items = collectedRawItems
     .slice(0, listLimit.limit)
     .map((raw) => normalizeRecordItem(raw, includeAnswers))
+  const sourceItemsForRows = items.slice()
   const columnProjection = projectRecordItemsColumns({
     items,
     includeAnswers,
@@ -3028,17 +3114,29 @@ async function executeRecordsList(
       }
     })
   }
-  const fitted = fitListItemsWithinSize({
-    items: columnProjection.items,
+  const selectedColumnsForRows =
+    args.max_columns !== undefined
+      ? columnProjection.selectedColumns.slice(0, args.max_columns)
+      : columnProjection.selectedColumns
+  const rows = buildFlatRowsFromItems({
+    items: sourceItemsForRows,
+    selectedColumns: selectedColumnsForRows
+  })
+  const fittedRows = fitListItemsWithinSize({
+    items: rows,
     limitBytes: MAX_LIST_ITEMS_BYTES
   })
-  const truncationReason = mergeTruncationReasons(listLimit.reason, columnProjection.reason, fitted.reason)
-  const omittedItems = Math.max(0, knownResultAmount - fitted.items.length)
+  const truncationReason = mergeTruncationReasons(
+    listLimit.reason,
+    columnProjection.reason,
+    fittedRows.reason
+  )
+  const omittedItems = Math.max(0, knownResultAmount - fittedRows.items.length)
   const isComplete =
     !hasMore &&
     omittedItems === 0 &&
-    fitted.omittedItems === 0 &&
-    fitted.omittedChars === 0
+    fittedRows.omittedItems === 0 &&
+    fittedRows.omittedChars === 0
   const nextPageToken =
     hasMore && nextPageNum
       ? encodeContinuationToken({
@@ -3050,7 +3148,7 @@ async function executeRecordsList(
 
   const completeness: z.infer<typeof completenessSchema> = {
     result_amount: knownResultAmount,
-    returned_items: fitted.items.length,
+    returned_items: fittedRows.items.length,
     fetched_pages: fetchedPages,
     requested_pages: requestedPages,
     actual_scanned_pages: fetchedPages,
@@ -3059,7 +3157,7 @@ async function executeRecordsList(
     is_complete: isComplete,
     partial: !isComplete,
     omitted_items: omittedItems,
-    omitted_chars: fitted.omittedChars
+    omitted_chars: fittedRows.omittedChars
   }
   const listState: ListQueryState = {
     query_id: queryId,
@@ -3098,37 +3196,59 @@ async function executeRecordsList(
         page_amount: pageAmount,
         result_amount: knownResultAmount
       },
-      items: fitted.items as z.infer<typeof recordItemSchema>[],
+      rows: fittedRows.items as Array<Record<string, unknown>>,
       applied_limits: {
         include_answers: includeAnswers,
         row_cap: listLimit.limit,
         column_cap: args.max_columns ?? null,
-        selected_columns: columnProjection.selectedColumns
+        selected_columns: selectedColumnsForRows
       },
-      completeness,
-      evidence
+      ...(isVerboseProfile(outputProfile)
+        ? {
+            completeness,
+            evidence
+          }
+        : {})
     },
-    completeness,
-    evidence,
-    error_code: null,
-    fix_hint: null,
+    output_profile: outputProfile,
+    ...(isVerboseProfile(outputProfile)
+      ? {
+          completeness,
+          evidence,
+          error_code: null,
+          fix_hint: null
+        }
+      : {}),
     next_page_token: completeness.next_page_token,
-    meta: responseMeta
+    ...(isVerboseProfile(outputProfile)
+      ? {
+          meta: responseMeta
+        }
+      : {})
   }
 
   return {
     payload: responsePayload,
     message: buildRecordsListMessage({
-      returned: fitted.items.length,
+      returned: fittedRows.items.length,
       total: knownResultAmount,
       truncationReason
-    })
+    }),
+    completeness,
+    evidence,
+    outputProfile
   }
 }
 
 async function executeRecordGet(
   args: z.infer<typeof recordGetInputSchema>
-): Promise<{ payload: z.infer<typeof recordGetSuccessOutputSchema>; message: string }> {
+): Promise<{
+  payload: z.infer<typeof recordGetSuccessOutputSchema>
+  message: string
+  completeness: z.infer<typeof completenessSchema>
+  evidence: z.infer<typeof recordGetSuccessOutputSchema>["data"]["evidence"]
+  outputProfile: OutputProfile
+}> {
   if (!args.select_columns?.length) {
     throw missingRequiredFieldError({
       field: "select_columns",
@@ -3136,6 +3256,7 @@ async function executeRecordGet(
       fixHint: "Provide select_columns as an array (<=10), for example: {\"apply_id\":\"...\",\"select_columns\":[0]}"
     })
   }
+  const outputProfile = resolveOutputProfile(args.output_profile)
 
   const queryId = randomUUID()
   const response = await client.getRecord(String(args.apply_id))
@@ -3145,66 +3266,72 @@ async function executeRecordGet(
     maxColumns: args.max_columns,
     selectColumns: args.select_columns
   })
-  const projectedRecord: Record<string, unknown> = {
-    ...record,
-    answers: projection.answers
+  const selectedColumnsForRow =
+    args.max_columns !== undefined
+      ? (projection.selectedColumns ?? []).slice(0, args.max_columns)
+      : projection.selectedColumns ?? []
+  const row = buildFlatRowFromAnswers({
+    applyId: (record.applyId as string | number | null | undefined) ?? null,
+    answers: asArray(record.answers),
+    selectedColumns: selectedColumnsForRow
+  })
+
+  const completeness: z.infer<typeof completenessSchema> = {
+    result_amount: 1,
+    returned_items: 1,
+    fetched_pages: 1,
+    requested_pages: 1,
+    actual_scanned_pages: 1,
+    has_more: false,
+    next_page_token: null,
+    is_complete: true,
+    partial: false,
+    omitted_items: 0,
+    omitted_chars: 0
   }
-  const answerCount = projection.answers.length
+  const evidence: z.infer<typeof recordGetSuccessOutputSchema>["data"]["evidence"] = {
+    query_id: queryId,
+    apply_id: String(args.apply_id),
+    selected_columns: selectedColumnsForRow
+  }
 
   return {
     payload: {
       ok: true,
       data: {
         apply_id: (record.applyId as string | number | null | undefined) ?? null,
-        answer_count: answerCount,
-        record: projectedRecord,
+        row,
         applied_limits: {
           column_cap: args.max_columns ?? null,
-          selected_columns: projection.selectedColumns
+          selected_columns: selectedColumnsForRow
         },
-        completeness: {
-          result_amount: 1,
-          returned_items: 1,
-          fetched_pages: 1,
-          requested_pages: 1,
-          actual_scanned_pages: 1,
-          has_more: false,
-          next_page_token: null,
-          is_complete: true,
-          partial: false,
-          omitted_items: 0,
-          omitted_chars: 0
-        },
-        evidence: {
-          query_id: queryId,
-          apply_id: String(args.apply_id),
-          selected_columns: projection.selectedColumns ?? []
-        }
+        ...(isVerboseProfile(outputProfile)
+          ? {
+              completeness,
+              evidence
+            }
+          : {})
       },
-      completeness: {
-        result_amount: 1,
-        returned_items: 1,
-        fetched_pages: 1,
-        requested_pages: 1,
-        actual_scanned_pages: 1,
-        has_more: false,
-        next_page_token: null,
-        is_complete: true,
-        partial: false,
-        omitted_items: 0,
-        omitted_chars: 0
-      },
-      evidence: {
-        query_id: queryId,
-        apply_id: String(args.apply_id),
-        selected_columns: projection.selectedColumns ?? []
-      },
-      error_code: null,
-      fix_hint: null,
+      output_profile: outputProfile,
+      ...(isVerboseProfile(outputProfile)
+        ? {
+            completeness,
+            evidence,
+            error_code: null,
+            fix_hint: null
+          }
+        : {}),
       next_page_token: null,
-      meta: buildMeta(response)
+      ...(isVerboseProfile(outputProfile)
+        ? {
+            meta: buildMeta(response)
+          }
+        : {})
     },
-    message: `Fetched record ${String(args.apply_id)}`
+    message: `Fetched record ${String(args.apply_id)}`,
+    completeness,
+    evidence,
+    outputProfile
   }
 }
 
@@ -3219,6 +3346,9 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   data: z.infer<typeof querySummaryOutputSchema>
   meta: ReturnType<typeof buildMeta>
   message: string
+  completeness: z.infer<typeof completenessSchema>
+  evidence: z.infer<typeof evidenceSchema>
+  outputProfile: OutputProfile
 }> {
   if (!args.app_key) {
     throw missingRequiredFieldError({
@@ -3234,6 +3364,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       fixHint: "Provide select_columns as an array (<=10), for example: {\"select_columns\":[\"客户全称\"]}"
     })
   }
+  const outputProfile = resolveOutputProfile(args.output_profile)
 
   const queryId = randomUUID()
   const strictFull = args.strict_full ?? true
@@ -3472,39 +3603,46 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
         missing_count: missingCount
       },
       rows,
-      completeness,
-      evidence,
-      meta: {
-        field_mapping: fieldMapping,
-        filters: {
-          app_key: args.app_key,
-          time_range: timeColumn
-            ? {
-                column: timeColumn.requested,
-                from: args.time_range?.from ?? null,
-                to: args.time_range?.to ?? null,
-                timezone
+      ...(isVerboseProfile(outputProfile)
+        ? {
+            completeness,
+            evidence,
+            meta: {
+              field_mapping: fieldMapping,
+              filters: {
+                app_key: args.app_key,
+                time_range: timeColumn
+                  ? {
+                      column: timeColumn.requested,
+                      from: args.time_range?.from ?? null,
+                      to: args.time_range?.to ?? null,
+                      timezone
+                    }
+                  : null
+              },
+              stat_policy: {
+                include_negative: includeNegative,
+                include_null: includeNull
+              },
+              execution: {
+                scanned_records: scannedRecords,
+                scanned_pages: scannedPages,
+                truncated: !isComplete,
+                row_cap: rowCap,
+                column_cap: args.max_columns ?? null,
+                scan_max_pages: scanMaxPages
               }
-            : null
-        },
-        stat_policy: {
-          include_negative: includeNegative,
-          include_null: includeNull
-        },
-        execution: {
-          scanned_records: scannedRecords,
-          scanned_pages: scannedPages,
-          truncated: !isComplete,
-          row_cap: rowCap,
-          column_cap: args.max_columns ?? null,
-          scan_max_pages: scanMaxPages
-        }
-      }
+            }
+          }
+        : {})
     },
     meta: summaryMeta,
     message: isComplete
       ? `Summarized ${scannedRecords} records`
-      : `Summarized ${scannedRecords}/${knownResultAmount} records (partial)`
+      : `Summarized ${scannedRecords}/${knownResultAmount} records (partial)`,
+    completeness,
+    evidence,
+    outputProfile
   }
 }
 
@@ -3514,6 +3652,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
 }> {
   const queryId = randomUUID()
   const strictFull = args.strict_full ?? true
+  const outputProfile = resolveOutputProfile(args.output_profile)
   const includeNegative = args.stat_policy?.include_negative ?? true
   const includeNull = args.stat_policy?.include_null ?? false
   const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
@@ -3734,22 +3873,35 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
           total_amount: amountColumn ? totalAmount : null
         },
         groups,
-        completeness,
-        evidence,
-        meta: {
-          field_mapping: fieldMapping,
-          stat_policy: {
-            include_negative: includeNegative,
-            include_null: includeNull
-          }
-        }
+        ...(isVerboseProfile(outputProfile)
+          ? {
+              completeness,
+              evidence,
+              meta: {
+                field_mapping: fieldMapping,
+                stat_policy: {
+                  include_negative: includeNegative,
+                  include_null: includeNull
+                }
+              }
+            }
+          : {})
       },
-      completeness,
-      evidence,
-      error_code: null,
-      fix_hint: null,
+      output_profile: outputProfile,
+      ...(isVerboseProfile(outputProfile)
+        ? {
+            completeness,
+            evidence,
+            error_code: null,
+            fix_hint: null
+          }
+        : {}),
       next_page_token: completeness.next_page_token,
-      meta: responseMeta
+      ...(isVerboseProfile(outputProfile)
+        ? {
+            meta: responseMeta
+          }
+        : {})
     },
     message: isComplete
       ? `Aggregated ${scannedRecords} records`
@@ -4377,11 +4529,14 @@ function projectRecordItemsColumns(params: {
       projected = projected.slice(0, params.maxColumns)
       columnCapped = true
     }
-    matchedAnswersCount += projected.length
+    const slimProjected = projected
+      .map((answer) => simplifyAnswerForOutput(answer))
+      .filter((answer): answer is Record<string, unknown> => Boolean(answer))
+    matchedAnswersCount += slimProjected.length
 
     return {
       ...item,
-      answers: projected
+      answers: slimProjected
     }
   })
 
@@ -4417,10 +4572,117 @@ function projectAnswersForOutput(params: {
     projected = projected.slice(0, params.maxColumns)
   }
 
+  const slimProjected = projected
+    .map((answer) => simplifyAnswerForOutput(answer))
+    .filter((answer): answer is Record<string, unknown> => Boolean(answer))
+
   return {
-    answers: projected,
+    answers: slimProjected,
     selectedColumns: normalizedSelectors.length > 0 ? normalizedSelectors : null
   }
+}
+
+function simplifyAnswerForOutput(answer: unknown): Record<string, unknown> | null {
+  const obj = asObject(answer)
+  if (!obj) {
+    return null
+  }
+
+  const queId = obj.queId ?? obj.que_id ?? null
+  const queTitle = asNullableString(obj.queTitle ?? obj.que_title)
+  const queType = obj.queType ?? obj.que_type
+  const value = extractAnswerDisplayValue(obj)
+
+  const slim: Record<string, unknown> = {
+    queId,
+    queTitle
+  }
+  if (queType !== undefined && queType !== null) {
+    slim.queType = queType
+  }
+  if (value !== undefined) {
+    slim.value = value
+  }
+  return slim
+}
+
+function buildFlatRowsFromItems(params: {
+  items: Array<Record<string, unknown>>
+  selectedColumns: string[]
+}): Array<Record<string, unknown>> {
+  return params.items.map((item) =>
+    buildFlatRowFromAnswers({
+      applyId: (item.apply_id as string | number | null | undefined) ?? null,
+      answers: asArray(item.answers),
+      selectedColumns: params.selectedColumns
+    })
+  )
+}
+
+function buildFlatRowFromAnswers(params: {
+  applyId: string | number | null
+  answers: unknown[]
+  selectedColumns: Array<string | number>
+}): Record<string, unknown> {
+  const row: Record<string, unknown> = {
+    apply_id: params.applyId
+  }
+  const selectors = normalizeColumnSelectors(params.selectedColumns)
+
+  for (const selector of selectors) {
+    const hit = findAnswerBySelector(params.answers, selector)
+    const keyBase = resolveFlatRowColumnKey(selector, hit)
+    const key = getUniqueRowKey(row, keyBase)
+    row[key] = hit ? extractAnswerDisplayValue(hit) : null
+  }
+  return row
+}
+
+function findAnswerBySelector(answers: unknown[], selector: string): Record<string, unknown> | null {
+  const target = normalizeColumnSelector(selector)
+  for (const answerRaw of answers) {
+    const answer = asObject(answerRaw)
+    if (!answer) {
+      continue
+    }
+    const answerQueId = asNullableString(answer.queId ?? answer.que_id)
+    if (answerQueId && normalizeColumnSelector(answerQueId) === target) {
+      return answer
+    }
+    const answerQueTitle = asNullableString(answer.queTitle ?? answer.que_title)
+    if (answerQueTitle && normalizeColumnSelector(answerQueTitle) === target) {
+      return answer
+    }
+  }
+  return null
+}
+
+function resolveFlatRowColumnKey(selector: string, answer: Record<string, unknown> | null): string {
+  const trimmed = selector.trim()
+  if (!trimmed) {
+    return "column"
+  }
+  if (!isNumericKey(trimmed)) {
+    return trimmed
+  }
+  const title = asNullableString(answer?.queTitle ?? answer?.que_title)
+  if (title && title.trim()) {
+    return title
+  }
+  return trimmed
+}
+
+function getUniqueRowKey(row: Record<string, unknown>, preferred: string): string {
+  if (!(preferred in row)) {
+    return preferred
+  }
+  let index = 2
+  let candidate = `${preferred}#${index}`
+  while (candidate in row) {
+    index += 1
+    candidate = `${preferred}#${index}`
+  }
+  return candidate
 }
 
 function fitListItemsWithinSize(params: {
@@ -4884,7 +5146,8 @@ function buildBaseExampleCall(params: {
       tool: "qf_record_get",
       arguments: {
         apply_id: "your_apply_id",
-        select_columns: params.selectColumns
+        select_columns: params.selectColumns,
+        output_profile: "compact"
       }
     }
   }
@@ -4897,7 +5160,8 @@ function buildBaseExampleCall(params: {
         mode: "all",
         page_size: 50,
         max_rows: 20,
-        select_columns: params.selectColumns
+        select_columns: params.selectColumns,
+        output_profile: "compact"
       }
     }
   }
@@ -4912,7 +5176,8 @@ function buildBaseExampleCall(params: {
         page_size: 50,
         requested_pages: 3,
         scan_max_pages: 3,
-        strict_full: false
+        strict_full: false,
+        output_profile: "compact"
       }
     }
   }
@@ -4924,7 +5189,8 @@ function buildBaseExampleCall(params: {
       arguments: {
         query_mode: "record",
         apply_id: "your_apply_id",
-        select_columns: params.selectColumns
+        select_columns: params.selectColumns,
+        output_profile: "compact"
       }
     }
   }
@@ -4938,7 +5204,8 @@ function buildBaseExampleCall(params: {
         select_columns: params.selectColumns,
         page_size: 50,
         scan_max_pages: 3,
-        strict_full: false
+        strict_full: false,
+        output_profile: "compact"
       }
     }
   }
@@ -4950,7 +5217,8 @@ function buildBaseExampleCall(params: {
       mode: "all",
       page_size: 50,
       max_rows: 20,
-      select_columns: params.selectColumns
+      select_columns: params.selectColumns,
+      output_profile: "compact"
     }
   }
 }
