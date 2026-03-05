@@ -628,6 +628,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
   await t.test("tools are exposed", async () => {
     const tools = await mcp.client.listTools()
     const names = tools.tools.map((item) => item.name)
+    assert.ok(names.includes("qf_tool_spec_get"))
     assert.ok(names.includes("qf_query"))
     assert.ok(names.includes("qf_records_list"))
     assert.ok(names.includes("qf_records_aggregate"))
@@ -639,6 +640,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(listed.stderr, "")
     const tools = JSON.parse(listed.stdout)
     const names = tools.map((item) => item.name)
+    assert.ok(names.includes("qf_tool_spec_get"))
     assert.ok(names.includes("qf_query"))
     assert.ok(names.includes("qf_records_aggregate"))
 
@@ -664,6 +666,27 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     const form = await callTool(mcp.client, "qf_form_get", { app_key: APP_KEY })
     assert.equal(form.ok, true)
     assert.equal(form.data.total_fields, 3)
+  })
+
+  await t.test("qf_tool_spec_get returns constraints and examples", async () => {
+    const spec = await callTool(mcp.client, "qf_tool_spec_get", {
+      tool_name: "qf_records_list"
+    })
+
+    assert.equal(spec.ok, true)
+    assert.equal(spec.data.requested_tool, "qf_records_list")
+    assert.equal(spec.data.tool_count, 1)
+
+    const item = spec.data.tools[0]
+    assert.equal(item.tool, "qf_records_list")
+    assert.ok(item.required.includes("app_key"))
+    assert.ok(item.required.includes("select_columns"))
+    assert.equal(item.limits.page_size_max, 200)
+    assert.equal(item.limits.select_columns_max, 10)
+    assert.ok(Array.isArray(item.aliases.select_columns))
+    assert.ok(item.aliases.select_columns.includes("selectColumns"))
+    assert.equal(item.minimal_example.app_key, "21b3d559")
+    assert.ok(Array.isArray(item.minimal_example.select_columns))
   })
 
   await t.test("qf_records_list applies strict row/column projection", async () => {

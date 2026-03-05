@@ -101,6 +101,7 @@ const DEFAULT_ROW_LIMIT = 200
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
+const SERVER_VERSION = "0.3.8"
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -121,7 +122,7 @@ const client = new QingflowClient({
 
 const server = new McpServer({
   name: "qingflow-mcp",
-  version: "0.3.7"
+  version: SERVER_VERSION
 })
 
 const jsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()])
@@ -288,6 +289,35 @@ const formSuccessOutputSchema = z.object({
   meta: apiMetaSchema
 })
 const formOutputSchema = formSuccessOutputSchema
+
+const toolSpecInputSchema = z.preprocess(
+  normalizeToolSpecInput,
+  z.object({
+    tool_name: z.string().min(1).optional(),
+    include_all: z.boolean().optional()
+  })
+)
+
+const toolSpecItemSchema = z.object({
+  tool: z.string(),
+  required: z.array(z.string()),
+  limits: z.record(z.unknown()),
+  aliases: z.record(z.array(z.string())),
+  minimal_example: z.record(z.unknown())
+})
+
+const toolSpecOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    requested_tool: z.string().nullable(),
+    tool_count: z.number().int().nonnegative(),
+    tools: z.array(toolSpecItemSchema)
+  }),
+  meta: z.object({
+    version: z.string(),
+    generated_at: z.string()
+  })
+})
 
 const listInputSchema = z
   .preprocess(
@@ -766,6 +796,63 @@ const aggregateOutputSchema = z.object({
   ...queryContractFields,
   meta: apiMetaSchema
 })
+
+server.registerTool(
+  "qf_tool_spec_get",
+  {
+    title: "Qingflow Tool Spec Get",
+    description:
+      "Return MCP tool parameter requirements, limits, aliases and minimal examples for agent prompt grounding.",
+    inputSchema: toolSpecInputSchema,
+    outputSchema: toolSpecOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const allSpecs = buildToolSpecCatalog()
+      const requested = args.tool_name?.trim() ?? null
+      const includeAll = args.include_all ?? false
+      const normalizedRequested = requested?.toLowerCase() ?? null
+
+      let tools = allSpecs
+      if (normalizedRequested && !includeAll) {
+        tools = allSpecs.filter((item) => item.tool.toLowerCase() === normalizedRequested)
+        if (tools.length === 0) {
+          throw new InputValidationError({
+            message: `Unknown tool "${requested}"`,
+            errorCode: "UNKNOWN_TOOL",
+            fixHint: "Use qf_tool_spec_get without tool_name to list all supported tool specs.",
+            details: {
+              tool_name: requested,
+              available_tools: allSpecs.map((item) => item.tool)
+            }
+          })
+        }
+      }
+
+      return okResult(
+        {
+          ok: true,
+          data: {
+            requested_tool: requested,
+            tool_count: tools.length,
+            tools
+          },
+          meta: {
+            version: SERVER_VERSION,
+            generated_at: new Date().toISOString()
+          }
+        },
+        requested ? `Returned spec for ${requested}` : `Returned ${tools.length} tool specs`
+      )
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
 
 server.registerTool(
   "qf_apps_list",
@@ -1374,7 +1461,7 @@ async function callLocalMcp(
 
   const localClient = new Client({
     name: "qingflow-mcp-cli",
-    version: "0.3.7"
+    version: SERVER_VERSION
   })
 
   try {
@@ -1550,6 +1637,310 @@ function applyAliases(
     }
   }
   return out
+}
+
+interface ToolSpecDoc {
+  tool: string
+  required: string[]
+  limits: Record<string, unknown>
+  aliases: Record<string, string[]>
+  minimal_example: Record<string, unknown>
+}
+
+function normalizeToolSpecInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    tool: "tool_name",
+    name: "tool_name",
+    toolName: "tool_name",
+    includeAll: "include_all"
+  })
+  return {
+    ...normalizedObj,
+    include_all: coerceBooleanLike(normalizedObj.include_all)
+  }
+}
+
+function buildToolSpecCatalog(): ToolSpecDoc[] {
+  return [
+    {
+      tool: "qf_tool_spec_get",
+      required: [],
+      limits: {
+        tool_name: "optional; when omitted returns all tool specs",
+        include_all: "default=false; true returns all specs even when tool_name is set"
+      },
+      aliases: collectAliasHints(["tool_name", "include_all"], {
+        tool_name: ["tool", "name", "toolName"],
+        include_all: ["includeAll"]
+      }),
+      minimal_example: {
+        tool_name: "qf_records_list"
+      }
+    },
+    {
+      tool: "qf_apps_list",
+      required: [],
+      limits: {
+        favourite: "0|1",
+        limit_max: 500,
+        offset_min: 0
+      },
+      aliases: collectAliasHints(["user_id"], {}),
+      minimal_example: {
+        keyword: "报价",
+        limit: 20
+      }
+    },
+    {
+      tool: "qf_form_get",
+      required: ["app_key"],
+      limits: {
+        app_key: "required string"
+      },
+      aliases: collectAliasHints(["app_key", "user_id", "force_refresh"], {}),
+      minimal_example: {
+        app_key: "21b3d559"
+      }
+    },
+    {
+      tool: "qf_records_list",
+      required: ["app_key", "select_columns"],
+      limits: {
+        page_size_max: 200,
+        requested_pages_max: 500,
+        scan_max_pages_max: 500,
+        max_rows_max: 200,
+        max_items_max: 200,
+        max_columns_max: 10,
+        select_columns_max: 10
+      },
+      aliases: collectAliasHints(
+        [
+          "app_key",
+          "user_id",
+          "page_num",
+          "page_token",
+          "page_size",
+          "requested_pages",
+          "scan_max_pages",
+          "max_rows",
+          "max_items",
+          "max_columns",
+          "select_columns",
+          "strict_full",
+          "include_answers",
+          "time_range"
+        ],
+        {
+          select_columns: ["columns", "selected_columns", "selectedColumns"],
+          max_rows: ["limit", "row_limit", "rowLimit"]
+        }
+      ),
+      minimal_example: {
+        app_key: "21b3d559",
+        mode: "all",
+        page_size: 50,
+        max_rows: 20,
+        select_columns: [0, "客户名称", "报价总金额"]
+      }
+    },
+    {
+      tool: "qf_record_get",
+      required: ["apply_id", "select_columns"],
+      limits: {
+        max_columns_max: 10,
+        select_columns_max: 10
+      },
+      aliases: collectAliasHints(["apply_id", "max_columns", "select_columns"], {
+        select_columns: ["columns", "selected_columns", "selectedColumns"]
+      }),
+      minimal_example: {
+        apply_id: "497600278750478338",
+        select_columns: [0, "客户名称"],
+        max_columns: 5
+      }
+    },
+    {
+      tool: "qf_query",
+      required: [
+        "record mode: apply_id + select_columns",
+        "list mode: app_key + select_columns",
+        "summary mode: app_key + select_columns"
+      ],
+      limits: {
+        query_mode: "auto|list|record|summary",
+        page_size_max: 200,
+        requested_pages_max: 500,
+        scan_max_pages_max: 500,
+        max_rows_max: 200,
+        max_items_max: 200,
+        max_columns_max: 10,
+        select_columns_max: 10
+      },
+      aliases: collectAliasHints(
+        [
+          "query_mode",
+          "app_key",
+          "apply_id",
+          "page_num",
+          "page_token",
+          "page_size",
+          "requested_pages",
+          "scan_max_pages",
+          "max_rows",
+          "max_items",
+          "max_columns",
+          "select_columns",
+          "amount_column",
+          "time_range",
+          "stat_policy",
+          "strict_full"
+        ],
+        {
+          select_columns: ["columns", "selected_columns", "selectedColumns"],
+          max_rows: ["limit", "row_limit", "rowLimit"],
+          amount_column: ["amount_que_ids", "amountQueIds", "amountColumns"],
+          time_range: ["date_field + date_from + date_to"]
+        }
+      ),
+      minimal_example: {
+        query_mode: "list",
+        app_key: "21b3d559",
+        mode: "all",
+        page_size: 50,
+        max_rows: 20,
+        select_columns: [0, "客户名称", "报价总金额"],
+        time_range: {
+          column: 6299264,
+          from: "2026-03-05",
+          to: "2026-03-05"
+        }
+      }
+    },
+    {
+      tool: "qf_records_aggregate",
+      required: ["app_key", "group_by"],
+      limits: {
+        page_size_max: 200,
+        requested_pages_max: 500,
+        scan_max_pages_max: 500,
+        max_groups_max: 2000,
+        group_by_max: 20
+      },
+      aliases: collectAliasHints(
+        [
+          "app_key",
+          "group_by",
+          "amount_column",
+          "page_num",
+          "page_token",
+          "page_size",
+          "requested_pages",
+          "scan_max_pages",
+          "time_range",
+          "stat_policy",
+          "strict_full"
+        ],
+        {
+          amount_column: ["amount_que_ids", "amountQueIds", "amountColumns"],
+          time_range: ["date_field + date_from + date_to"]
+        }
+      ),
+      minimal_example: {
+        app_key: "21b3d559",
+        mode: "all",
+        group_by: [9500572],
+        amount_column: 6299263,
+        time_range: {
+          column: 6299264,
+          from: "2026-03-05",
+          to: "2026-03-05"
+        },
+        requested_pages: 3,
+        scan_max_pages: 3,
+        strict_full: false
+      }
+    },
+    {
+      tool: "qf_record_create",
+      required: ["app_key", "answers or fields"],
+      limits: {
+        write_mode: "Provide either answers[] or fields{}"
+      },
+      aliases: collectAliasHints(["app_key", "user_id", "force_refresh_form", "apply_user"], {}),
+      minimal_example: {
+        app_key: "21b3d559",
+        fields: {
+          客户名称: "测试客户",
+          报价总金额: 1000
+        }
+      }
+    },
+    {
+      tool: "qf_record_update",
+      required: ["apply_id", "answers or fields"],
+      limits: {
+        write_mode: "Provide either answers[] or fields{}"
+      },
+      aliases: collectAliasHints(["apply_id", "app_key", "user_id", "force_refresh_form"], {}),
+      minimal_example: {
+        apply_id: "497600278750478338",
+        app_key: "21b3d559",
+        fields: {
+          报价总金额: 1200
+        }
+      }
+    },
+    {
+      tool: "qf_operation_get",
+      required: ["request_id"],
+      limits: {},
+      aliases: {},
+      minimal_example: {
+        request_id: "req-xxxxxxxx"
+      }
+    }
+  ]
+}
+
+function collectAliasHints(
+  canonicalFields: string[],
+  extraAliases: Record<string, string[]>
+): Record<string, string[]> {
+  const result: Record<string, string[]> = {}
+  const aliasEntries = Object.entries(COMMON_INPUT_ALIASES)
+
+  for (const field of canonicalFields) {
+    const fromCommon = aliasEntries
+      .filter(([, canonical]) => canonical === field)
+      .map(([alias]) => alias)
+      .filter((alias) => alias !== field)
+    const combined = uniqueStringList([...(extraAliases[field] ?? []), ...fromCommon])
+    if (combined.length > 0) {
+      result[field] = combined
+    }
+  }
+
+  return result
+}
+
+function uniqueStringList(values: string[]): string[] {
+  const seen = new Set<string>()
+  const output: string[] = []
+  for (const value of values) {
+    const normalized = value.trim()
+    if (!normalized || seen.has(normalized)) {
+      continue
+    }
+    seen.add(normalized)
+    output.push(normalized)
+  }
+  return output
 }
 
 function normalizeListInput(raw: unknown): unknown {
