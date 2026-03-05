@@ -96,9 +96,11 @@ class InputValidationError extends Error {
 const FORM_CACHE_TTL_MS = Number(process.env.QINGFLOW_FORM_CACHE_TTL_MS ?? "300000")
 const formCache = new Map<string, FormCacheEntry>()
 const DEFAULT_PAGE_SIZE = 50
-const DEFAULT_SCAN_MAX_PAGES = 50
+const DEFAULT_SCAN_MAX_PAGES = 10
 const DEFAULT_ROW_LIMIT = 200
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
+const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
+const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -113,12 +115,13 @@ if (!baseUrl) {
 
 const client = new QingflowClient({
   accessToken,
-  baseUrl
+  baseUrl,
+  timeoutMs: REQUEST_TIMEOUT_MS
 })
 
 const server = new McpServer({
   name: "qingflow-mcp",
-  version: "0.3.1"
+  version: "0.3.3"
 })
 
 const jsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()])
@@ -1496,9 +1499,10 @@ function missingRequiredFieldError(params: {
 }
 
 function normalizeListInput(raw: unknown): unknown {
-  const obj = asObject(raw)
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
   if (!obj) {
-    return raw
+    return parsedRoot
   }
   return {
     ...obj,
@@ -1521,9 +1525,10 @@ function normalizeListInput(raw: unknown): unknown {
 }
 
 function normalizeRecordGetInput(raw: unknown): unknown {
-  const obj = asObject(raw)
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
   if (!obj) {
-    return raw
+    return parsedRoot
   }
   return {
     ...obj,
@@ -1534,9 +1539,10 @@ function normalizeRecordGetInput(raw: unknown): unknown {
 }
 
 function normalizeQueryInput(raw: unknown): unknown {
-  const obj = asObject(raw)
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
   if (!obj) {
-    return raw
+    return parsedRoot
   }
   return {
     ...obj,
@@ -1560,9 +1566,10 @@ function normalizeQueryInput(raw: unknown): unknown {
 }
 
 function normalizeAggregateInput(raw: unknown): unknown {
-  const obj = asObject(raw)
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
   if (!obj) {
-    return raw
+    return parsedRoot
   }
   return {
     ...obj,
@@ -1583,8 +1590,12 @@ function normalizeAggregateInput(raw: unknown): unknown {
 }
 
 function coerceNumberLike(value: unknown): unknown {
-  if (typeof value === "string") {
-    const trimmed = value.trim()
+  const parsed = parseJsonLikeDeep(value)
+  if (typeof parsed === "number" && Number.isFinite(parsed)) {
+    return parsed
+  }
+  if (typeof parsed === "string") {
+    const trimmed = parsed.trim()
     if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
       const parsed = Number(trimmed)
       if (Number.isFinite(parsed)) {
@@ -1592,12 +1603,16 @@ function coerceNumberLike(value: unknown): unknown {
       }
     }
   }
-  return value
+  return parsed
 }
 
 function coerceBooleanLike(value: unknown): unknown {
-  if (typeof value === "string") {
-    const trimmed = value.trim().toLowerCase()
+  const parsed = parseJsonLikeDeep(value)
+  if (typeof parsed === "boolean") {
+    return parsed
+  }
+  if (typeof parsed === "string") {
+    const trimmed = parsed.trim().toLowerCase()
     if (trimmed === "true") {
       return true
     }
@@ -1605,29 +1620,44 @@ function coerceBooleanLike(value: unknown): unknown {
       return false
     }
   }
-  return value
+  return parsed
 }
 
-function parseJsonLike(value: unknown): unknown {
-  if (typeof value !== "string") {
-    return value
+function parseJsonLikeDeep(value: unknown, maxDepth = 4): unknown {
+  let current = value
+  for (let i = 0; i < maxDepth; i += 1) {
+    if (typeof current !== "string") {
+      return current
+    }
+    const trimmed = current.trim()
+    if (!trimmed) {
+      return current
+    }
+
+    const singleQuoted = trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2
+    const candidate = singleQuoted ? trimmed.slice(1, -1) : trimmed
+    const shouldTryJson =
+      candidate.startsWith("{") ||
+      candidate.startsWith("[") ||
+      (candidate.startsWith('"') && candidate.endsWith('"'))
+    if (!shouldTryJson) {
+      return current
+    }
+    try {
+      const parsed = JSON.parse(candidate)
+      if (Object.is(parsed, current)) {
+        return current
+      }
+      current = parsed
+    } catch {
+      return current
+    }
   }
-  const trimmed = value.trim()
-  if (!trimmed) {
-    return value
-  }
-  if (!trimmed.startsWith("[") && !trimmed.startsWith("{")) {
-    return value
-  }
-  try {
-    return JSON.parse(trimmed)
-  } catch {
-    return value
-  }
+  return current
 }
 
 function normalizeSelectorListInput(value: unknown): unknown {
-  const parsed = parseJsonLike(value)
+  const parsed = parseJsonLikeDeep(value)
   if (Array.isArray(parsed)) {
     return parsed.map((item) => coerceNumberLike(item))
   }
@@ -1652,7 +1682,7 @@ function normalizeSelectorListInput(value: unknown): unknown {
 }
 
 function normalizeIdArrayInput(value: unknown): unknown {
-  const parsed = parseJsonLike(value)
+  const parsed = parseJsonLikeDeep(value)
   if (Array.isArray(parsed)) {
     return parsed.map((item) => coerceNumberLike(item))
   }
@@ -1667,7 +1697,7 @@ function normalizeIdArrayInput(value: unknown): unknown {
 }
 
 function normalizeSortInput(value: unknown): unknown {
-  const parsed = parseJsonLike(value)
+  const parsed = parseJsonLikeDeep(value)
   if (!Array.isArray(parsed)) {
     return parsed
   }
@@ -1685,7 +1715,7 @@ function normalizeSortInput(value: unknown): unknown {
 }
 
 function normalizeFiltersInput(value: unknown): unknown {
-  const parsed = parseJsonLike(value)
+  const parsed = parseJsonLikeDeep(value)
   if (parsed === undefined || parsed === null) {
     return parsed
   }
@@ -1705,7 +1735,7 @@ function normalizeFiltersInput(value: unknown): unknown {
 }
 
 function normalizeTimeRangeInput(value: unknown): unknown {
-  const parsed = parseJsonLike(value)
+  const parsed = parseJsonLikeDeep(value)
   const obj = asObject(parsed)
   if (!obj) {
     return parsed
@@ -1755,6 +1785,10 @@ function decodeContinuationToken(token: string): ContinuationTokenPayload {
     next_page_num: nextPageNum,
     page_size: pageSize
   }
+}
+
+function isExecutionBudgetExceeded(startedAt: number): boolean {
+  return Date.now() - startedAt >= EXECUTION_BUDGET_MS
 }
 
 function buildEvidencePayload(
@@ -1967,6 +2001,7 @@ async function executeRecordsList(
   const effectiveFilters = appendTimeRangeFilter(args.filters, args.time_range)
   const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
   const includeAnswers = true
+  const startedAt = Date.now()
   let currentPage = pageNum
   let fetchedPages = 0
   let hasMore = false
@@ -1978,6 +2013,12 @@ async function executeRecordsList(
   const collectedRawItems: unknown[] = []
 
   while (fetchedPages < requestedPages && fetchedPages < scanMaxPages) {
+    if (fetchedPages > 0 && isExecutionBudgetExceeded(startedAt)) {
+      hasMore = true
+      nextPageNum = currentPage
+      break
+    }
+
     const payload = buildListPayload({
       pageNum: currentPage,
       pageSize,
@@ -2029,11 +2070,17 @@ async function executeRecordsList(
     selectColumns: args.select_columns
   })
   if (items.length > 0 && columnProjection.matchedAnswersCount === 0) {
-    throw new Error(
-      `No answers matched select_columns (${args.select_columns
+    throw new InputValidationError({
+      message: `No answers matched select_columns (${args.select_columns
         .map((item) => String(item))
-        .join(", ")}). Check que_id/title from qf_form_get.`
-    )
+        .join(", ")}).`,
+      errorCode: "COLUMN_SELECTOR_NOT_FOUND",
+      fixHint:
+        "Use qf_form_get to confirm que_id/que_title. If parameters were stringified, pass native JSON arrays (or plain arrays) for select_columns.",
+      details: {
+        select_columns: args.select_columns
+      }
+    })
   }
   const fitted = fitListItemsWithinSize({
     items: columnProjection.items,
@@ -2295,6 +2342,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   }
 
   let currentPage = startPage
+  const startedAt = Date.now()
   let scannedPages = 0
   let scannedRecords = 0
   let hasMore = false
@@ -2309,6 +2357,12 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   const byDay = new Map<string, { count: number; amount: number }>()
 
   while (scannedPages < requestedPages && scannedPages < scanMaxPages) {
+    if (scannedPages > 0 && isExecutionBudgetExceeded(startedAt)) {
+      hasMore = true
+      nextPageNum = currentPage
+      break
+    }
+
     const payload = buildListPayload({
       pageNum: currentPage,
       pageSize,
@@ -2557,6 +2611,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
   }
 
   let currentPage = startPage
+  const startedAt = Date.now()
   let scannedPages = 0
   let scannedRecords = 0
   let hasMore = false
@@ -2568,6 +2623,12 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
   const groupStats = new Map<string, { group: Record<string, unknown>; count: number; amount: number }>()
 
   while (scannedPages < requestedPages && scannedPages < scanMaxPages) {
+    if (scannedPages > 0 && isExecutionBudgetExceeded(startedAt)) {
+      hasMore = true
+      nextPageNum = currentPage
+      break
+    }
+
     const payload = buildListPayload({
       pageNum: currentPage,
       pageSize,
@@ -3599,14 +3660,17 @@ function toErrorPayload(error: unknown): Record<string, unknown> {
     }
   }
   if (error instanceof QingflowApiError) {
+    const timeoutHint = /timeout/i.test(error.message) || /timeout/i.test(error.errMsg)
     return {
       ok: false,
-      error_code: "QINGFLOW_API_ERROR",
+      error_code: timeoutHint ? "UPSTREAM_TIMEOUT" : "QINGFLOW_API_ERROR",
       message: error.message,
       err_code: error.errCode,
       err_msg: error.errMsg || null,
       http_status: error.httpStatus,
-      fix_hint: "Check app_key/accessToken and request body against qf_form_get field definitions.",
+      fix_hint: timeoutHint
+        ? "Upstream request timed out. Reduce page_size/requested_pages, narrow filters, or continue with next_page_token."
+        : "Check app_key/accessToken and request body against qf_form_get field definitions.",
       next_page_token: null,
       details: error.details ?? null
     }

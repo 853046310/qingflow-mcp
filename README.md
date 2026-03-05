@@ -37,6 +37,8 @@ Optional:
 
 ```bash
 export QINGFLOW_FORM_CACHE_TTL_MS=300000
+export QINGFLOW_REQUEST_TIMEOUT_MS=18000
+export QINGFLOW_EXECUTION_BUDGET_MS=20000
 ```
 
 ## Run
@@ -247,8 +249,8 @@ Aggregate example (`qf_records_aggregate`):
   "app_key": "your_app_key",
   "group_by": ["归属部门", "归属销售"],
   "amount_column": "报价总金额",
-  "requested_pages": 50,
-  "scan_max_pages": 50,
+  "requested_pages": 10,
+  "scan_max_pages": 10,
   "strict_full": true
 }
 ```

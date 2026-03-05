@@ -19,8 +19,13 @@
    - `max_columns` 最大 `10`
 5. 参数容错（P0）：
    - 支持字符串化 JSON 自动反序列化（如 `select_columns` / `filters` / `group_by`）
+   - 支持双层字符串化 JSON 反序列化（如 `select_columns: "\"[1001,1002]\""`)
    - 数字字符串自动转 number（如 `max_rows: \"50\"`）
    - 布尔字符串自动转 boolean（如 `strict_full: \"true\"`）
+6. 超时保护（P0）：
+   - 默认单次上游请求超时：`QINGFLOW_REQUEST_TIMEOUT_MS=18000`
+   - 默认工具执行预算：`QINGFLOW_EXECUTION_BUDGET_MS=20000`
+   - 默认 `scan_max_pages=10`，避免在 25s tool timeout 场景下超时。
 
 ## 2. 完整性协议（completeness）
 

@@ -728,6 +728,24 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(listed.completeness.returned_items, 2)
   })
 
+  await t.test("qf_query list mode tolerates double-stringified params", async () => {
+    const listed = await callTool(mcp.client, "qf_query", {
+      query_mode: "list",
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: "\"20\"",
+      max_rows: "\"2\"",
+      select_columns: "\"[1001]\"",
+      filters:
+        "\"[{\\\"que_id\\\":1003,\\\"min_value\\\":\\\"2026-01-02\\\",\\\"max_value\\\":\\\"2026-01-02\\\"}]\""
+    })
+
+    assert.equal(listed.ok, true)
+    assert.equal(listed.data.mode, "list")
+    assert.equal(listed.data.list.items.length, 2)
+    assert.equal(listed.data.list.completeness.returned_items, 2)
+  })
+
   await t.test("qf_records_list returns deterministic pagination token", async () => {
     const page1 = await callTool(mcp.client, "qf_records_list", {
       app_key: APP_KEY,
@@ -962,6 +980,23 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       requested_pages: "10",
       scan_max_pages: "10",
       strict_full: "true"
+    })
+
+    assert.equal(aggregated.ok, true)
+    assert.equal(aggregated.data.summary.total_count, 6)
+    assert.equal(aggregated.completeness.is_complete, true)
+  })
+
+  await t.test("qf_records_aggregate tolerates double-stringified group_by/amount", async () => {
+    const aggregated = await callTool(mcp.client, "qf_records_aggregate", {
+      app_key: APP_KEY,
+      mode: "all",
+      group_by: "\"[1003]\"",
+      amount_column: "\"1002\"",
+      page_size: "\"2\"",
+      requested_pages: "\"10\"",
+      scan_max_pages: "\"10\"",
+      strict_full: "\"true\""
     })
 
     assert.equal(aggregated.ok, true)
