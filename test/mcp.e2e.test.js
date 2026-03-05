@@ -741,7 +741,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.ok(item.required.includes("app_key"))
     assert.ok(item.required.includes("select_columns"))
     assert.equal(item.limits.page_size_max, 200)
-    assert.equal(item.limits.select_columns_max, 3)
+    assert.equal(item.limits.select_columns_max, 2)
     assert.ok(Array.isArray(item.aliases.select_columns))
     assert.ok(item.aliases.select_columns.includes("selectColumns"))
     assert.ok(Array.isArray(item.aliases.output_profile))

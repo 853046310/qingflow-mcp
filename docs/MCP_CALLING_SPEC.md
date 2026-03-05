@@ -104,8 +104,8 @@
 
 约束：
 - `include_answers=false` 不允许
-- `select_columns <= 3`
-- `max_columns <= 3`
+- `select_columns <= 2`
+- `max_columns <= 2`
 - `max_rows/max_items <= 200`
 
 ## 6.4 `qf_record_get`
@@ -117,8 +117,8 @@
 - 可选：`max_columns`, `output_profile`（默认 `compact`）
 
 约束：
-- `select_columns <= 3`
-- `max_columns <= 3`
+- `select_columns <= 2`
+- `max_columns <= 2`
 
 ## 6.5 `qf_query`
 

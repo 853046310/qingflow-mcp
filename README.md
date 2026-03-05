@@ -213,7 +213,7 @@ Strict mode (`qf_records_list`):
 6. The server may still trim by response-size guardrail (`QINGFLOW_LIST_MAX_ITEMS_BYTES`) when payload is too large.
 7. Use `requested_pages` and `scan_max_pages` for deterministic page scan.
 8. Continue with `page_token` from previous `next_page_token`.
-9. Column limits: `select_columns <= 3`, `max_columns <= 3`.
+9. Column limits: `select_columns <= 2`, `max_columns <= 2`.
 
 Example:
 
@@ -226,8 +226,8 @@ Example:
   "scan_max_pages": 1,
   "include_answers": true,
   "max_rows": 10,
-  "max_columns": 3,
-  "select_columns": [1, "客户名称", "1003"],
+  "max_columns": 2,
+  "select_columns": [1, "客户名称"],
   "output_profile": "compact",
   "strict_full": false
 }
@@ -238,7 +238,7 @@ For single record details (`qf_record_get`), the same column controls are suppor
 ```json
 {
   "apply_id": "497600278750478338",
-  "max_columns": 3,
+  "max_columns": 2,
   "select_columns": [1, "客户名称"],
   "output_profile": "compact"
 }

@@ -98,12 +98,12 @@ const formCache = new Map<string, FormCacheEntry>()
 const DEFAULT_PAGE_SIZE = 50
 const DEFAULT_SCAN_MAX_PAGES = 10
 const DEFAULT_ROW_LIMIT = 200
-const MAX_COLUMN_LIMIT = 3
+const MAX_COLUMN_LIMIT = 2
 const DEFAULT_OUTPUT_PROFILE = "compact" as const
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
-const SERVER_VERSION = "0.3.10"
+const SERVER_VERSION = "0.3.11"
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -1786,7 +1786,7 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         mode: "all",
         page_size: 50,
         max_rows: 20,
-        select_columns: [0, "客户名称", "报价总金额"],
+        select_columns: [0, "客户名称"],
         output_profile: "compact"
       }
     },
@@ -1808,7 +1808,7 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       minimal_example: {
         apply_id: "497600278750478338",
         select_columns: [0, "客户名称"],
-        max_columns: 3,
+        max_columns: 2,
         output_profile: "compact"
       }
     },
@@ -1864,7 +1864,7 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         mode: "all",
         page_size: 50,
         max_rows: 20,
-        select_columns: [0, "客户名称", "报价总金额"],
+        select_columns: [0, "客户名称"],
         output_profile: "compact",
         time_range: {
           column: 6299264,
@@ -2703,7 +2703,7 @@ function buildListArgsFromQuery(args: z.infer<typeof queryInputSchema>): z.infer
       field: "select_columns",
       tool: "qf_query(list)",
       fixHint:
-        "Provide select_columns as an array (<=3), for example: {\"select_columns\":[0,\"客户全称\",\"报价总金额\"]}"
+        "Provide select_columns as an array (<=2), for example: {\"select_columns\":[0,\"客户全称\"]}"
     })
   }
 
@@ -2981,7 +2981,7 @@ function buildRecordGetArgsFromQuery(
     throw missingRequiredFieldError({
       field: "select_columns",
       tool: "qf_query(record)",
-      fixHint: "Provide select_columns as an array (<=3), for example: {\"select_columns\":[0,\"客户全称\"]}"
+      fixHint: "Provide select_columns as an array (<=2), for example: {\"select_columns\":[0,\"客户全称\"]}"
     })
   }
 
@@ -3014,7 +3014,7 @@ async function executeRecordsList(
       field: "select_columns",
       tool: "qf_records_list",
       fixHint:
-        "Provide select_columns as an array (<=3), for example: {\"select_columns\":[0,\"客户全称\",\"报价总金额\"]}"
+        "Provide select_columns as an array (<=2), for example: {\"select_columns\":[0,\"客户全称\"]}"
     })
   }
   const outputProfile = resolveOutputProfile(args.output_profile)
@@ -3254,7 +3254,7 @@ async function executeRecordGet(
     throw missingRequiredFieldError({
       field: "select_columns",
       tool: "qf_record_get",
-      fixHint: "Provide select_columns as an array (<=3), for example: {\"apply_id\":\"...\",\"select_columns\":[0]}"
+      fixHint: "Provide select_columns as an array (<=2), for example: {\"apply_id\":\"...\",\"select_columns\":[0]}"
     })
   }
   const outputProfile = resolveOutputProfile(args.output_profile)
@@ -3362,7 +3362,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     throw missingRequiredFieldError({
       field: "select_columns",
       tool: "qf_query(summary)",
-      fixHint: "Provide select_columns as an array (<=3), for example: {\"select_columns\":[\"客户全称\"]}"
+      fixHint: "Provide select_columns as an array (<=2), for example: {\"select_columns\":[\"客户全称\"]}"
     })
   }
   const outputProfile = resolveOutputProfile(args.output_profile)
