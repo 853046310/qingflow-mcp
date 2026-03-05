@@ -35,13 +35,15 @@ function makeAnswer(queId, queTitle, value) {
     return {
       queId,
       queTitle,
-      values: []
+      values: [],
+      tableValues: []
     }
   }
 
   return {
     queId,
     queTitle,
+    tableValues: [],
     values: [
       {
         value,
@@ -943,6 +945,10 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(aggregated.data.completeness.is_complete, true)
     assert.ok(Array.isArray(aggregated.data.groups))
     assert.ok(aggregated.data.groups.length > 0)
+    assert.ok(
+      aggregated.data.groups.every((item) => !Array.isArray(item.group["1003"])),
+      "group_by value should come from values, not empty tableValues"
+    )
     assert.equal(aggregated.data.evidence.source_pages.length, 3)
   })
 

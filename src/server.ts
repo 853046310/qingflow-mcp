@@ -2830,13 +2830,19 @@ function extractSummaryColumnValue(answers: unknown[], column: SummaryColumn): u
 
 function extractAnswerDisplayValue(answer: Record<string, unknown>): unknown {
   const tableValues = answer.tableValues ?? answer.table_values
-  if (tableValues !== undefined) {
+  if (Array.isArray(tableValues)) {
+    // Qingflow often sends tableValues: [] for non-table fields.
+    // Prefer non-empty tableValues; otherwise fallback to values.
+    if (tableValues.length > 0) {
+      return tableValues
+    }
+  } else if (tableValues !== undefined && tableValues !== null) {
     return tableValues
   }
 
   const values = asArray(answer.values)
   if (values.length === 0) {
-    return null
+    return Array.isArray(tableValues) ? tableValues : null
   }
 
   const normalized = values.map((item) => extractAnswerValueCell(item))
