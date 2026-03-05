@@ -98,11 +98,12 @@ const formCache = new Map<string, FormCacheEntry>()
 const DEFAULT_PAGE_SIZE = 50
 const DEFAULT_SCAN_MAX_PAGES = 10
 const DEFAULT_ROW_LIMIT = 200
+const MAX_COLUMN_LIMIT = 3
 const DEFAULT_OUTPUT_PROFILE = "compact" as const
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
-const SERVER_VERSION = "0.3.9"
+const SERVER_VERSION = "0.3.10"
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -377,12 +378,12 @@ const listInputSchema = z
       .optional(),
     max_rows: z.number().int().positive().max(200).optional(),
     max_items: z.number().int().positive().max(200).optional(),
-    max_columns: z.number().int().positive().max(10).optional(),
+    max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
     // Strict mode: callers must explicitly choose columns.
     select_columns: z
       .array(z.union([z.string().min(1), z.number().int()]))
       .min(1)
-      .max(10)
+      .max(MAX_COLUMN_LIMIT)
       .optional(),
     include_answers: z.boolean().optional(),
     strict_full: z.boolean().optional(),
@@ -427,11 +428,11 @@ const recordGetInputSchema = z.preprocess(
   normalizeRecordGetInput,
   z.object({
     apply_id: z.union([z.string().min(1), z.number().int()]),
-    max_columns: z.number().int().positive().max(10).optional(),
+    max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
     select_columns: z
       .array(z.union([z.string().min(1), z.number().int()]))
       .min(1)
-      .max(10)
+      .max(MAX_COLUMN_LIMIT)
       .optional(),
     output_profile: outputProfileSchema.optional()
   })
@@ -581,11 +582,11 @@ const queryInputSchema = z
         .optional(),
       max_rows: z.number().int().positive().max(200).optional(),
       max_items: z.number().int().positive().max(200).optional(),
-      max_columns: z.number().int().positive().max(10).optional(),
+      max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
       select_columns: z
         .array(z.union([z.string().min(1), z.number().int()]))
         .min(1)
-        .max(10)
+        .max(MAX_COLUMN_LIMIT)
         .optional(),
       include_answers: z.boolean().optional(),
       amount_column: z.union([z.string().min(1), z.number().int()]).optional(),
@@ -1752,8 +1753,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         scan_max_pages_max: 500,
         max_rows_max: 200,
         max_items_max: 200,
-        max_columns_max: 10,
-        select_columns_max: 10,
+        max_columns_max: MAX_COLUMN_LIMIT,
+        select_columns_max: MAX_COLUMN_LIMIT,
         output_profile: "compact|verbose (default compact)"
       },
       aliases: collectAliasHints(
@@ -1793,8 +1794,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       tool: "qf_record_get",
       required: ["apply_id", "select_columns"],
       limits: {
-        max_columns_max: 10,
-        select_columns_max: 10,
+        max_columns_max: MAX_COLUMN_LIMIT,
+        select_columns_max: MAX_COLUMN_LIMIT,
         output_profile: "compact|verbose (default compact)"
       },
       aliases: collectAliasHints(
@@ -1807,7 +1808,7 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       minimal_example: {
         apply_id: "497600278750478338",
         select_columns: [0, "客户名称"],
-        max_columns: 5,
+        max_columns: 3,
         output_profile: "compact"
       }
     },
@@ -1825,8 +1826,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         scan_max_pages_max: 500,
         max_rows_max: 200,
         max_items_max: 200,
-        max_columns_max: 10,
-        select_columns_max: 10,
+        max_columns_max: MAX_COLUMN_LIMIT,
+        select_columns_max: MAX_COLUMN_LIMIT,
         output_profile: "compact|verbose (default compact)"
       },
       aliases: collectAliasHints(
@@ -2702,7 +2703,7 @@ function buildListArgsFromQuery(args: z.infer<typeof queryInputSchema>): z.infer
       field: "select_columns",
       tool: "qf_query(list)",
       fixHint:
-        "Provide select_columns as an array (<=10), for example: {\"select_columns\":[0,\"客户全称\",\"报价总金额\"]}"
+        "Provide select_columns as an array (<=3), for example: {\"select_columns\":[0,\"客户全称\",\"报价总金额\"]}"
     })
   }
 
@@ -2980,7 +2981,7 @@ function buildRecordGetArgsFromQuery(
     throw missingRequiredFieldError({
       field: "select_columns",
       tool: "qf_query(record)",
-      fixHint: "Provide select_columns as an array (<=10), for example: {\"select_columns\":[0,\"客户全称\"]}"
+      fixHint: "Provide select_columns as an array (<=3), for example: {\"select_columns\":[0,\"客户全称\"]}"
     })
   }
 
@@ -3013,7 +3014,7 @@ async function executeRecordsList(
       field: "select_columns",
       tool: "qf_records_list",
       fixHint:
-        "Provide select_columns as an array (<=10), for example: {\"select_columns\":[0,\"客户全称\",\"报价总金额\"]}"
+        "Provide select_columns as an array (<=3), for example: {\"select_columns\":[0,\"客户全称\",\"报价总金额\"]}"
     })
   }
   const outputProfile = resolveOutputProfile(args.output_profile)
@@ -3253,7 +3254,7 @@ async function executeRecordGet(
     throw missingRequiredFieldError({
       field: "select_columns",
       tool: "qf_record_get",
-      fixHint: "Provide select_columns as an array (<=10), for example: {\"apply_id\":\"...\",\"select_columns\":[0]}"
+      fixHint: "Provide select_columns as an array (<=3), for example: {\"apply_id\":\"...\",\"select_columns\":[0]}"
     })
   }
   const outputProfile = resolveOutputProfile(args.output_profile)
@@ -3361,7 +3362,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     throw missingRequiredFieldError({
       field: "select_columns",
       tool: "qf_query(summary)",
-      fixHint: "Provide select_columns as an array (<=10), for example: {\"select_columns\":[\"客户全称\"]}"
+      fixHint: "Provide select_columns as an array (<=3), for example: {\"select_columns\":[\"客户全称\"]}"
     })
   }
   const outputProfile = resolveOutputProfile(args.output_profile)
