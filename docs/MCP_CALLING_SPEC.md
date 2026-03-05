@@ -8,6 +8,8 @@
 2. 读工具以“可证明”为目标，统一返回：
    - `completeness`：完整性信息
    - `evidence`：证据链信息
+   - `error_code` / `fix_hint`：成功时为 `null`，失败时给出结构化错误与修复建议
+   - `next_page_token`：顶层续拉 token（无则 `null`）
 3. 统计结论必须看 `is_complete`：
    - `is_complete=true` 才能直接用于最终统计结论
    - `is_complete=false` 只能视为样本/部分结果
@@ -15,6 +17,10 @@
    - 行上限默认 `200`（可由 `max_rows` 或 `max_items` 下调，最大仍是 `200`）
    - `select_columns` 最大 `10`
    - `max_columns` 最大 `10`
+5. 参数容错（P0）：
+   - 支持字符串化 JSON 自动反序列化（如 `select_columns` / `filters` / `group_by`）
+   - 数字字符串自动转 number（如 `max_rows: \"50\"`）
+   - 布尔字符串自动转 boolean（如 `strict_full: \"true\"`）
 
 ## 2. 完整性协议（completeness）
 
@@ -160,11 +166,15 @@
 
 - 通用：
   - `ok=false`
+  - `error_code`
   - `message`
-  - 可选 `err_code`, `err_msg`, `http_status`, `details`
+  - `fix_hint`
+  - 可选 `err_code`, `err_msg`, `http_status`, `details`, `next_page_token`
 - 不完整失败（严格模式）：
   - `code="NEED_MORE_DATA"`
   - `status="need_more_data"`
+  - `error_code="NEED_MORE_DATA"`
+  - `fix_hint` 提示续拉方式
   - `details.completeness`
   - `details.evidence`
 

@@ -60,6 +60,31 @@ Run tests:
 npm test
 ```
 
+## Command Line Usage
+
+`qingflow-mcp` still defaults to MCP stdio mode:
+
+```bash
+qingflow-mcp
+```
+
+Use CLI mode for quick local invocation:
+
+```bash
+# list all available tools
+qingflow-mcp cli tools
+
+# machine-readable tool list
+qingflow-mcp cli tools --json
+
+# call one tool with JSON args
+qingflow-mcp cli call qf_apps_list --args '{"limit":5}'
+
+# call from stdin
+echo '{"app_key":"your_app_key","mode":"all","select_columns":[1001]}' \
+  | qingflow-mcp cli call qf_query
+```
+
 ## CLI Install
 
 Global install from GitHub:
@@ -164,6 +189,9 @@ Deterministic read protocol (list/summary/aggregate):
    - `time_range`
    - `source_pages`
 3. `strict_full=true` makes incomplete results fail fast with `NEED_MORE_DATA`.
+4. Success payloads also expose top-level `error_code=null`, `fix_hint=null`, `next_page_token`.
+5. Error payloads expose `error_code` and `fix_hint` for actionable retries.
+6. Parameter tolerance supports stringified JSON and numeric/boolean strings for key query fields.
 
 ## List Query Tips
 

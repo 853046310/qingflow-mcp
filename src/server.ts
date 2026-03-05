@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
+import { Client } from "@modelcontextprotocol/sdk/client/index.js"
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { randomUUID } from "node:crypto"
 import { z } from "zod"
 
@@ -72,6 +74,25 @@ class NeedMoreDataError extends Error {
   }
 }
 
+class InputValidationError extends Error {
+  public readonly errorCode: string
+  public readonly fixHint: string
+  public readonly details: Record<string, unknown> | null
+
+  constructor(params: {
+    message: string
+    errorCode: string
+    fixHint: string
+    details?: Record<string, unknown>
+  }) {
+    super(params.message)
+    this.name = "InputValidationError"
+    this.errorCode = params.errorCode
+    this.fixHint = params.fixHint
+    this.details = params.details ?? null
+  }
+}
+
 const FORM_CACHE_TTL_MS = Number(process.env.QINGFLOW_FORM_CACHE_TTL_MS ?? "300000")
 const formCache = new Map<string, FormCacheEntry>()
 const DEFAULT_PAGE_SIZE = 50
@@ -97,7 +118,7 @@ const client = new QingflowClient({
 
 const server = new McpServer({
   name: "qingflow-mcp",
-  version: "0.3.0"
+  version: "0.3.1"
 })
 
 const jsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()])
@@ -190,6 +211,14 @@ const evidenceSchema = z.object({
   source_pages: z.array(z.number().int().positive())
 })
 
+const queryContractFields = {
+  completeness: completenessSchema,
+  evidence: z.record(z.unknown()),
+  error_code: z.null(),
+  fix_hint: z.null(),
+  next_page_token: z.string().nullable()
+}
+
 const appSchema = z.object({
   appKey: z.string(),
   appName: z.string()
@@ -258,8 +287,10 @@ const formSuccessOutputSchema = z.object({
 const formOutputSchema = formSuccessOutputSchema
 
 const listInputSchema = z
-  .object({
-    app_key: z.string().min(1),
+  .preprocess(
+    normalizeListInput,
+    z.object({
+      app_key: z.string().min(1).optional(),
     user_id: z.string().min(1).optional(),
     page_num: z.number().int().positive().optional(),
     page_token: z.string().min(1).optional(),
@@ -320,10 +351,15 @@ const listInputSchema = z
     max_items: z.number().int().positive().max(200).optional(),
     max_columns: z.number().int().positive().max(10).optional(),
     // Strict mode: callers must explicitly choose columns.
-    select_columns: z.array(z.union([z.string().min(1), z.number().int()])).min(1).max(10),
+    select_columns: z
+      .array(z.union([z.string().min(1), z.number().int()]))
+      .min(1)
+      .max(10)
+      .optional(),
     include_answers: z.boolean().optional(),
     strict_full: z.boolean().optional()
-  })
+    })
+  )
   .refine((value) => value.include_answers !== false, {
     message: "include_answers=false is not allowed in strict column mode"
   })
@@ -353,18 +389,23 @@ const listSuccessOutputSchema = z.object({
     completeness: completenessSchema,
     evidence: evidenceSchema
   }),
+  ...queryContractFields,
   meta: apiMetaSchema
 })
 const listOutputSchema = listSuccessOutputSchema
 
-const recordGetInputSchema = z.object({
-  apply_id: z.union([z.string().min(1), z.number().int()]),
-  max_columns: z.number().int().positive().max(10).optional(),
-  select_columns: z
-    .array(z.union([z.string().min(1), z.number().int()]))
-    .min(1)
-    .max(10)
-})
+const recordGetInputSchema = z.preprocess(
+  normalizeRecordGetInput,
+  z.object({
+    apply_id: z.union([z.string().min(1), z.number().int()]),
+    max_columns: z.number().int().positive().max(10).optional(),
+    select_columns: z
+      .array(z.union([z.string().min(1), z.number().int()]))
+      .min(1)
+      .max(10)
+      .optional()
+  })
+)
 
 const recordGetSuccessOutputSchema = z.object({
   ok: z.literal(true),
@@ -385,6 +426,7 @@ const recordGetSuccessOutputSchema = z.object({
       selected_columns: z.array(z.string())
     })
   }),
+  ...queryContractFields,
   meta: apiMetaSchema
 })
 const recordGetOutputSchema = recordGetSuccessOutputSchema
@@ -454,84 +496,88 @@ const operationSuccessOutputSchema = z.object({
 })
 const operationOutputSchema = operationSuccessOutputSchema
 
-const queryInputSchema = z.object({
-  query_mode: z.enum(["auto", "list", "record", "summary"]).optional(),
-  app_key: z.string().min(1).optional(),
-  apply_id: z.union([z.string().min(1), z.number().int()]).optional(),
-  user_id: z.string().min(1).optional(),
-  page_num: z.number().int().positive().optional(),
-  page_token: z.string().min(1).optional(),
-  page_size: z.number().int().positive().max(200).optional(),
-  requested_pages: z.number().int().positive().max(500).optional(),
-  mode: z
-    .enum([
-      "todo",
-      "done",
-      "mine_approved",
-      "mine_rejected",
-      "mine_draft",
-      "mine_need_improve",
-      "mine_processing",
-      "all",
-      "all_approved",
-      "all_rejected",
-      "all_processing",
-      "cc"
-    ])
-    .optional(),
-  type: z.number().int().min(1).max(12).optional(),
-  keyword: z.string().optional(),
-  query_logic: z.enum(["and", "or"]).optional(),
-  apply_ids: z.array(z.union([z.string(), z.number()])).optional(),
-  sort: z
-    .array(
-      z.object({
-        que_id: z.union([z.string().min(1), z.number().int()]),
-        ascend: z.boolean().optional()
-      })
-    )
-    .optional(),
-  filters: z
-    .array(
-      z.object({
-        que_id: z.union([z.string().min(1), z.number().int()]).optional(),
-        search_key: z.string().optional(),
-        search_keys: z.array(z.string()).optional(),
-        min_value: z.string().optional(),
-        max_value: z.string().optional(),
-        scope: z.number().int().optional(),
-        search_options: z.array(z.union([z.string(), z.number()])).optional(),
-        search_user_ids: z.array(z.string()).optional()
-      })
-    )
-    .optional(),
-  max_rows: z.number().int().positive().max(200).optional(),
-  max_items: z.number().int().positive().max(200).optional(),
-  max_columns: z.number().int().positive().max(10).optional(),
-  select_columns: z
-    .array(z.union([z.string().min(1), z.number().int()]))
-    .min(1)
-    .max(10)
-    .optional(),
-  include_answers: z.boolean().optional(),
-  amount_column: z.union([z.string().min(1), z.number().int()]).optional(),
-  time_range: z
-    .object({
-      column: z.union([z.string().min(1), z.number().int()]),
-      from: z.string().optional(),
-      to: z.string().optional(),
-      timezone: z.string().optional()
+const queryInputSchema = z
+  .preprocess(
+    normalizeQueryInput,
+    z.object({
+      query_mode: z.enum(["auto", "list", "record", "summary"]).optional(),
+      app_key: z.string().min(1).optional(),
+      apply_id: z.union([z.string().min(1), z.number().int()]).optional(),
+      user_id: z.string().min(1).optional(),
+      page_num: z.number().int().positive().optional(),
+      page_token: z.string().min(1).optional(),
+      page_size: z.number().int().positive().max(200).optional(),
+      requested_pages: z.number().int().positive().max(500).optional(),
+      mode: z
+        .enum([
+          "todo",
+          "done",
+          "mine_approved",
+          "mine_rejected",
+          "mine_draft",
+          "mine_need_improve",
+          "mine_processing",
+          "all",
+          "all_approved",
+          "all_rejected",
+          "all_processing",
+          "cc"
+        ])
+        .optional(),
+      type: z.number().int().min(1).max(12).optional(),
+      keyword: z.string().optional(),
+      query_logic: z.enum(["and", "or"]).optional(),
+      apply_ids: z.array(z.union([z.string(), z.number()])).optional(),
+      sort: z
+        .array(
+          z.object({
+            que_id: z.union([z.string().min(1), z.number().int()]),
+            ascend: z.boolean().optional()
+          })
+        )
+        .optional(),
+      filters: z
+        .array(
+          z.object({
+            que_id: z.union([z.string().min(1), z.number().int()]).optional(),
+            search_key: z.string().optional(),
+            search_keys: z.array(z.string()).optional(),
+            min_value: z.string().optional(),
+            max_value: z.string().optional(),
+            scope: z.number().int().optional(),
+            search_options: z.array(z.union([z.string(), z.number()])).optional(),
+            search_user_ids: z.array(z.string()).optional()
+          })
+        )
+        .optional(),
+      max_rows: z.number().int().positive().max(200).optional(),
+      max_items: z.number().int().positive().max(200).optional(),
+      max_columns: z.number().int().positive().max(10).optional(),
+      select_columns: z
+        .array(z.union([z.string().min(1), z.number().int()]))
+        .min(1)
+        .max(10)
+        .optional(),
+      include_answers: z.boolean().optional(),
+      amount_column: z.union([z.string().min(1), z.number().int()]).optional(),
+      time_range: z
+        .object({
+          column: z.union([z.string().min(1), z.number().int()]),
+          from: z.string().optional(),
+          to: z.string().optional(),
+          timezone: z.string().optional()
+        })
+        .optional(),
+      stat_policy: z
+        .object({
+          include_negative: z.boolean().optional(),
+          include_null: z.boolean().optional()
+        })
+        .optional(),
+      scan_max_pages: z.number().int().positive().max(500).optional(),
+      strict_full: z.boolean().optional()
     })
-    .optional(),
-  stat_policy: z
-    .object({
-      include_negative: z.boolean().optional(),
-      include_null: z.boolean().optional()
-    })
-    .optional(),
-  scan_max_pages: z.number().int().positive().max(500).optional(),
-  strict_full: z.boolean().optional()
-})
+  )
   .refine((value) => !(value.page_num !== undefined && value.page_token !== undefined), {
     message: "page_num and page_token cannot be used together"
   })
@@ -597,13 +643,16 @@ const querySuccessOutputSchema = z.object({
     record: recordGetSuccessOutputSchema.shape.data.optional(),
     summary: querySummaryOutputSchema.optional()
   }),
+  ...queryContractFields,
   meta: apiMetaSchema
 })
 const queryOutputSchema = querySuccessOutputSchema
 
 const aggregateInputSchema = z
-  .object({
-    app_key: z.string().min(1),
+  .preprocess(
+    normalizeAggregateInput,
+    z.object({
+      app_key: z.string().min(1),
     user_id: z.string().min(1).optional(),
     page_num: z.number().int().positive().optional(),
     page_token: z.string().min(1).optional(),
@@ -670,7 +719,8 @@ const aggregateInputSchema = z
       .optional(),
     max_groups: z.number().int().positive().max(2000).optional(),
     strict_full: z.boolean().optional()
-  })
+    })
+  )
   .refine((value) => !(value.page_num !== undefined && value.page_token !== undefined), {
     message: "page_num and page_token cannot be used together"
   })
@@ -710,6 +760,7 @@ const aggregateOutputSchema = z.object({
       })
     })
   }),
+  ...queryContractFields,
   meta: apiMetaSchema
 })
 
@@ -874,6 +925,8 @@ server.registerTool(
       if (routedMode === "record") {
         const recordArgs = buildRecordGetArgsFromQuery(args)
         const executed = await executeRecordGet(recordArgs)
+        const completeness = executed.payload.completeness
+        const evidence = executed.payload.evidence
         return okResult(
           {
             ok: true,
@@ -882,6 +935,11 @@ server.registerTool(
               source_tool: "qf_record_get",
               record: executed.payload.data
             },
+            completeness,
+            evidence,
+            error_code: null,
+            fix_hint: null,
+            next_page_token: completeness.next_page_token,
             meta: executed.payload.meta
           },
           executed.message
@@ -890,6 +948,8 @@ server.registerTool(
 
       if (routedMode === "summary") {
         const executed = await executeRecordsSummary(args)
+        const completeness = executed.data.completeness
+        const evidence = executed.data.evidence
         return okResult(
           {
             ok: true,
@@ -898,6 +958,11 @@ server.registerTool(
               source_tool: "qf_records_summary",
               summary: executed.data
             },
+            completeness,
+            evidence,
+            error_code: null,
+            fix_hint: null,
+            next_page_token: completeness.next_page_token,
             meta: executed.meta
           },
           executed.message
@@ -906,6 +971,8 @@ server.registerTool(
 
       const listArgs = buildListArgsFromQuery(args)
       const executed = await executeRecordsList(listArgs)
+      const completeness = executed.payload.completeness
+      const evidence = executed.payload.evidence
       return okResult(
         {
           ok: true,
@@ -914,6 +981,11 @@ server.registerTool(
             source_tool: "qf_records_list",
             list: executed.payload.data
           },
+          completeness,
+          evidence,
+          error_code: null,
+          fix_hint: null,
+          next_page_token: completeness.next_page_token,
           meta: executed.payload.meta
         },
         executed.message
@@ -1090,11 +1162,307 @@ server.registerTool(
 )
 
 async function main(): Promise<void> {
+  const cliExitCode = await runCli(process.argv.slice(2))
+  if (cliExitCode !== null) {
+    process.exitCode = cliExitCode
+    return
+  }
+
   const transport = new StdioServerTransport()
   await server.connect(transport)
 }
 
-void main()
+void main().catch((error) => {
+  process.stderr.write(`${error instanceof Error ? error.message : "Unknown error"}\n`)
+  process.exitCode = 1
+})
+
+async function runCli(argv: string[]): Promise<number | null> {
+  if (argv.length === 0 || argv[0] === "--stdio-server") {
+    return null
+  }
+
+  const [command, ...rest] = argv
+  if (command === "--help" || command === "-h") {
+    printCliHelp()
+    return 0
+  }
+
+  if (command !== "cli") {
+    printCliHelp()
+    return 2
+  }
+
+  const [subcommand, ...subArgs] = rest
+  if (!subcommand || subcommand === "--help" || subcommand === "-h") {
+    printCliHelp()
+    return 0
+  }
+
+  if (subcommand === "tools") {
+    return runCliTools(subArgs)
+  }
+
+  if (subcommand === "call") {
+    return runCliCall(subArgs)
+  }
+
+  process.stderr.write(`Unknown CLI subcommand: ${subcommand}\n`)
+  printCliHelp()
+  return 2
+}
+
+async function runCliTools(args: string[]): Promise<number> {
+  let options: { argsText?: string; help: boolean; json: boolean }
+  try {
+    options = parseCliFlags(args)
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : "Invalid CLI options"}\n`)
+    return 2
+  }
+  if (options.help) {
+    process.stdout.write("Usage: qingflow-mcp cli tools [--json]\n")
+    return 0
+  }
+  if (options.argsText !== undefined) {
+    process.stderr.write("--args is not supported for 'cli tools'\n")
+    return 2
+  }
+
+  const call = await callLocalMcp("tools")
+  if (call.ok) {
+    if (options.json) {
+      process.stdout.write(`${JSON.stringify(call.tools, null, 2)}\n`)
+      return 0
+    }
+    for (const tool of call.tools) {
+      process.stdout.write(`${tool.name}\t${tool.description ?? ""}\n`)
+    }
+    return 0
+  }
+
+  process.stderr.write(`${JSON.stringify(call.error, null, 2)}\n`)
+  return 1
+}
+
+async function runCliCall(args: string[]): Promise<number> {
+  if (args.length === 0) {
+    process.stderr.write("Usage: qingflow-mcp cli call <tool_name> [--args '{\"key\":\"value\"}']\n")
+    return 2
+  }
+
+  const [toolName, ...flagArgs] = args
+  let options: { argsText?: string; help: boolean; json: boolean }
+  try {
+    options = parseCliFlags(flagArgs)
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : "Invalid CLI options"}\n`)
+    return 2
+  }
+  if (options.help) {
+    process.stdout.write("Usage: qingflow-mcp cli call <tool_name> [--args '{\"key\":\"value\"}'] [--json]\n")
+    return 0
+  }
+
+  const inputText = options.argsText ?? (process.stdin.isTTY ? "{}" : await readStdinText())
+  let parsedInput: unknown
+  try {
+    parsedInput = inputText.trim() ? JSON.parse(inputText) : {}
+  } catch {
+    process.stderr.write("Invalid JSON for --args or stdin body\n")
+    return 2
+  }
+  if (!parsedInput || typeof parsedInput !== "object" || Array.isArray(parsedInput)) {
+    process.stderr.write("Tool arguments must be a JSON object\n")
+    return 2
+  }
+
+  const call = await callLocalMcp("call", {
+    toolName,
+    args: parsedInput
+  })
+
+  if (call.ok) {
+    if (options.json || typeof call.payload === "object") {
+      process.stdout.write(`${JSON.stringify(call.payload, null, 2)}\n`)
+      return 0
+    }
+    process.stdout.write(`${String(call.payload)}\n`)
+    return 0
+  }
+
+  process.stderr.write(`${JSON.stringify(call.error, null, 2)}\n`)
+  return 1
+}
+
+function parseCliFlags(args: string[]): { argsText?: string; help: boolean; json: boolean } {
+  let argsText: string | undefined
+  let help = false
+  let json = false
+
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i]
+    if (token === "--help" || token === "-h") {
+      help = true
+      continue
+    }
+    if (token === "--json") {
+      json = true
+      continue
+    }
+    if (token === "--args") {
+      const next = args[i + 1]
+      if (next === undefined) {
+        throw new Error("--args requires a JSON value")
+      }
+      argsText = next
+      i += 1
+      continue
+    }
+    if (token.startsWith("--args=")) {
+      argsText = token.slice("--args=".length)
+      continue
+    }
+    throw new Error(`Unknown CLI option: ${token}`)
+  }
+
+  return { argsText, help, json }
+}
+
+async function callLocalMcp(
+  mode: "tools"
+): Promise<{ ok: true; tools: Array<{ name: string; description?: string }> } | { ok: false; error: unknown }>
+async function callLocalMcp(
+  mode: "call",
+  params: { toolName: string; args: unknown }
+): Promise<{ ok: true; payload: unknown } | { ok: false; error: unknown }>
+async function callLocalMcp(
+  mode: "tools" | "call",
+  params?: { toolName: string; args: unknown }
+): Promise<
+  | { ok: true; tools: Array<{ name: string; description?: string }> }
+  | { ok: true; payload: unknown }
+  | { ok: false; error: unknown }
+> {
+  const entrypoint = process.argv[1]
+  if (!entrypoint) {
+    return { ok: false, error: { message: "Cannot locate current executable entrypoint" } }
+  }
+  const childEnv: Record<string, string> = {}
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) {
+      childEnv[key] = value
+    }
+  }
+
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [entrypoint, "--stdio-server"],
+    cwd: process.cwd(),
+    env: childEnv,
+    stderr: "pipe"
+  })
+
+  if (transport.stderr) {
+    transport.stderr.on("data", () => {
+      // Keep stderr drained to avoid child process backpressure.
+    })
+  }
+
+  const localClient = new Client({
+    name: "qingflow-mcp-cli",
+    version: "0.3.0"
+  })
+
+  try {
+    await localClient.connect(transport)
+
+    if (mode === "tools") {
+      const listed = await localClient.listTools()
+      const tools = listed.tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description
+      }))
+      return { ok: true, tools }
+    }
+
+    if (!params) {
+      throw new Error("Missing tool call params")
+    }
+
+    const result = await localClient.callTool({
+      name: params.toolName,
+      arguments: params.args as Record<string, unknown>
+    })
+
+    if (result.isError) {
+      const payload = tryParseToolPayload(result)
+      return { ok: false, error: payload ?? { message: `Tool ${params.toolName} failed`, result } }
+    }
+
+    const payload = tryParseToolPayload(result)
+    return { ok: true, payload: payload ?? result }
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? { message: error.message } : error
+    }
+  } finally {
+    await localClient.close().catch(() => {})
+  }
+}
+
+function tryParseToolPayload(result: unknown): unknown | null {
+  const obj = asObject(result)
+  if (!obj) {
+    return null
+  }
+
+  if (obj.structuredContent !== undefined) {
+    return obj.structuredContent
+  }
+
+  const textItems = Array.isArray(obj.content)
+    ? obj.content.filter(
+        (item) =>
+          Boolean(item) &&
+          typeof item === "object" &&
+          (item as { type?: unknown }).type === "text" &&
+          typeof (item as { text?: unknown }).text === "string"
+      )
+    : []
+
+  for (const item of textItems) {
+    const text = (item as { text: string }).text
+    try {
+      return JSON.parse(text)
+    } catch {
+      // keep scanning and fallback
+    }
+  }
+  return null
+}
+
+async function readStdinText(): Promise<string> {
+  const chunks: string[] = []
+  for await (const chunk of process.stdin) {
+    chunks.push(String(chunk))
+  }
+  return chunks.join("")
+}
+
+function printCliHelp(): void {
+  process.stdout.write(`qingflow-mcp usage
+
+Default (MCP stdio server):
+  qingflow-mcp
+
+CLI mode:
+  qingflow-mcp cli tools [--json]
+  qingflow-mcp cli call <tool_name> [--args '{"key":"value"}'] [--json]
+  echo '{"app_key":"xxx","mode":"all","select_columns":[1001]}' | qingflow-mcp cli call qf_query
+`)
+}
 
 function hasWritePayload(
   answers?: z.infer<typeof answerInputSchema>[],
@@ -1108,6 +1476,243 @@ function buildMeta(response: QingflowResponse<unknown>) {
     provider_err_code: response.errCode,
     provider_err_msg: response.errMsg || null,
     base_url: baseUrl as string
+  }
+}
+
+function missingRequiredFieldError(params: {
+  field: string
+  tool: string
+  fixHint: string
+}): InputValidationError {
+  return new InputValidationError({
+    message: `Missing required field "${params.field}" for ${params.tool}`,
+    errorCode: "MISSING_REQUIRED_FIELD",
+    fixHint: params.fixHint,
+    details: {
+      field: params.field,
+      tool: params.tool
+    }
+  })
+}
+
+function normalizeListInput(raw: unknown): unknown {
+  const obj = asObject(raw)
+  if (!obj) {
+    return raw
+  }
+  return {
+    ...obj,
+    page_num: coerceNumberLike(obj.page_num),
+    page_size: coerceNumberLike(obj.page_size),
+    requested_pages: coerceNumberLike(obj.requested_pages),
+    scan_max_pages: coerceNumberLike(obj.scan_max_pages),
+    type: coerceNumberLike(obj.type),
+    max_rows: coerceNumberLike(obj.max_rows),
+    max_items: coerceNumberLike(obj.max_items),
+    max_columns: coerceNumberLike(obj.max_columns),
+    strict_full: coerceBooleanLike(obj.strict_full),
+    include_answers: coerceBooleanLike(obj.include_answers),
+    apply_ids: normalizeIdArrayInput(obj.apply_ids),
+    sort: normalizeSortInput(obj.sort),
+    filters: normalizeFiltersInput(obj.filters),
+    select_columns: normalizeSelectorListInput(obj.select_columns),
+    time_range: normalizeTimeRangeInput(obj.time_range)
+  }
+}
+
+function normalizeRecordGetInput(raw: unknown): unknown {
+  const obj = asObject(raw)
+  if (!obj) {
+    return raw
+  }
+  return {
+    ...obj,
+    apply_id: coerceNumberLike(obj.apply_id),
+    max_columns: coerceNumberLike(obj.max_columns),
+    select_columns: normalizeSelectorListInput(obj.select_columns)
+  }
+}
+
+function normalizeQueryInput(raw: unknown): unknown {
+  const obj = asObject(raw)
+  if (!obj) {
+    return raw
+  }
+  return {
+    ...obj,
+    page_num: coerceNumberLike(obj.page_num),
+    page_size: coerceNumberLike(obj.page_size),
+    requested_pages: coerceNumberLike(obj.requested_pages),
+    scan_max_pages: coerceNumberLike(obj.scan_max_pages),
+    type: coerceNumberLike(obj.type),
+    max_rows: coerceNumberLike(obj.max_rows),
+    max_items: coerceNumberLike(obj.max_items),
+    max_columns: coerceNumberLike(obj.max_columns),
+    apply_id: coerceNumberLike(obj.apply_id),
+    strict_full: coerceBooleanLike(obj.strict_full),
+    include_answers: coerceBooleanLike(obj.include_answers),
+    apply_ids: normalizeIdArrayInput(obj.apply_ids),
+    sort: normalizeSortInput(obj.sort),
+    filters: normalizeFiltersInput(obj.filters),
+    select_columns: normalizeSelectorListInput(obj.select_columns),
+    time_range: normalizeTimeRangeInput(obj.time_range)
+  }
+}
+
+function normalizeAggregateInput(raw: unknown): unknown {
+  const obj = asObject(raw)
+  if (!obj) {
+    return raw
+  }
+  return {
+    ...obj,
+    page_num: coerceNumberLike(obj.page_num),
+    page_size: coerceNumberLike(obj.page_size),
+    requested_pages: coerceNumberLike(obj.requested_pages),
+    scan_max_pages: coerceNumberLike(obj.scan_max_pages),
+    type: coerceNumberLike(obj.type),
+    max_groups: coerceNumberLike(obj.max_groups),
+    strict_full: coerceBooleanLike(obj.strict_full),
+    group_by: normalizeSelectorListInput(obj.group_by),
+    amount_column: coerceNumberLike(obj.amount_column),
+    apply_ids: normalizeIdArrayInput(obj.apply_ids),
+    sort: normalizeSortInput(obj.sort),
+    filters: normalizeFiltersInput(obj.filters),
+    time_range: normalizeTimeRangeInput(obj.time_range)
+  }
+}
+
+function coerceNumberLike(value: unknown): unknown {
+  if (typeof value === "string") {
+    const trimmed = value.trim()
+    if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
+      const parsed = Number(trimmed)
+      if (Number.isFinite(parsed)) {
+        return parsed
+      }
+    }
+  }
+  return value
+}
+
+function coerceBooleanLike(value: unknown): unknown {
+  if (typeof value === "string") {
+    const trimmed = value.trim().toLowerCase()
+    if (trimmed === "true") {
+      return true
+    }
+    if (trimmed === "false") {
+      return false
+    }
+  }
+  return value
+}
+
+function parseJsonLike(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value
+  }
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return value
+  }
+  if (!trimmed.startsWith("[") && !trimmed.startsWith("{")) {
+    return value
+  }
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    return value
+  }
+}
+
+function normalizeSelectorListInput(value: unknown): unknown {
+  const parsed = parseJsonLike(value)
+  if (Array.isArray(parsed)) {
+    return parsed.map((item) => coerceNumberLike(item))
+  }
+  if (typeof parsed === "string") {
+    const trimmed = parsed.trim()
+    if (!trimmed) {
+      return parsed
+    }
+    if (trimmed.includes(",")) {
+      return trimmed
+        .split(",")
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0)
+        .map((item) => coerceNumberLike(item))
+    }
+    return [coerceNumberLike(trimmed)]
+  }
+  if (parsed !== undefined && parsed !== null) {
+    return [coerceNumberLike(parsed)]
+  }
+  return parsed
+}
+
+function normalizeIdArrayInput(value: unknown): unknown {
+  const parsed = parseJsonLike(value)
+  if (Array.isArray(parsed)) {
+    return parsed.map((item) => coerceNumberLike(item))
+  }
+  if (typeof parsed === "string" && parsed.includes(",")) {
+    return parsed
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0)
+      .map((item) => coerceNumberLike(item))
+  }
+  return parsed
+}
+
+function normalizeSortInput(value: unknown): unknown {
+  const parsed = parseJsonLike(value)
+  if (!Array.isArray(parsed)) {
+    return parsed
+  }
+  return parsed.map((item) => {
+    const obj = asObject(item)
+    if (!obj) {
+      return item
+    }
+    return {
+      ...obj,
+      que_id: coerceNumberLike(obj.que_id),
+      ascend: coerceBooleanLike(obj.ascend)
+    }
+  })
+}
+
+function normalizeFiltersInput(value: unknown): unknown {
+  const parsed = parseJsonLike(value)
+  if (parsed === undefined || parsed === null) {
+    return parsed
+  }
+  const list = Array.isArray(parsed) ? parsed : [parsed]
+  return list.map((item) => {
+    const obj = asObject(item)
+    if (!obj) {
+      return item
+    }
+    return {
+      ...obj,
+      que_id: coerceNumberLike(obj.que_id),
+      scope: coerceNumberLike(obj.scope),
+      search_options: normalizeIdArrayInput(obj.search_options)
+    }
+  })
+}
+
+function normalizeTimeRangeInput(value: unknown): unknown {
+  const parsed = parseJsonLike(value)
+  const obj = asObject(parsed)
+  if (!obj) {
+    return parsed
+  }
+  return {
+    ...obj,
+    column: coerceNumberLike(obj.column)
   }
 }
 
@@ -1214,10 +1819,19 @@ function resolveQueryMode(args: z.infer<typeof queryInputSchema>): "list" | "rec
 
 function buildListArgsFromQuery(args: z.infer<typeof queryInputSchema>): z.infer<typeof listInputSchema> {
   if (!args.app_key) {
-    throw new Error("app_key is required for list query")
+    throw missingRequiredFieldError({
+      field: "app_key",
+      tool: "qf_query(list)",
+      fixHint: "Provide app_key, for example: {\"query_mode\":\"list\",\"app_key\":\"21b3d559\",...}"
+    })
   }
   if (!args.select_columns?.length) {
-    throw new Error("select_columns is required for list query")
+    throw missingRequiredFieldError({
+      field: "select_columns",
+      tool: "qf_query(list)",
+      fixHint:
+        "Provide select_columns as an array (<=10), for example: {\"select_columns\":[0,\"客户全称\",\"报价总金额\"]}"
+    })
   }
 
   const filters = buildListFiltersFromQuery(args)
@@ -1305,10 +1919,18 @@ function buildRecordGetArgsFromQuery(
   args: z.infer<typeof queryInputSchema>
 ): z.infer<typeof recordGetInputSchema> {
   if (args.apply_id === undefined) {
-    throw new Error("apply_id is required for record query")
+    throw missingRequiredFieldError({
+      field: "apply_id",
+      tool: "qf_query(record)",
+      fixHint: "Provide apply_id, for example: {\"query_mode\":\"record\",\"apply_id\":\"497600278750478338\",...}"
+    })
   }
   if (!args.select_columns?.length) {
-    throw new Error("select_columns is required for record query")
+    throw missingRequiredFieldError({
+      field: "select_columns",
+      tool: "qf_query(record)",
+      fixHint: "Provide select_columns as an array (<=10), for example: {\"select_columns\":[0,\"客户全称\"]}"
+    })
   }
 
   return recordGetInputSchema.parse({
@@ -1321,6 +1943,22 @@ function buildRecordGetArgsFromQuery(
 async function executeRecordsList(
   args: z.infer<typeof listInputSchema>
 ): Promise<{ payload: z.infer<typeof listSuccessOutputSchema>; message: string }> {
+  if (!args.app_key) {
+    throw missingRequiredFieldError({
+      field: "app_key",
+      tool: "qf_records_list",
+      fixHint: "Provide app_key, for example: {\"app_key\":\"21b3d559\",...}"
+    })
+  }
+  if (!args.select_columns?.length) {
+    throw missingRequiredFieldError({
+      field: "select_columns",
+      tool: "qf_records_list",
+      fixHint:
+        "Provide select_columns as an array (<=10), for example: {\"select_columns\":[0,\"客户全称\",\"报价总金额\"]}"
+    })
+  }
+
   const queryId = randomUUID()
   const pageNum = resolveStartPage(args.page_num, args.page_token, args.app_key)
   const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
@@ -1444,6 +2082,7 @@ async function executeRecordsList(
         }
       : null
   }
+  const evidence = buildEvidencePayload(listState, sourcePages)
 
   if (args.strict_full && !isComplete) {
     throw new NeedMoreDataError(
@@ -1451,7 +2090,7 @@ async function executeRecordsList(
       {
         code: "NEED_MORE_DATA",
         completeness,
-        evidence: buildEvidencePayload(listState, sourcePages)
+        evidence
       }
     )
   }
@@ -1474,8 +2113,13 @@ async function executeRecordsList(
         selected_columns: columnProjection.selectedColumns
       },
       completeness,
-      evidence: buildEvidencePayload(listState, sourcePages)
+      evidence
     },
+    completeness,
+    evidence,
+    error_code: null,
+    fix_hint: null,
+    next_page_token: completeness.next_page_token,
     meta: responseMeta
   }
 
@@ -1492,6 +2136,14 @@ async function executeRecordsList(
 async function executeRecordGet(
   args: z.infer<typeof recordGetInputSchema>
 ): Promise<{ payload: z.infer<typeof recordGetSuccessOutputSchema>; message: string }> {
+  if (!args.select_columns?.length) {
+    throw missingRequiredFieldError({
+      field: "select_columns",
+      tool: "qf_record_get",
+      fixHint: "Provide select_columns as an array (<=10), for example: {\"apply_id\":\"...\",\"select_columns\":[0]}"
+    })
+  }
+
   const queryId = randomUUID()
   const response = await client.getRecord(String(args.apply_id))
   const record = asObject(response.result) ?? {}
@@ -1536,6 +2188,27 @@ async function executeRecordGet(
           selected_columns: projection.selectedColumns ?? []
         }
       },
+      completeness: {
+        result_amount: 1,
+        returned_items: 1,
+        fetched_pages: 1,
+        requested_pages: 1,
+        actual_scanned_pages: 1,
+        has_more: false,
+        next_page_token: null,
+        is_complete: true,
+        partial: false,
+        omitted_items: 0,
+        omitted_chars: 0
+      },
+      evidence: {
+        query_id: queryId,
+        apply_id: String(args.apply_id),
+        selected_columns: projection.selectedColumns ?? []
+      },
+      error_code: null,
+      fix_hint: null,
+      next_page_token: null,
       meta: buildMeta(response)
     },
     message: `Fetched record ${String(args.apply_id)}`
@@ -1555,10 +2228,18 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   message: string
 }> {
   if (!args.app_key) {
-    throw new Error("app_key is required for summary query")
+    throw missingRequiredFieldError({
+      field: "app_key",
+      tool: "qf_query(summary)",
+      fixHint: "Provide app_key, for example: {\"query_mode\":\"summary\",\"app_key\":\"21b3d559\",...}"
+    })
   }
   if (!args.select_columns?.length) {
-    throw new Error("select_columns is required for summary query")
+    throw missingRequiredFieldError({
+      field: "select_columns",
+      tool: "qf_query(summary)",
+      fixHint: "Provide select_columns as an array (<=10), for example: {\"select_columns\":[\"客户全称\"]}"
+    })
   }
 
   const queryId = randomUUID()
@@ -2054,6 +2735,11 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
           }
         }
       },
+      completeness,
+      evidence,
+      error_code: null,
+      fix_hint: null,
+      next_page_token: completeness.next_page_token,
       meta: responseMeta
     },
     message: isComplete
@@ -2883,40 +3569,69 @@ function errorResult(error: unknown) {
 
 function toErrorPayload(error: unknown): Record<string, unknown> {
   if (error instanceof NeedMoreDataError) {
+    const details = asObject(error.details)
+    const completeness = asObject(details?.completeness)
     return {
       ok: false,
       code: error.code,
+      error_code: error.code,
       status: "need_more_data",
       message: error.message,
+      fix_hint: "Continue with next_page_token or increase requested_pages/scan_max_pages.",
+      next_page_token: asNullableString(completeness?.next_page_token),
+      details: error.details
+    }
+  }
+  if (error instanceof InputValidationError) {
+    return {
+      ok: false,
+      error_code: error.errorCode,
+      message: error.message,
+      fix_hint: error.fixHint,
+      next_page_token: null,
       details: error.details
     }
   }
   if (error instanceof QingflowApiError) {
     return {
       ok: false,
+      error_code: "QINGFLOW_API_ERROR",
       message: error.message,
       err_code: error.errCode,
       err_msg: error.errMsg || null,
       http_status: error.httpStatus,
+      fix_hint: "Check app_key/accessToken and request body against qf_form_get field definitions.",
+      next_page_token: null,
       details: error.details ?? null
     }
   }
   if (error instanceof z.ZodError) {
+    const firstIssue = error.issues[0]
+    const firstPath = firstIssue?.path?.join(".") || "arguments"
     return {
       ok: false,
+      error_code: "INVALID_ARGUMENTS",
       message: "Invalid arguments",
+      fix_hint: `Fix field "${firstPath}" and retry with schema-compliant values.`,
+      next_page_token: null,
       issues: error.issues
     }
   }
   if (error instanceof Error) {
     return {
       ok: false,
-      message: error.message
+      error_code: "INTERNAL_ERROR",
+      message: error.message,
+      fix_hint: "Retry the request. If it persists, report query_id and input payload.",
+      next_page_token: null
     }
   }
   return {
     ok: false,
+    error_code: "UNKNOWN_ERROR",
     message: "Unknown error",
+    fix_hint: "Retry the request with explicit app_key/select_columns and deterministic page parameters.",
+    next_page_token: null,
     details: error
   }
 }

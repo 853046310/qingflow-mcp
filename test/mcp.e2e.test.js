@@ -1,10 +1,12 @@
 import assert from "node:assert/strict"
+import { execFile } from "node:child_process"
 import http from "node:http"
 import { once } from "node:events"
 import path from "node:path"
 import { randomUUID } from "node:crypto"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
+import { promisify } from "node:util"
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
@@ -12,6 +14,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const ROOT_DIR = path.resolve(__dirname, "..")
+const execFileAsync = promisify(execFile)
 
 const ACCESS_TOKEN = "test-token"
 const APP_KEY = "app_demo"
@@ -545,6 +548,25 @@ async function startMcpClient(baseUrl) {
   }
 }
 
+async function runCliCommand(baseUrl, args) {
+  const entry = path.join(ROOT_DIR, "dist/server.js")
+  const result = await execFileAsync(process.execPath, [entry, "cli", ...args], {
+    cwd: ROOT_DIR,
+    env: {
+      ...process.env,
+      QINGFLOW_BASE_URL: baseUrl,
+      QINGFLOW_ACCESS_TOKEN: ACCESS_TOKEN,
+      QINGFLOW_FORM_CACHE_TTL_MS: "1",
+      QINGFLOW_LIST_MAX_ITEMS_BYTES: "1000000"
+    }
+  })
+
+  return {
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim()
+  }
+}
+
 async function callTool(client, name, args) {
   const result = await client.callTool({
     name,
@@ -610,6 +632,27 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.ok(names.includes("qf_record_create"))
   })
 
+  await t.test("cli mode can list tools and call one tool", async () => {
+    const listed = await runCliCommand(mock.baseUrl, ["tools", "--json"])
+    assert.equal(listed.stderr, "")
+    const tools = JSON.parse(listed.stdout)
+    const names = tools.map((item) => item.name)
+    assert.ok(names.includes("qf_query"))
+    assert.ok(names.includes("qf_records_aggregate"))
+
+    const called = await runCliCommand(mock.baseUrl, [
+      "call",
+      "qf_apps_list",
+      "--args",
+      '{"keyword":"demo","limit":1}'
+    ])
+    assert.equal(called.stderr, "")
+    const payload = JSON.parse(called.stdout)
+    assert.equal(payload.ok, true)
+    assert.equal(payload.data.returned_apps, 1)
+    assert.equal(payload.data.apps[0].appKey, APP_KEY)
+  })
+
   await t.test("apps and form basics", async () => {
     const apps = await callTool(mcp.client, "qf_apps_list", { keyword: "demo", limit: 5 })
     assert.equal(apps.ok, true)
@@ -666,6 +709,21 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(listed.data.items.length, 3)
     const firstDay = firstAnswerValue(listed.data.items[0])
     assert.equal(firstDay, "2026-02-01")
+  })
+
+  await t.test("qf_records_list accepts stringified select_columns/filters/max_rows", async () => {
+    const listed = await callTool(mcp.client, "qf_records_list", {
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: "20",
+      max_rows: "2",
+      select_columns: "[1001,1003]",
+      filters: "[{\"que_id\":1003,\"min_value\":\"2026-01-02\",\"max_value\":\"2026-01-02\"}]"
+    })
+
+    assert.equal(listed.ok, true)
+    assert.equal(listed.data.items.length, 2)
+    assert.equal(listed.completeness.returned_items, 2)
   })
 
   await t.test("qf_records_list returns deterministic pagination token", async () => {
@@ -811,7 +869,9 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(failed.ok, false)
-    assert.match(failed.message, /select_columns is required for list query/)
+    assert.equal(failed.error_code, "MISSING_REQUIRED_FIELD")
+    assert.equal(typeof failed.fix_hint, "string")
+    assert.match(failed.message, /Missing required field "select_columns"/)
   })
 
   await t.test("qf_query list mode uses default row limit when max_rows is omitted", async () => {
@@ -884,6 +944,23 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.ok(Array.isArray(aggregated.data.groups))
     assert.ok(aggregated.data.groups.length > 0)
     assert.equal(aggregated.data.evidence.source_pages.length, 3)
+  })
+
+  await t.test("qf_records_aggregate accepts stringified group_by", async () => {
+    const aggregated = await callTool(mcp.client, "qf_records_aggregate", {
+      app_key: APP_KEY,
+      mode: "all",
+      group_by: "[1003]",
+      amount_column: "1002",
+      page_size: "2",
+      requested_pages: "10",
+      scan_max_pages: "10",
+      strict_full: "true"
+    })
+
+    assert.equal(aggregated.ok, true)
+    assert.equal(aggregated.data.summary.total_count, 6)
+    assert.equal(aggregated.completeness.is_complete, true)
   })
 
   await t.test("create + update + operation are still working", async () => {
