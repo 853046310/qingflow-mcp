@@ -108,7 +108,7 @@ npm i -g git+https://github.com/853046310/qingflow-mcp.git
 Install from npm (pinned version):
 
 ```bash
-npm i -g qingflow-mcp@0.3.12
+npm i -g qingflow-mcp@0.3.13
 ```
 
 Or one-click installer:
@@ -184,6 +184,7 @@ Deterministic read protocol (list/summary/aggregate):
 1. output profile:
    - default `output_profile=compact`: return core data only (`rows/row/groups/summary` + `next_page_token`)
    - `output_profile=verbose`: include full contract (`completeness` + `evidence` + `meta`)
+   - exception: `qf_query(summary)` and `qf_records_aggregate` always return `completeness`, even in `compact`, so agents can block on incomplete statistics
 2. when `output_profile=verbose`, `completeness` fields are:
    - `result_amount`
    - `returned_items`
@@ -204,8 +205,16 @@ Deterministic read protocol (list/summary/aggregate):
    - `time_range`
    - `source_pages`
 4. `strict_full=true` makes incomplete results fail fast with `NEED_MORE_DATA`.
+   - for `qf_query(summary)`, `strict_full` enforces raw source scan completeness; sample rows may still be capped by `max_rows`, which is reflected by `output_page_complete=false`
 5. Error payloads expose `error_code` and `fix_hint` for actionable retries.
 6. Parameter tolerance supports stringified JSON and numeric/boolean strings for key query fields.
+
+For `qf_query(summary)` and `qf_records_aggregate`, read `data.summary.completeness` / `data.completeness` before concluding:
+
+1. `raw_scan_complete=false`: source data is not fully scanned, do not produce a final conclusion.
+2. `scan_limit_hit=true`: query stopped because scan budget was hit.
+3. `output_page_complete=false`: source may be complete, but output was truncated by `max_rows` or `max_groups`.
+4. `raw_next_page_token`: use this token to continue raw scan pagination (`next_page_token` remains as a backward-compatible alias).
 
 ## List Query Tips
 

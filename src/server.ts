@@ -114,7 +114,7 @@ const ADAPTIVE_TARGET_PAGE_MS = toPositiveInt(process.env.QINGFLOW_ADAPTIVE_TARG
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
-const SERVER_VERSION = "0.3.12"
+const SERVER_VERSION = "0.3.13"
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -211,7 +211,15 @@ const completenessSchema = z.object({
   is_complete: z.boolean(),
   partial: z.boolean(),
   omitted_items: z.number().int().nonnegative(),
-  omitted_chars: z.number().int().nonnegative()
+  omitted_chars: z.number().int().nonnegative(),
+  raw_scan_complete: z.boolean().optional(),
+  scan_limit_hit: z.boolean().optional(),
+  scanned_pages: z.number().int().nonnegative().optional(),
+  scan_limit: z.number().int().positive().optional(),
+  output_page_complete: z.boolean().optional(),
+  raw_next_page_token: z.string().nullable().optional(),
+  output_next_page_token: z.string().nullable().optional(),
+  stop_reason: z.string().nullable().optional()
 })
 
 const evidenceSchema = z.object({
@@ -3355,6 +3363,54 @@ function applyAdaptivePaging(params: {
   return { shouldStop: false }
 }
 
+function resolveScanLimit(requestedPages: number, scanMaxPages: number): number {
+  return Math.max(1, Math.min(requestedPages, scanMaxPages))
+}
+
+function buildExtendedCompleteness(params: {
+  resultAmount: number
+  returnedItems: number
+  fetchedPages: number
+  requestedPages: number
+  hasMore: boolean
+  nextPageToken: string | null
+  omittedItems: number
+  omittedChars: number
+  rawScanComplete?: boolean
+  scanLimitHit?: boolean
+  scannedPages?: number
+  scanLimit?: number
+  outputPageComplete?: boolean
+  rawNextPageToken?: string | null
+  outputNextPageToken?: string | null
+  stopReason?: string | null
+}): z.infer<typeof completenessSchema> {
+  const rawScanComplete = params.rawScanComplete ?? (!params.hasMore && params.omittedItems === 0)
+  const outputPageComplete = params.outputPageComplete ?? (params.omittedItems === 0 && params.omittedChars === 0)
+  const isComplete = rawScanComplete && outputPageComplete
+  return {
+    result_amount: params.resultAmount,
+    returned_items: params.returnedItems,
+    fetched_pages: params.fetchedPages,
+    requested_pages: params.requestedPages,
+    actual_scanned_pages: params.fetchedPages,
+    has_more: params.hasMore,
+    next_page_token: params.nextPageToken,
+    is_complete: isComplete,
+    partial: !isComplete,
+    omitted_items: params.omittedItems,
+    omitted_chars: params.omittedChars,
+    raw_scan_complete: rawScanComplete,
+    scan_limit_hit: params.scanLimitHit ?? false,
+    scanned_pages: params.scannedPages ?? params.fetchedPages,
+    scan_limit: params.scanLimit,
+    output_page_complete: outputPageComplete,
+    raw_next_page_token: params.rawNextPageToken ?? params.nextPageToken,
+    output_next_page_token: params.outputNextPageToken ?? null,
+    stop_reason: params.stopReason ?? null
+  }
+}
+
 function normalizePlanToolName(tool: string): string {
   const normalized = tool.trim().replace(/^qingflow-mcp__/, "")
   const allowed = new Set([
@@ -5245,6 +5301,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   let nextPageNum: number | null = null
   let resultAmount: number | null = null
   let summaryMeta: ReturnType<typeof buildMeta> | null = null
+  let stopReason: string | null = null
   let totalAmount = 0
   let missingCount = 0
   const sourcePages: number[] = []
@@ -5256,6 +5313,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     if (scannedPages > 0 && isExecutionBudgetExceeded(startedAt)) {
       hasMore = true
       nextPageNum = currentPage
+      stopReason = "execution_budget"
       break
     }
 
@@ -5336,10 +5394,12 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     })
     if (adaptiveDecision.shouldStop && hasMore) {
       nextPageNum = nextPageNum ?? currentPage + 1
+      stopReason = "adaptive_budget"
       break
     }
 
     if (!hasMore) {
+      stopReason = "source_exhausted"
       break
     }
 
@@ -5391,9 +5451,8 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   }
 
   const knownResultAmount = resultAmount ?? scannedRecords
-  const omittedItems = Math.max(0, knownResultAmount - scannedRecords)
-  const isComplete = !hasMore && omittedItems === 0
-  const nextPageToken =
+  const omittedSourceItems = Math.max(0, knownResultAmount - scannedRecords)
+  const rawNextPageToken =
     hasMore && nextPageNum
       ? encodeContinuationToken({
           app_key: args.app_key,
@@ -5401,22 +5460,35 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
           page_size: adaptivePaging.current_page_size
         })
       : null
-  const completeness: z.infer<typeof completenessSchema> = {
-    result_amount: knownResultAmount,
-    returned_items: scannedRecords,
-    fetched_pages: scannedPages,
-    requested_pages: requestedPages,
-    actual_scanned_pages: scannedPages,
-    has_more: hasMore,
-    next_page_token: nextPageToken,
-    is_complete: isComplete,
-    partial: !isComplete,
-    omitted_items: omittedItems,
-    omitted_chars: 0
-  }
+  const rawScanComplete = !hasMore && omittedSourceItems === 0
+  const outputPageComplete = rows.length >= scannedRecords
+  const scanLimit = resolveScanLimit(requestedPages, scanMaxPages)
+  const scanLimitHit =
+    !rawScanComplete &&
+    (scannedPages >= scanLimit ||
+      stopReason === "execution_budget" ||
+      stopReason === "adaptive_budget")
+  const completeness = buildExtendedCompleteness({
+    resultAmount: knownResultAmount,
+    returnedItems: scannedRecords,
+    fetchedPages: scannedPages,
+    requestedPages,
+    hasMore,
+    nextPageToken: rawNextPageToken,
+    omittedItems: omittedSourceItems,
+    omittedChars: 0,
+    rawScanComplete,
+    scanLimitHit,
+    scannedPages,
+    scanLimit,
+    outputPageComplete,
+    rawNextPageToken,
+    outputNextPageToken: null,
+    stopReason
+  })
   const evidence = buildEvidencePayload(listState, sourcePages)
 
-  if (strictFull && !isComplete) {
+  if (strictFull && !rawScanComplete) {
     throw new NeedMoreDataError(
       "Summary is incomplete. Continue with next_page_token or increase requested_pages/scan_max_pages.",
       {
@@ -5436,9 +5508,9 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
         missing_count: missingCount
       },
       rows,
+      completeness,
       ...(isVerboseProfile(outputProfile)
         ? {
-            completeness,
             evidence,
             meta: {
               field_mapping: fieldMapping,
@@ -5460,7 +5532,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
               execution: {
                 scanned_records: scannedRecords,
                 scanned_pages: scannedPages,
-                truncated: !isComplete,
+                truncated: !completeness.is_complete,
                 row_cap: rowCap,
                 column_cap: args.max_columns ?? null,
                 scan_max_pages: scanMaxPages
@@ -5470,7 +5542,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
         : {})
     },
     meta: summaryMeta,
-    message: isComplete
+    message: completeness.is_complete
       ? `Summarized ${scannedRecords} records`
       : `Summarized ${scannedRecords}/${knownResultAmount} records (partial)`,
     completeness,
@@ -5551,6 +5623,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
   let nextPageNum: number | null = null
   let resultAmount: number | null = null
   let responseMeta: ReturnType<typeof buildMeta> | null = null
+  let stopReason: string | null = null
   let totalAmount = 0
   const sourcePages: number[] = []
   const groupStats = new Map<
@@ -5568,6 +5641,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     if (scannedPages > 0 && isExecutionBudgetExceeded(startedAt)) {
       hasMore = true
       nextPageNum = currentPage
+      stopReason = "execution_budget"
       break
     }
 
@@ -5660,10 +5734,12 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     })
     if (adaptiveDecision.shouldStop && hasMore) {
       nextPageNum = nextPageNum ?? currentPage + 1
+      stopReason = "adaptive_budget"
       break
     }
 
     if (!hasMore) {
+      stopReason = "source_exhausted"
       break
     }
     currentPage = currentPage + 1
@@ -5674,9 +5750,8 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
   }
 
   const knownResultAmount = resultAmount ?? scannedRecords
-  const omittedItems = Math.max(0, knownResultAmount - scannedRecords)
-  const isComplete = !hasMore && omittedItems === 0
-  const nextPageToken =
+  const omittedSourceItems = Math.max(0, knownResultAmount - scannedRecords)
+  const rawNextPageToken =
     hasMore && nextPageNum
       ? encodeContinuationToken({
           app_key: args.app_key,
@@ -5684,22 +5759,36 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
           page_size: adaptivePaging.current_page_size
         })
       : null
-  const completeness: z.infer<typeof completenessSchema> = {
-    result_amount: knownResultAmount,
-    returned_items: scannedRecords,
-    fetched_pages: scannedPages,
-    requested_pages: requestedPages,
-    actual_scanned_pages: scannedPages,
-    has_more: hasMore,
-    next_page_token: nextPageToken,
-    is_complete: isComplete,
-    partial: !isComplete,
-    omitted_items: omittedItems,
-    omitted_chars: 0
-  }
+  const groupsTotal = groupStats.size
+  const rawScanComplete = !hasMore && omittedSourceItems === 0
+  const outputPageComplete = groupsTotal <= maxGroups
+  const scanLimit = resolveScanLimit(requestedPages, scanMaxPages)
+  const scanLimitHit =
+    !rawScanComplete &&
+    (scannedPages >= scanLimit ||
+      stopReason === "execution_budget" ||
+      stopReason === "adaptive_budget")
+  const completeness = buildExtendedCompleteness({
+    resultAmount: knownResultAmount,
+    returnedItems: scannedRecords,
+    fetchedPages: scannedPages,
+    requestedPages,
+    hasMore,
+    nextPageToken: rawNextPageToken,
+    omittedItems: omittedSourceItems,
+    omittedChars: 0,
+    rawScanComplete,
+    scanLimitHit,
+    scannedPages,
+    scanLimit,
+    outputPageComplete,
+    rawNextPageToken,
+    outputNextPageToken: null,
+    stopReason
+  })
   const evidence = buildEvidencePayload(listState, sourcePages)
 
-  if (strictFull && !isComplete) {
+  if (strictFull && !completeness.is_complete) {
     throw new NeedMoreDataError(
       "Aggregate result is incomplete. Continue with next_page_token or increase requested_pages/scan_max_pages.",
       {
@@ -5784,9 +5873,9 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
             : {})
         },
         groups,
+        completeness,
         ...(isVerboseProfile(outputProfile)
           ? {
-              completeness,
               evidence,
               meta: {
                 field_mapping: fieldMapping,
@@ -5816,7 +5905,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
           }
         : {})
     },
-    message: isComplete
+    message: completeness.is_complete
       ? `Aggregated ${scannedRecords} records`
       : `Aggregated ${scannedRecords}/${knownResultAmount} records (partial)`
   }

@@ -1112,6 +1112,34 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(queryList.meta, undefined)
   })
 
+  await t.test("qf_query summary compact still exposes scan completeness", async () => {
+    const summary = await callToolRaw(mcp.client, "qf_query", {
+      query_mode: "summary",
+      app_key: APP_KEY,
+      mode: "all",
+      select_columns: [1001],
+      amount_column: 1002,
+      page_size: 2,
+      requested_pages: 1,
+      scan_max_pages: 1,
+      max_rows: 1,
+      strict_full: false
+    })
+
+    assert.equal(summary.ok, true)
+    assert.equal(summary.output_profile, "compact")
+    assert.equal(summary.data.mode, "summary")
+    assert.equal(summary.data.summary.completeness.is_complete, false)
+    assert.equal(summary.data.summary.completeness.raw_scan_complete, false)
+    assert.equal(summary.data.summary.completeness.scan_limit_hit, true)
+    assert.equal(summary.data.summary.completeness.output_page_complete, false)
+    assert.equal(
+      summary.data.summary.completeness.raw_next_page_token,
+      summary.next_page_token
+    )
+    assert.equal(summary.data.summary.completeness.output_next_page_token, null)
+  })
+
   await t.test("qf_query list mode applies time_range as filter", async () => {
     const queryList = await callTool(mcp.client, "qf_query", {
       query_mode: "list",
@@ -1185,7 +1213,9 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(summary.data.summary.summary.total_amount, 330)
     assert.equal(summary.data.summary.summary.missing_count, 1)
     assert.equal(summary.data.summary.rows.length, 3)
-    assert.equal(summary.data.summary.completeness.is_complete, true)
+    assert.equal(summary.data.summary.completeness.raw_scan_complete, true)
+    assert.equal(summary.data.summary.completeness.output_page_complete, false)
+    assert.equal(summary.data.summary.completeness.is_complete, false)
     assert.equal(summary.data.summary.completeness.actual_scanned_pages, 3)
     assert.equal(summary.data.summary.evidence.source_pages.length, 3)
 
@@ -1196,7 +1226,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     const roles = summary.data.summary.meta.field_mapping.map((item) => item.role).sort()
     assert.deepEqual(roles, ["amount", "row", "time"])
     assert.equal(summary.data.summary.meta.execution.scanned_pages, 3)
-    assert.equal(summary.data.summary.meta.execution.truncated, false)
+    assert.equal(summary.data.summary.meta.execution.truncated, true)
   })
 
   await t.test("qf_query summary tolerates double-stringified amount_column", async () => {
@@ -1315,6 +1345,29 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       "group_by value should come from values, not empty tableValues"
     )
     assert.equal(aggregated.data.evidence.source_pages.length, 3)
+  })
+
+  await t.test("qf_records_aggregate compact separates raw scan completeness and output truncation", async () => {
+    const aggregated = await callToolRaw(mcp.client, "qf_records_aggregate", {
+      app_key: APP_KEY,
+      mode: "all",
+      group_by: [1003],
+      amount_column: 1002,
+      page_size: 2,
+      requested_pages: 10,
+      scan_max_pages: 10,
+      max_groups: 1,
+      strict_full: false
+    })
+
+    assert.equal(aggregated.ok, true)
+    assert.equal(aggregated.output_profile, "compact")
+    assert.equal(aggregated.data.completeness.raw_scan_complete, true)
+    assert.equal(aggregated.data.completeness.output_page_complete, false)
+    assert.equal(aggregated.data.completeness.is_complete, false)
+    assert.equal(aggregated.data.completeness.scan_limit_hit, false)
+    assert.equal(aggregated.data.completeness.raw_next_page_token, null)
+    assert.equal(aggregated.next_page_token, null)
   })
 
   await t.test("qf_records_aggregate supports metrics + time_bucket", async () => {
