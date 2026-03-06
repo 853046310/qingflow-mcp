@@ -14,8 +14,9 @@
    - `is_complete=false` 只能视为样本/部分结果
 4. 默认硬限制：
    - 行上限默认 `200`（可由 `max_rows` 或 `max_items` 下调，最大仍是 `200`）
-   - `select_columns` 最大 `10`
-   - `max_columns` 最大 `10`
+   - `select_columns` 最大 `2`
+   - `max_columns` 最大 `2`
+   - 导出工具 `max_rows` 最大 `10000`（`QINGFLOW_EXPORT_MAX_ROWS`）
 5. 参数容错（P0）：
    - 支持字符串化 JSON 自动反序列化（如 `select_columns` / `filters` / `group_by`）
    - 支持双层字符串化 JSON 反序列化（如 `select_columns: "\"[1001,1002]\""`)
@@ -28,7 +29,7 @@
 
 ## 2. 完整性协议（completeness，`output_profile=verbose`）
 
-读工具（`qf_records_list` / `qf_query(list|summary)` / `qf_records_aggregate` / `qf_record_get`）在 `verbose` 模式返回：
+读工具（`qf_records_list` / `qf_query(list|summary)` / `qf_records_aggregate` / `qf_record_get` / `qf_records_batch_get` / `qf_export_csv` / `qf_export_json`）在 `verbose` 模式返回：
 
 - `result_amount`: 服务端已知总条数
 - `returned_items`: 本次返回条数
@@ -88,7 +89,29 @@
 - 必填：`app_key`
 - 可选：`include_raw`, `force_refresh`, `user_id`
 
-## 6.3 `qf_records_list`
+## 6.3 `qf_field_resolve`
+
+用途：把自然语言字段名/别名映射到稳定 `que_id`。
+
+关键入参：
+- 必填：`app_key` + (`query` 或 `queries`)
+- 可选：`top_k`, `fuzzy`
+
+## 6.4 `qf_query_plan`
+
+用途：执行前预检（参数归一化、必填检查、字段映射、扫描规模估算）。
+
+关键入参：
+- 必填：`tool`
+- 可选：`arguments`, `resolve_fields`, `probe`
+
+返回核心：
+- `normalized_arguments`
+- `validation`（`valid`/`missing_required`/`warnings`）
+- `field_mapping`
+- `estimate`（页规模和命中上限风险）
+
+## 6.5 `qf_records_list`
 
 用途：多条记录列表查询（推荐用于数据拉取）。
 
@@ -108,7 +131,7 @@
 - `max_columns <= 2`
 - `max_rows/max_items <= 200`
 
-## 6.4 `qf_record_get`
+## 6.6 `qf_record_get`
 
 用途：单条记录详情查询。
 
@@ -120,7 +143,29 @@
 - `select_columns <= 2`
 - `max_columns <= 2`
 
-## 6.5 `qf_query`
+## 6.7 `qf_records_batch_get`
+
+用途：按 `apply_ids` 批量拉详情，输出扁平 `rows`。
+
+关键入参：
+- 必填：`app_key`, `apply_ids`, `select_columns`
+- 可选：`max_columns`, `output_profile`
+
+## 6.8 `qf_export_csv` / `qf_export_json`
+
+用途：把查询结果写文件，避免大结果直接回传导致上下文爆炸。
+
+关键入参：
+- 必填：`app_key`, `select_columns`
+- 可选：
+  - 查询参数同 `qf_records_list`
+  - 导出参数：`file_name`, `export_dir`
+  - `max_rows`（最大 `10000`）
+
+返回核心：
+- `file_path`, `file_size_bytes`, `row_count`, `columns`, `preview`
+
+## 6.9 `qf_query`
 
 用途：统一读入口，按 `query_mode` 路由到 list/record/summary。
 
@@ -140,14 +185,14 @@
 - `summary` 默认 `strict_full=true`。
 - `output_profile` 默认 `compact`，可切换 `verbose` 以拿完整审计字段。
 
-## 6.6 `qf_records_aggregate`
+## 6.10 `qf_records_aggregate`
 
 用途：通用聚合工具（把统计计算下沉到 MCP）。
 
 关键入参：
 - 必填：`app_key`, `group_by`
 - 可选：
-  - 指标：`amount_column`, `stat_policy`
+  - 指标：`amount_column` / `amount_columns`, `metrics(count|sum|avg|min|max)`, `time_bucket(day|week|month)`, `stat_policy`
   - 过滤：`filters`, `time_range`
   - 分页扫描：`page_num` / `page_token`, `page_size`, `requested_pages`, `scan_max_pages`
   - 结果规模：`max_groups`
@@ -155,10 +200,10 @@
 
 返回核心：
 - `summary`: 总数/总金额
-- `groups`: 分组统计（count、amount、占比）
+- `groups`: 分组统计（count、amount、占比 + 可选 metrics）
 - `completeness` + `evidence`（`output_profile=verbose`）
 
-## 6.7 `qf_record_create` / `qf_record_update` / `qf_operation_get`
+## 6.11 `qf_record_create` / `qf_record_update` / `qf_operation_get`
 
 用途：写入与异步结果查询。
 

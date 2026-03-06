@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { execFile } from "node:child_process"
+import { promises as fs } from "node:fs"
 import http from "node:http"
 import { once } from "node:events"
 import path from "node:path"
@@ -570,7 +571,15 @@ async function runCliCommand(baseUrl, args) {
 }
 
 async function callTool(client, name, args) {
-  const readTools = new Set(["qf_records_list", "qf_record_get", "qf_query", "qf_records_aggregate"])
+  const readTools = new Set([
+    "qf_records_list",
+    "qf_record_get",
+    "qf_query",
+    "qf_records_aggregate",
+    "qf_records_batch_get",
+    "qf_export_csv",
+    "qf_export_json"
+  ])
   const normalizedArgs =
     readTools.has(name) && args && typeof args === "object" && args.output_profile === undefined
       ? { ...args, output_profile: "verbose" }
@@ -688,8 +697,13 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     const tools = await mcp.client.listTools()
     const names = tools.tools.map((item) => item.name)
     assert.ok(names.includes("qf_tool_spec_get"))
+    assert.ok(names.includes("qf_field_resolve"))
+    assert.ok(names.includes("qf_query_plan"))
     assert.ok(names.includes("qf_query"))
     assert.ok(names.includes("qf_records_list"))
+    assert.ok(names.includes("qf_records_batch_get"))
+    assert.ok(names.includes("qf_export_csv"))
+    assert.ok(names.includes("qf_export_json"))
     assert.ok(names.includes("qf_records_aggregate"))
     assert.ok(names.includes("qf_record_create"))
   })
@@ -749,6 +763,63 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(item.limits.output_profile, "compact|verbose (default compact)")
     assert.equal(item.minimal_example.app_key, "21b3d559")
     assert.ok(Array.isArray(item.minimal_example.select_columns))
+  })
+
+  await t.test("qf_field_resolve maps title/id queries to que_id", async () => {
+    const resolved = await callTool(mcp.client, "qf_field_resolve", {
+      app_key: APP_KEY,
+      queries: ["客户名称", "1002"],
+      top_k: 2
+    })
+
+    assert.equal(resolved.ok, true)
+    assert.equal(resolved.data.query_count, 2)
+    assert.equal(resolved.data.results[0].requested, "客户名称")
+    assert.equal(resolved.data.results[0].matches[0].que_id, 1001)
+    assert.equal(resolved.data.results[1].requested, "1002")
+    assert.equal(resolved.data.results[1].matches[0].que_id, 1002)
+  })
+
+  await t.test("qf_query_plan normalizes stringified args and estimates pages", async () => {
+    const planned = await callTool(mcp.client, "qf_query_plan", {
+      tool: "qf_records_list",
+      arguments: {
+        app_key: APP_KEY,
+        page_size: "20",
+        requested_pages: "2",
+        max_rows: "10",
+        select_columns: "[1001,1002]"
+      },
+      resolve_fields: true,
+      probe: true
+    })
+
+    assert.equal(planned.ok, true)
+    assert.equal(planned.data.tool, "qf_records_list")
+    assert.equal(planned.data.validation.valid, true)
+    assert.deepEqual(planned.data.validation.missing_required, [])
+    assert.ok(Array.isArray(planned.data.normalized_arguments.select_columns))
+    assert.equal(planned.data.normalized_arguments.page_size, 20)
+    assert.equal(planned.data.estimate.page_size, 20)
+    assert.equal(planned.data.estimate.requested_pages, 2)
+    assert.equal(typeof planned.data.estimate.estimated_items_upper_bound, "number")
+    assert.ok(Array.isArray(planned.data.field_mapping))
+    assert.ok(planned.data.field_mapping.some((item) => item.resolved === true))
+  })
+
+  await t.test("qf_query_plan reports missing required fields", async () => {
+    const planned = await callTool(mcp.client, "qf_query_plan", {
+      tool: "qf_records_list",
+      arguments: {
+        app_key: APP_KEY
+      },
+      resolve_fields: false,
+      probe: false
+    })
+
+    assert.equal(planned.ok, true)
+    assert.equal(planned.data.validation.valid, false)
+    assert.ok(planned.data.validation.missing_required.includes("select_columns"))
   })
 
   await t.test("qf_records_list defaults to compact output profile", async () => {
@@ -928,6 +999,67 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.ok(record.data.row)
     assert.ok("apply_id" in record.data.row)
     assert.equal(rowValueByCandidates(record.data.row, ["客户名称", "1001"]), "客户A")
+  })
+
+  await t.test("qf_records_batch_get returns rows and missing ids", async () => {
+    const batch = await callTool(mcp.client, "qf_records_batch_get", {
+      app_key: APP_KEY,
+      apply_ids: ["5001", "999999999"],
+      select_columns: [1001]
+    })
+
+    assert.equal(batch.ok, true)
+    assert.equal(batch.data.found_count, 1)
+    assert.equal(batch.data.missing_apply_ids.length, 1)
+    assert.equal(batch.data.missing_apply_ids[0], "999999999")
+    assert.equal(batch.data.rows.length, 1)
+    assert.equal(rowValueByCandidates(batch.data.rows[0], ["客户名称", "1001"]), "客户A")
+  })
+
+  await t.test("qf_export_json writes export file with preview", async () => {
+    const exported = await callTool(mcp.client, "qf_export_json", {
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: 2,
+      requested_pages: 2,
+      max_rows: 3,
+      select_columns: [1001, 1002]
+    })
+
+    assert.equal(exported.ok, true)
+    assert.equal(exported.data.format, "json")
+    assert.equal(typeof exported.data.file_path, "string")
+    assert.equal(exported.data.row_count, 3)
+    assert.ok(Array.isArray(exported.data.preview))
+    assert.ok(exported.data.preview.length > 0)
+    assert.ok(Array.isArray(exported.data.columns))
+    assert.ok(exported.data.columns.includes("apply_id"))
+
+    const raw = await fs.readFile(exported.data.file_path, "utf8")
+    const parsed = JSON.parse(raw)
+    assert.ok(Array.isArray(parsed))
+    assert.equal(parsed.length, 3)
+
+    await fs.unlink(exported.data.file_path)
+  })
+
+  await t.test("qf_export_csv writes export file", async () => {
+    const exported = await callTool(mcp.client, "qf_export_csv", {
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: 2,
+      requested_pages: 1,
+      max_rows: 2,
+      select_columns: [1001]
+    })
+
+    assert.equal(exported.ok, true)
+    assert.equal(exported.data.format, "csv")
+    assert.equal(exported.data.row_count, 2)
+    const csvText = await fs.readFile(exported.data.file_path, "utf8")
+    assert.match(csvText, /apply_id/)
+    assert.match(csvText, /客户A|客户B/)
+    await fs.unlink(exported.data.file_path)
   })
 
   await t.test("qf_query auto routes to list and record", async () => {
@@ -1183,6 +1315,41 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       "group_by value should come from values, not empty tableValues"
     )
     assert.equal(aggregated.data.evidence.source_pages.length, 3)
+  })
+
+  await t.test("qf_records_aggregate supports metrics + time_bucket", async () => {
+    const aggregated = await callTool(mcp.client, "qf_records_aggregate", {
+      app_key: APP_KEY,
+      mode: "all",
+      group_by: [1003],
+      amount_columns: [1002],
+      metrics: ["count", "sum", "avg", "min", "max"],
+      time_range: {
+        column: 1003,
+        from: "2026-01-01",
+        to: "2026-01-31"
+      },
+      time_bucket: "week",
+      page_size: 2,
+      requested_pages: 10,
+      scan_max_pages: 10,
+      strict_full: true
+    })
+
+    assert.equal(aggregated.ok, true)
+    assert.equal(aggregated.data.summary.total_count, 5)
+    assert.equal(aggregated.data.summary.total_amount, 280)
+    assert.equal(aggregated.data.summary.metrics["1002"].sum, 280)
+    assert.equal(aggregated.data.summary.metrics["1002"].count, 4)
+    assert.equal(aggregated.data.summary.metrics["1002"].avg, 70)
+    assert.equal(aggregated.data.summary.metrics["1002"].min, -50)
+    assert.equal(aggregated.data.summary.metrics["1002"].max, 200)
+    assert.equal(aggregated.data.meta.time_bucket, "week")
+    assert.ok(aggregated.data.groups.length > 0)
+    assert.ok(
+      aggregated.data.groups.every((item) => Object.prototype.hasOwnProperty.call(item.group, "time_bucket_week"))
+    )
+    assert.ok(aggregated.data.groups.every((item) => item.metrics && item.metrics["1002"]))
   })
 
   await t.test("qf_records_aggregate accepts stringified group_by", async () => {

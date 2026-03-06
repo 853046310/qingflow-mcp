@@ -4,6 +4,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { randomUUID } from "node:crypto"
+import os from "node:os"
+import path from "node:path"
+import { promises as fs } from "node:fs"
 import { z } from "zod"
 
 import { QingflowApiError, QingflowClient, type QingflowResponse } from "./qingflow-client.js"
@@ -100,10 +103,18 @@ const DEFAULT_SCAN_MAX_PAGES = 10
 const DEFAULT_ROW_LIMIT = 200
 const MAX_COLUMN_LIMIT = 2
 const DEFAULT_OUTPUT_PROFILE = "compact" as const
+const EXPORT_DEFAULT_PAGES = 10
+const EXPORT_MAX_ROWS = toPositiveInt(process.env.QINGFLOW_EXPORT_MAX_ROWS) ?? 10000
+const EXPORT_PREVIEW_ROWS = 3
+const EXPORT_BASE_DIR =
+  process.env.QINGFLOW_EXPORT_DIR?.trim() || path.join(os.tmpdir(), "qingflow-mcp-exports")
+const ADAPTIVE_PAGING_ENABLED = process.env.QINGFLOW_ADAPTIVE_PAGING !== "0"
+const ADAPTIVE_MIN_PAGE_SIZE = toPositiveInt(process.env.QINGFLOW_ADAPTIVE_MIN_PAGE_SIZE) ?? 20
+const ADAPTIVE_TARGET_PAGE_MS = toPositiveInt(process.env.QINGFLOW_ADAPTIVE_TARGET_PAGE_MS) ?? 1200
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
-const SERVER_VERSION = "0.3.11"
+const SERVER_VERSION = "0.3.12"
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -742,6 +753,13 @@ const aggregateInputSchema = z
       .optional(),
     group_by: z.array(z.union([z.string().min(1), z.number().int()])).min(1).max(20),
     amount_column: z.union([z.string().min(1), z.number().int()]).optional(),
+    amount_columns: z
+      .array(z.union([z.string().min(1), z.number().int()]))
+      .min(1)
+      .max(5)
+      .optional(),
+    metrics: z.array(z.enum(["count", "sum", "avg", "min", "max"])).min(1).max(5).optional(),
+    time_bucket: z.enum(["day", "week", "month"]).optional(),
     stat_policy: z
       .object({
         include_negative: z.boolean().optional(),
@@ -763,7 +781,8 @@ const aggregateOutputSchema = z.object({
     app_key: z.string(),
     summary: z.object({
       total_count: z.number().int().nonnegative(),
-      total_amount: z.number().nullable()
+      total_amount: z.number().nullable(),
+      metrics: z.record(z.record(z.number().nullable())).optional()
     }),
     groups: z.array(
       z.object({
@@ -771,7 +790,8 @@ const aggregateOutputSchema = z.object({
         count: z.number().int().nonnegative(),
         count_ratio: z.number().min(0).max(1),
         amount_total: z.number().nullable(),
-        amount_ratio: z.number().nullable()
+        amount_ratio: z.number().nullable(),
+        metrics: z.record(z.record(z.number().nullable())).optional()
       })
     ),
     completeness: completenessSchema.optional(),
@@ -789,8 +809,237 @@ const aggregateOutputSchema = z.object({
       stat_policy: z.object({
         include_negative: z.boolean(),
         include_null: z.boolean()
-      })
+      }),
+      metrics: z.array(z.string()).optional(),
+      time_bucket: z.enum(["day", "week", "month"]).nullable().optional()
     }).optional()
+  }),
+  ...queryContractFields,
+  meta: apiMetaSchema.optional()
+})
+
+const fieldResolveInputSchema = z.preprocess(
+  normalizeFieldResolveInput,
+  z.object({
+    app_key: z.string().min(1),
+    query: z.union([z.string().min(1), z.number().int()]).optional(),
+    queries: z.array(z.union([z.string().min(1), z.number().int()])).min(1).max(50).optional(),
+    top_k: z.number().int().positive().max(10).optional(),
+    fuzzy: z.boolean().optional()
+  }).refine((value) => value.query !== undefined || (value.queries?.length ?? 0) > 0, {
+    message: "query or queries is required"
+  })
+)
+
+const fieldResolveOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    app_key: z.string(),
+    query_count: z.number().int().nonnegative(),
+    results: z.array(
+      z.object({
+        requested: z.string(),
+        matches: z.array(
+          z.object({
+            que_id: z.union([z.string(), z.number()]),
+            que_title: z.string().nullable(),
+            que_type: z.unknown(),
+            score: z.number().min(0).max(1),
+            match_type: z.string()
+          })
+        )
+      })
+    )
+  }),
+  meta: apiMetaSchema
+})
+
+const queryPlanInputSchema = z.preprocess(
+  normalizeQueryPlanInput,
+  z.object({
+    tool: z.string().min(1),
+    arguments: z.record(z.unknown()).optional(),
+    resolve_fields: z.boolean().optional(),
+    probe: z.boolean().optional()
+  })
+)
+
+const queryPlanOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    tool: z.string(),
+    normalized_arguments: z.record(z.unknown()),
+    validation: z.object({
+      valid: z.boolean(),
+      missing_required: z.array(z.string()),
+      warnings: z.array(z.string())
+    }),
+    field_mapping: z.array(
+      z.object({
+        role: z.string(),
+        requested: z.string(),
+        resolved: z.boolean(),
+        que_id: z.union([z.string(), z.number(), z.null()]),
+        que_title: z.string().nullable(),
+        que_type: z.unknown(),
+        reason: z.string().nullable()
+      })
+    ),
+    estimate: z.object({
+      page_size: z.number().int().positive().nullable(),
+      requested_pages: z.number().int().positive().nullable(),
+      scan_max_pages: z.number().int().positive().nullable(),
+      estimated_scan_pages: z.number().int().nonnegative().nullable(),
+      estimated_items_upper_bound: z.number().int().nonnegative().nullable(),
+      may_hit_limits: z.boolean(),
+      reasons: z.array(z.string()),
+      probe: z
+        .object({
+          result_amount: z.number().int().nonnegative().nullable(),
+          page_amount: z.number().int().nonnegative().nullable()
+        })
+        .nullable()
+    })
+  }),
+  meta: z.object({
+    version: z.string(),
+    generated_at: z.string()
+  })
+})
+
+const batchGetInputSchema = z.preprocess(
+  normalizeBatchGetInput,
+  z.object({
+    app_key: z.string().min(1),
+    user_id: z.string().min(1).optional(),
+    apply_ids: z.array(z.union([z.string().min(1), z.number().int()])).min(1).max(200),
+    select_columns: z
+      .array(z.union([z.string().min(1), z.number().int()]))
+      .min(1)
+      .max(MAX_COLUMN_LIMIT),
+    max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
+    output_profile: outputProfileSchema.optional()
+  })
+)
+
+const batchGetOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    app_key: z.string(),
+    requested_apply_ids: z.array(z.string()),
+    found_count: z.number().int().nonnegative(),
+    missing_apply_ids: z.array(z.string()),
+    rows: z.array(z.record(z.unknown())),
+    applied_limits: z
+      .object({
+        column_cap: z.number().int().positive().nullable(),
+        selected_columns: z.array(z.string())
+      })
+      .optional(),
+    completeness: completenessSchema.optional(),
+    evidence: evidenceSchema.optional()
+  }),
+  ...queryContractFields,
+  meta: apiMetaSchema.optional()
+})
+
+const exportInputSchema = z.preprocess(
+  normalizeExportInput,
+  z.object({
+    app_key: z.string().min(1).optional(),
+    user_id: z.string().min(1).optional(),
+    page_num: z.number().int().positive().optional(),
+    page_token: z.string().min(1).optional(),
+    page_size: z.number().int().positive().max(200).optional(),
+    requested_pages: z.number().int().positive().max(500).optional(),
+    scan_max_pages: z.number().int().positive().max(500).optional(),
+    mode: z
+      .enum([
+        "todo",
+        "done",
+        "mine_approved",
+        "mine_rejected",
+        "mine_draft",
+        "mine_need_improve",
+        "mine_processing",
+        "all",
+        "all_approved",
+        "all_rejected",
+        "all_processing",
+        "cc"
+      ])
+      .optional(),
+    type: z.number().int().min(1).max(12).optional(),
+    keyword: z.string().optional(),
+    query_logic: z.enum(["and", "or"]).optional(),
+    apply_ids: z.array(z.union([z.string(), z.number()])).optional(),
+    sort: z
+      .array(
+        z.object({
+          que_id: z.union([z.string().min(1), z.number().int()]),
+          ascend: z.boolean().optional()
+        })
+      )
+      .optional(),
+    filters: z
+      .array(
+        z.object({
+          que_id: z.union([z.string().min(1), z.number().int()]).optional(),
+          search_key: z.string().optional(),
+          search_keys: z.array(z.string()).optional(),
+          min_value: z.string().optional(),
+          max_value: z.string().optional(),
+          scope: z.number().int().optional(),
+          search_options: z.array(z.union([z.string(), z.number()])).optional(),
+          search_user_ids: z.array(z.string()).optional()
+        })
+      )
+      .optional(),
+    time_range: z
+      .object({
+        column: z.union([z.string().min(1), z.number().int()]),
+        from: z.string().optional(),
+        to: z.string().optional(),
+        timezone: z.string().optional()
+      })
+      .optional(),
+    max_rows: z.number().int().positive().max(EXPORT_MAX_ROWS).optional(),
+    max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
+    select_columns: z
+      .array(z.union([z.string().min(1), z.number().int()]))
+      .min(1)
+      .max(MAX_COLUMN_LIMIT)
+      .optional(),
+    strict_full: z.boolean().optional(),
+    output_profile: outputProfileSchema.optional(),
+    export_dir: z.string().min(1).optional(),
+    file_name: z.string().min(1).optional()
+  }).refine((value) => !(value.page_num !== undefined && value.page_token !== undefined), {
+    message: "page_num and page_token cannot be used together"
+  })
+)
+
+const exportOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    export_id: z.string(),
+    format: z.enum(["csv", "json"]),
+    app_key: z.string(),
+    file_path: z.string(),
+    file_size_bytes: z.number().int().nonnegative(),
+    row_count: z.number().int().nonnegative(),
+    columns: z.array(z.string()),
+    preview: z.array(z.record(z.unknown())),
+    completeness: completenessSchema.optional(),
+    evidence: evidenceSchema.optional(),
+    execution: z
+      .object({
+        scanned_pages: z.number().int().nonnegative(),
+        requested_pages: z.number().int().positive(),
+        page_size: z.number().int().positive(),
+        truncated: z.boolean()
+      })
+      .optional()
   }),
   ...queryContractFields,
   meta: apiMetaSchema.optional()
@@ -951,6 +1200,52 @@ server.registerTool(
 )
 
 server.registerTool(
+  "qf_field_resolve",
+  {
+    title: "Qingflow Field Resolve",
+    description:
+      "Resolve natural language field names/aliases into stable que_id mappings for one app.",
+    inputSchema: fieldResolveInputSchema,
+    outputSchema: fieldResolveOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const payload = await executeFieldResolve(args)
+      return okResult(payload, `Resolved fields for ${args.app_key}`)
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_query_plan",
+  {
+    title: "Qingflow Query Plan",
+    description:
+      "Preflight query arguments: normalize inputs, validate required fields, resolve mappings and estimate scan limits before execution.",
+    inputSchema: queryPlanInputSchema,
+    outputSchema: queryPlanOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const payload = await executeQueryPlan(args)
+      return okResult(payload, `Planned ${args.tool}`)
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
   "qf_records_list",
   {
     title: "Qingflow Records List",
@@ -987,6 +1282,74 @@ server.registerTool(
   async (args) => {
     try {
       const executed = await executeRecordGet(args)
+      return okResult(executed.payload, executed.message)
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_records_batch_get",
+  {
+    title: "Qingflow Records Batch Get",
+    description: "Fetch multiple records by apply_ids in one call and return strict flat rows.",
+    inputSchema: batchGetInputSchema,
+    outputSchema: batchGetOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const payload = await executeRecordsBatchGet(args)
+      return okResult(payload.payload, payload.message)
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_export_csv",
+  {
+    title: "Qingflow Export CSV",
+    description:
+      "Export list query result to a CSV file and return file path + summary instead of large inline payloads.",
+    inputSchema: exportInputSchema,
+    outputSchema: exportOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const executed = await executeRecordsExport("csv", args)
+      return okResult(executed.payload, executed.message)
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_export_json",
+  {
+    title: "Qingflow Export JSON",
+    description:
+      "Export list query result to a JSON file and return file path + summary instead of large inline payloads.",
+    inputSchema: exportInputSchema,
+    outputSchema: exportOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const executed = await executeRecordsExport("json", args)
       return okResult(executed.payload, executed.message)
     } catch (error) {
       return errorResult(error)
@@ -1655,6 +2018,12 @@ const COMMON_INPUT_ALIASES: Record<string, string> = {
   statPolicy: "stat_policy",
   groupBy: "group_by",
   strictFull: "strict_full",
+  topK: "top_k",
+  fileName: "file_name",
+  filename: "file_name",
+  outputDir: "export_dir",
+  output_dir: "export_dir",
+  resolveFields: "resolve_fields",
   outputProfile: "output_profile",
   responseProfile: "output_profile",
   profile: "output_profile",
@@ -1745,6 +2114,46 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       }
     },
     {
+      tool: "qf_field_resolve",
+      required: ["app_key", "query or queries"],
+      limits: {
+        query_count_max: 50,
+        top_k_max: 10
+      },
+      aliases: collectAliasHints(["app_key"], {
+        query: ["field", "name"],
+        queries: ["fields", "names"],
+        top_k: ["topK"]
+      }),
+      minimal_example: {
+        app_key: "21b3d559",
+        queries: ["客户名称", "报价总金额"],
+        top_k: 3
+      }
+    },
+    {
+      tool: "qf_query_plan",
+      required: ["tool"],
+      limits: {
+        tool:
+          "qf_records_list|qf_record_get|qf_query|qf_records_aggregate|qf_records_batch_get|qf_export_csv|qf_export_json"
+      },
+      aliases: collectAliasHints([], {
+        arguments: ["args"],
+        resolve_fields: ["resolveFields"],
+        probe: ["withProbe"]
+      }),
+      minimal_example: {
+        tool: "qf_query",
+        arguments: {
+          query_mode: "list",
+          app_key: "21b3d559",
+          select_columns: [0, "客户名称"]
+        },
+        resolve_fields: true
+      }
+    },
+    {
       tool: "qf_records_list",
       required: ["app_key", "select_columns"],
       limits: {
@@ -1810,6 +2219,111 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         select_columns: [0, "客户名称"],
         max_columns: 2,
         output_profile: "compact"
+      }
+    },
+    {
+      tool: "qf_records_batch_get",
+      required: ["app_key", "apply_ids", "select_columns"],
+      limits: {
+        apply_ids_max: 200,
+        max_columns_max: MAX_COLUMN_LIMIT,
+        select_columns_max: MAX_COLUMN_LIMIT
+      },
+      aliases: collectAliasHints(
+        ["app_key", "apply_ids", "select_columns", "max_columns", "output_profile"],
+        {
+          select_columns: ["columns", "selected_columns", "selectedColumns"],
+          output_profile: ["outputProfile", "responseProfile", "profile"]
+        }
+      ),
+      minimal_example: {
+        app_key: "21b3d559",
+        apply_ids: ["497600278750478338", "497600278750478339"],
+        select_columns: [0, "客户名称"]
+      }
+    },
+    {
+      tool: "qf_export_csv",
+      required: ["app_key", "select_columns"],
+      limits: {
+        page_size_max: 200,
+        requested_pages_max: 500,
+        scan_max_pages_max: 500,
+        max_rows_max: EXPORT_MAX_ROWS,
+        max_columns_max: MAX_COLUMN_LIMIT,
+        select_columns_max: MAX_COLUMN_LIMIT
+      },
+      aliases: collectAliasHints(
+        [
+          "app_key",
+          "page_num",
+          "page_token",
+          "page_size",
+          "requested_pages",
+          "scan_max_pages",
+          "max_rows",
+          "max_columns",
+          "select_columns",
+          "file_name",
+          "export_dir",
+          "output_profile"
+        ],
+        {
+          select_columns: ["columns", "selected_columns", "selectedColumns"],
+          output_profile: ["outputProfile", "responseProfile", "profile"],
+          file_name: ["filename"],
+          export_dir: ["output_dir", "outputDir"]
+        }
+      ),
+      minimal_example: {
+        app_key: "21b3d559",
+        mode: "all",
+        page_size: 50,
+        requested_pages: 5,
+        select_columns: [0, "客户名称"],
+        file_name: "报价单导出.csv"
+      }
+    },
+    {
+      tool: "qf_export_json",
+      required: ["app_key", "select_columns"],
+      limits: {
+        page_size_max: 200,
+        requested_pages_max: 500,
+        scan_max_pages_max: 500,
+        max_rows_max: EXPORT_MAX_ROWS,
+        max_columns_max: MAX_COLUMN_LIMIT,
+        select_columns_max: MAX_COLUMN_LIMIT
+      },
+      aliases: collectAliasHints(
+        [
+          "app_key",
+          "page_num",
+          "page_token",
+          "page_size",
+          "requested_pages",
+          "scan_max_pages",
+          "max_rows",
+          "max_columns",
+          "select_columns",
+          "file_name",
+          "export_dir",
+          "output_profile"
+        ],
+        {
+          select_columns: ["columns", "selected_columns", "selectedColumns"],
+          output_profile: ["outputProfile", "responseProfile", "profile"],
+          file_name: ["filename"],
+          export_dir: ["output_dir", "outputDir"]
+        }
+      ),
+      minimal_example: {
+        app_key: "21b3d559",
+        mode: "all",
+        page_size: 50,
+        requested_pages: 5,
+        select_columns: [0, "客户名称"],
+        file_name: "报价单导出.json"
       }
     },
     {
@@ -1882,6 +2396,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         scan_max_pages_max: 500,
         max_groups_max: 2000,
         group_by_max: 20,
+        metrics_supported: ["count", "sum", "avg", "min", "max"],
+        time_bucket_supported: ["day", "week", "month"],
         output_profile: "compact|verbose (default compact)"
       },
       aliases: collectAliasHints(
@@ -1889,6 +2405,9 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
           "app_key",
           "group_by",
           "amount_column",
+          "amount_columns",
+          "metrics",
+          "time_bucket",
           "page_num",
           "page_token",
           "page_size",
@@ -1902,6 +2421,7 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         {
           amount_column: ["amount_que_ids", "amountQueIds", "amountColumns"],
           time_range: ["date_field + date_from + date_to"],
+          time_bucket: ["timeBucket", "bucket"],
           output_profile: ["outputProfile", "responseProfile", "profile"]
         }
       ),
@@ -1909,7 +2429,9 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         app_key: "21b3d559",
         mode: "all",
         group_by: [9500572],
-        amount_column: 6299263,
+        amount_columns: [6299263],
+        metrics: ["count", "sum", "avg"],
+        time_bucket: "day",
         output_profile: "compact",
         time_range: {
           column: 6299264,
@@ -2089,6 +2611,9 @@ function normalizeAggregateInput(raw: unknown): unknown {
   }
   const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
   const timeRange = buildFriendlyTimeRangeInput(normalizedObj)
+  const amountColumns = normalizeAmountColumnsInput(
+    normalizedObj.amount_columns ?? normalizedObj.amount_column
+  )
 
   return {
     ...normalizedObj,
@@ -2101,12 +2626,106 @@ function normalizeAggregateInput(raw: unknown): unknown {
     strict_full: coerceBooleanLike(normalizedObj.strict_full),
     output_profile: normalizeOutputProfileInput(normalizedObj.output_profile),
     group_by: normalizeSelectorListInput(normalizedObj.group_by),
-    amount_column: normalizeAmountColumnInput(normalizedObj.amount_column),
+    amount_columns: amountColumns,
+    amount_column: normalizeAmountColumnInput(amountColumns),
+    metrics: normalizeMetricsInput(normalizedObj.metrics),
+    time_bucket: normalizeTimeBucketInput(normalizedObj.time_bucket),
     apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
     sort: normalizeSortInput(normalizedObj.sort),
     filters: normalizeFiltersInput(normalizedObj.filters),
     time_range: timeRange,
     stat_policy: normalizeStatPolicyInput(normalizedObj.stat_policy)
+  }
+}
+
+function normalizeFieldResolveInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    appKey: "app_key",
+    topK: "top_k",
+    field: "query",
+    name: "query",
+    fields: "queries",
+    names: "queries"
+  })
+  return {
+    ...normalizedObj,
+    query: coerceNumberLike(normalizedObj.query),
+    queries: normalizeSelectorListInput(normalizedObj.queries),
+    top_k: coerceNumberLike(normalizedObj.top_k),
+    fuzzy: coerceBooleanLike(normalizedObj.fuzzy)
+  }
+}
+
+function normalizeQueryPlanInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    toolName: "tool",
+    name: "tool",
+    args: "arguments",
+    resolveFields: "resolve_fields",
+    withProbe: "probe"
+  })
+  return {
+    ...normalizedObj,
+    arguments: asObject(parseJsonLikeDeep(normalizedObj.arguments)) ?? normalizedObj.arguments,
+    resolve_fields: coerceBooleanLike(normalizedObj.resolve_fields),
+    probe: coerceBooleanLike(normalizedObj.probe)
+  }
+}
+
+function normalizeBatchGetInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
+  const selectColumns = normalizedObj.select_columns ?? normalizedObj.keep_columns
+  return {
+    ...normalizedObj,
+    apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
+    max_columns: coerceNumberLike(normalizedObj.max_columns),
+    select_columns: normalizeSelectorListInput(selectColumns),
+    output_profile: normalizeOutputProfileInput(normalizedObj.output_profile)
+  }
+}
+
+function normalizeExportInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
+  const selectColumns = normalizedObj.select_columns ?? normalizedObj.keep_columns
+  const timeRange = buildFriendlyTimeRangeInput(normalizedObj)
+  return {
+    ...normalizedObj,
+    page_num: coerceNumberLike(normalizedObj.page_num),
+    page_size: coerceNumberLike(normalizedObj.page_size),
+    requested_pages: coerceNumberLike(normalizedObj.requested_pages),
+    scan_max_pages: coerceNumberLike(normalizedObj.scan_max_pages),
+    type: coerceNumberLike(normalizedObj.type),
+    max_rows: coerceNumberLike(normalizedObj.max_rows),
+    max_columns: coerceNumberLike(normalizedObj.max_columns),
+    strict_full: coerceBooleanLike(normalizedObj.strict_full),
+    output_profile: normalizeOutputProfileInput(normalizedObj.output_profile),
+    apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
+    sort: normalizeSortInput(normalizedObj.sort),
+    filters: normalizeFiltersInput(normalizedObj.filters),
+    select_columns: normalizeSelectorListInput(selectColumns),
+    time_range: timeRange,
+    export_dir: coerceStringLike(normalizedObj.export_dir),
+    file_name: coerceStringLike(normalizedObj.file_name)
   }
 }
 
@@ -2465,6 +3084,44 @@ function normalizeAmountColumnInput(value: unknown): unknown {
   return coerceNumberLike(normalizeSelectorInputValue(parsed))
 }
 
+function normalizeAmountColumnsInput(value: unknown): unknown {
+  const parsed = parseJsonLikeDeep(value)
+  if (parsed === undefined || parsed === null) {
+    return parsed
+  }
+  const normalized = normalizeSelectorListInput(parsed)
+  if (!Array.isArray(normalized)) {
+    return normalized
+  }
+  return normalized
+    .map((item) => coerceNumberLike(normalizeSelectorInputValue(item)))
+    .filter((item) => item !== undefined && item !== null)
+}
+
+function normalizeMetricsInput(value: unknown): unknown {
+  const parsed = parseJsonLikeDeep(value)
+  if (parsed === undefined || parsed === null) {
+    return parsed
+  }
+  const values = Array.isArray(parsed) ? parsed : [parsed]
+  const normalized = values
+    .map((item) => (typeof item === "string" ? item.trim().toLowerCase() : ""))
+    .filter((item) => item.length > 0)
+  return normalized
+}
+
+function normalizeTimeBucketInput(value: unknown): unknown {
+  const parsed = parseJsonLikeDeep(value)
+  if (typeof parsed !== "string") {
+    return parsed
+  }
+  const normalized = parsed.trim().toLowerCase()
+  if (normalized === "day" || normalized === "week" || normalized === "month") {
+    return normalized
+  }
+  return parsed
+}
+
 function buildFriendlyTimeRangeInput(obj: Record<string, unknown>): unknown {
   const normalizedRawTimeRange = normalizeTimeRangeInput(obj.time_range)
   const normalizedTimeRange = asObject(normalizedRawTimeRange)
@@ -2628,6 +3285,669 @@ function decodeContinuationToken(token: string): ContinuationTokenPayload {
 
 function isExecutionBudgetExceeded(startedAt: number): boolean {
   return Date.now() - startedAt >= EXECUTION_BUDGET_MS
+}
+
+interface AdaptivePagingState {
+  enabled: boolean
+  current_page_size: number
+  events: string[]
+  page_durations_ms: number[]
+}
+
+function createAdaptivePagingState(initialPageSize: number): AdaptivePagingState {
+  return {
+    enabled: ADAPTIVE_PAGING_ENABLED,
+    current_page_size: initialPageSize,
+    events: [],
+    page_durations_ms: []
+  }
+}
+
+function applyAdaptivePaging(params: {
+  state: AdaptivePagingState
+  fetchedPages: number
+  requestedPages: number
+  fetchMs: number
+  startedAt: number
+}): { shouldStop: boolean } {
+  const { state } = params
+  if (!state.enabled) {
+    return { shouldStop: false }
+  }
+
+  state.page_durations_ms.push(params.fetchMs)
+  const elapsed = Date.now() - params.startedAt
+  const remainingBudget = EXECUTION_BUDGET_MS - elapsed
+  const avgFetchMs =
+    state.page_durations_ms.reduce((sum, value) => sum + value, 0) / state.page_durations_ms.length
+  const remainingPages = Math.max(0, params.requestedPages - params.fetchedPages)
+
+  if (params.fetchMs > ADAPTIVE_TARGET_PAGE_MS && state.current_page_size > ADAPTIVE_MIN_PAGE_SIZE) {
+    const nextSize = Math.max(ADAPTIVE_MIN_PAGE_SIZE, Math.floor(state.current_page_size / 2))
+    if (nextSize < state.current_page_size) {
+      state.events.push(
+        `Reduced page_size ${state.current_page_size}->${nextSize} after slow page ${params.fetchMs}ms`
+      )
+      state.current_page_size = nextSize
+    }
+  }
+
+  if (remainingBudget <= 0) {
+    return { shouldStop: true }
+  }
+  if (remainingPages > 0 && avgFetchMs > 0) {
+    const projectedNeed = avgFetchMs * remainingPages
+    if (projectedNeed > remainingBudget && state.current_page_size > ADAPTIVE_MIN_PAGE_SIZE) {
+      const nextSize = Math.max(ADAPTIVE_MIN_PAGE_SIZE, Math.floor(state.current_page_size / 2))
+      if (nextSize < state.current_page_size) {
+        state.events.push(
+          `Reduced page_size ${state.current_page_size}->${nextSize} for remaining budget`
+        )
+        state.current_page_size = nextSize
+      }
+    }
+    if (avgFetchMs >= remainingBudget && params.fetchedPages >= 1) {
+      state.events.push("Stopped early due to budget forecast")
+      return { shouldStop: true }
+    }
+  }
+
+  return { shouldStop: false }
+}
+
+function normalizePlanToolName(tool: string): string {
+  const normalized = tool.trim().replace(/^qingflow-mcp__/, "")
+  const allowed = new Set([
+    "qf_records_list",
+    "qf_record_get",
+    "qf_query",
+    "qf_records_aggregate",
+    "qf_records_batch_get",
+    "qf_export_csv",
+    "qf_export_json"
+  ])
+  if (allowed.has(normalized)) {
+    return normalized
+  }
+  throw new InputValidationError({
+    message: `Unsupported tool "${tool}"`,
+    errorCode: "UNKNOWN_TOOL",
+    fixHint:
+      "tool must be one of qf_records_list|qf_record_get|qf_query|qf_records_aggregate|qf_records_batch_get|qf_export_csv|qf_export_json.",
+    details: {
+      tool
+    }
+  })
+}
+
+function normalizePlanArguments(
+  tool: string,
+  rawArgs: Record<string, unknown>
+): {
+  normalizedArguments: Record<string, unknown>
+  validation: {
+    valid: boolean
+    missing_required: string[]
+    warnings: string[]
+  }
+} {
+  let normalized: unknown = rawArgs
+  let parsed:
+    | ReturnType<typeof listInputSchema.safeParse>
+    | ReturnType<typeof recordGetInputSchema.safeParse>
+    | ReturnType<typeof queryInputSchema.safeParse>
+    | ReturnType<typeof aggregateInputSchema.safeParse>
+    | ReturnType<typeof batchGetInputSchema.safeParse>
+    | ReturnType<typeof exportInputSchema.safeParse>
+
+  if (tool === "qf_records_list") {
+    normalized = normalizeListInput(rawArgs)
+    parsed = listInputSchema.safeParse(normalized)
+  } else if (tool === "qf_record_get") {
+    normalized = normalizeRecordGetInput(rawArgs)
+    parsed = recordGetInputSchema.safeParse(normalized)
+  } else if (tool === "qf_query") {
+    normalized = normalizeQueryInput(rawArgs)
+    parsed = queryInputSchema.safeParse(normalized)
+  } else if (tool === "qf_records_aggregate") {
+    normalized = normalizeAggregateInput(rawArgs)
+    parsed = aggregateInputSchema.safeParse(normalized)
+  } else if (tool === "qf_records_batch_get") {
+    normalized = normalizeBatchGetInput(rawArgs)
+    parsed = batchGetInputSchema.safeParse(normalized)
+  } else {
+    normalized = normalizeExportInput(rawArgs)
+    parsed = exportInputSchema.safeParse(normalized)
+  }
+
+  const normalizedArguments = asObject(normalized) ?? {}
+  const warnings: string[] = []
+  let missingRequired: string[] = inferPlanMissingRequired(tool, normalizedArguments)
+
+  if (!parsed.success) {
+    for (const issue of parsed.error.issues) {
+      const path = issue.path.join(".")
+      if (
+        issue.code === "invalid_type" &&
+        "received" in issue &&
+        (issue as { received?: string }).received === "undefined"
+      ) {
+        if (path) {
+          missingRequired.push(path)
+        }
+      } else {
+        warnings.push(path ? `${path}: ${issue.message}` : issue.message)
+      }
+    }
+  }
+
+  missingRequired = uniqueStringList(missingRequired)
+
+  return {
+    normalizedArguments: parsed.success
+      ? ((parsed.data as unknown as Record<string, unknown>) ?? normalizedArguments)
+      : normalizedArguments,
+    validation: {
+      valid: parsed.success && missingRequired.length === 0,
+      missing_required: missingRequired,
+      warnings: uniqueStringList(warnings)
+    }
+  }
+}
+
+function inferPlanMissingRequired(tool: string, args: Record<string, unknown>): string[] {
+  const missing: string[] = []
+
+  const hasSelectColumns = Array.isArray(args.select_columns) && args.select_columns.length > 0
+  const hasAppKey = typeof asNullableString(args.app_key) === "string"
+  const hasApplyId = args.apply_id !== undefined && args.apply_id !== null
+  const hasApplyIds = Array.isArray(args.apply_ids) && args.apply_ids.length > 0
+
+  if (tool === "qf_records_list" && !hasAppKey) {
+    missing.push("app_key")
+  }
+  if (tool === "qf_records_list" && !hasSelectColumns) {
+    missing.push("select_columns")
+  }
+
+  if (tool === "qf_record_get" && !hasApplyId) {
+    missing.push("apply_id")
+  }
+  if (tool === "qf_record_get" && !hasSelectColumns) {
+    missing.push("select_columns")
+  }
+
+  if (tool === "qf_records_batch_get") {
+    if (!hasAppKey) {
+      missing.push("app_key")
+    }
+    if (!hasApplyIds) {
+      missing.push("apply_ids")
+    }
+    if (!hasSelectColumns) {
+      missing.push("select_columns")
+    }
+  }
+
+  if (tool === "qf_records_aggregate") {
+    if (!hasAppKey) {
+      missing.push("app_key")
+    }
+    if (!Array.isArray(args.group_by) || args.group_by.length === 0) {
+      missing.push("group_by")
+    }
+  }
+
+  if (tool === "qf_export_csv" || tool === "qf_export_json") {
+    if (!hasAppKey) {
+      missing.push("app_key")
+    }
+    if (!hasSelectColumns) {
+      missing.push("select_columns")
+    }
+  }
+
+  if (tool === "qf_query") {
+    const queryMode = resolveQueryMode(args as z.infer<typeof queryInputSchema>)
+    if (queryMode === "record") {
+      if (!hasApplyId) {
+        missing.push("apply_id")
+      }
+      if (!hasSelectColumns) {
+        missing.push("select_columns")
+      }
+    } else {
+      if (!hasAppKey) {
+        missing.push("app_key")
+      }
+      if (!hasSelectColumns) {
+        missing.push("select_columns")
+      }
+    }
+  }
+
+  return missing
+}
+
+function collectPlanFieldCandidates(
+  tool: string,
+  args: Record<string, unknown>
+): Array<{ role: string; requested: string }> {
+  const candidates: Array<{ role: string; requested: string }> = []
+  const addMany = (role: string, values: unknown): void => {
+    for (const item of asArray(values)) {
+      const text = String(item ?? "").trim()
+      if (!text) {
+        continue
+      }
+      candidates.push({ role, requested: text })
+    }
+  }
+  const addOne = (role: string, value: unknown): void => {
+    if (value === undefined || value === null) {
+      return
+    }
+    const text = String(value).trim()
+    if (text) {
+      candidates.push({ role, requested: text })
+    }
+  }
+
+  if (
+    tool === "qf_records_list" ||
+    tool === "qf_query" ||
+    tool === "qf_records_batch_get" ||
+    tool === "qf_export_csv" ||
+    tool === "qf_export_json"
+  ) {
+    addMany("select_columns", args.select_columns)
+  }
+  if (tool === "qf_records_aggregate") {
+    addMany("group_by", args.group_by)
+    addMany("amount_columns", args.amount_columns)
+    addOne("amount_column", args.amount_column)
+  }
+  if (tool === "qf_query") {
+    addOne("amount_column", args.amount_column)
+  }
+
+  const timeRange = asObject(args.time_range)
+  if (timeRange) {
+    addOne("time_range.column", timeRange.column)
+  }
+
+  for (const filter of asArray(args.filters)) {
+    const filterObj = asObject(filter)
+    if (!filterObj) {
+      continue
+    }
+    addOne("filters.que_id", filterObj.que_id)
+  }
+
+  for (const sort of asArray(args.sort)) {
+    const sortObj = asObject(sort)
+    if (!sortObj) {
+      continue
+    }
+    addOne("sort.que_id", sortObj.que_id)
+  }
+
+  return candidates
+}
+
+function resolvePlanFieldCandidate(
+  candidate: { role: string; requested: string },
+  index: FieldIndex
+): {
+  role: string
+  requested: string
+  resolved: boolean
+  que_id: string | number | null
+  que_title: string | null
+  que_type: unknown
+  reason: string | null
+} {
+  try {
+    const field = resolveFieldByKey(candidate.requested, index)
+    if (field?.queId === undefined || field.queId === null) {
+      return {
+        role: candidate.role,
+        requested: candidate.requested,
+        resolved: false,
+        que_id: null,
+        que_title: null,
+        que_type: null,
+        reason: "field not found"
+      }
+    }
+    return {
+      role: candidate.role,
+      requested: candidate.requested,
+      resolved: true,
+      que_id: normalizeQueId(field.queId),
+      que_title: asNullableString(field.queTitle),
+      que_type: field.queType,
+      reason: null
+    }
+  } catch (error) {
+    return {
+      role: candidate.role,
+      requested: candidate.requested,
+      resolved: false,
+      que_id: null,
+      que_title: null,
+      que_type: null,
+      reason: error instanceof Error ? error.message : String(error)
+    }
+  }
+}
+
+async function estimatePlanExecution(params: {
+  tool: string
+  normalizedArguments: Record<string, unknown>
+  probe: boolean
+  warnings: string[]
+}): Promise<z.infer<typeof queryPlanOutputSchema>["data"]["estimate"]> {
+  const args = params.normalizedArguments
+
+  if (params.tool === "qf_record_get") {
+    return {
+      page_size: null,
+      requested_pages: null,
+      scan_max_pages: null,
+      estimated_scan_pages: null,
+      estimated_items_upper_bound: 1,
+      may_hit_limits: false,
+      reasons: [],
+      probe: null
+    }
+  }
+
+  if (params.tool === "qf_records_batch_get") {
+    const itemCount = Array.isArray(args.apply_ids) ? args.apply_ids.length : 0
+    return {
+      page_size: null,
+      requested_pages: null,
+      scan_max_pages: null,
+      estimated_scan_pages: 1,
+      estimated_items_upper_bound: itemCount,
+      may_hit_limits: false,
+      reasons: [],
+      probe: null
+    }
+  }
+
+  const pageSize = toPositiveInt(args.page_size) ?? DEFAULT_PAGE_SIZE
+  const requestedPages = toPositiveInt(args.requested_pages) ?? 1
+  const scanMaxPages = toPositiveInt(args.scan_max_pages) ?? requestedPages
+  const estimatedScanPagesBase = Math.min(requestedPages, scanMaxPages)
+  let estimatedScanPages: number | null = estimatedScanPagesBase
+  let estimatedItemsUpperBound: number | null = estimatedScanPagesBase * pageSize
+  const reasons: string[] = []
+  let mayHitLimits = false
+  let probeResult: { result_amount: number | null; page_amount: number | null } | null = null
+
+  const maxRows = toPositiveInt(args.max_rows)
+  const maxItems = toPositiveInt(args.max_items)
+  if (maxRows !== null && estimatedItemsUpperBound !== null && estimatedItemsUpperBound > maxRows) {
+    mayHitLimits = true
+    reasons.push(`estimated items ${estimatedItemsUpperBound} > max_rows ${maxRows}`)
+  }
+  if (
+    maxItems !== null &&
+    estimatedItemsUpperBound !== null &&
+    estimatedItemsUpperBound > maxItems
+  ) {
+    mayHitLimits = true
+    reasons.push(`estimated items ${estimatedItemsUpperBound} > max_items ${maxItems}`)
+  }
+
+  const appKey = asNullableString(args.app_key)
+  if (params.probe && appKey) {
+    try {
+      const modeText = asNullableString(args.mode)
+      const mode = modeText && modeText in MODE_TO_TYPE ? (modeText as ModeKey) : undefined
+      const rawFilters = asArray(args.filters) as Array<{
+        que_id?: string | number
+        search_key?: string
+        search_keys?: string[]
+        min_value?: string
+        max_value?: string
+        scope?: number
+        search_options?: Array<string | number>
+        search_user_ids?: string[]
+      }>
+      const rawTimeRange = asObject(args.time_range) as
+        | {
+            column: string | number
+            from?: string
+            to?: string
+            timezone?: string
+          }
+        | null
+
+      const probePayload = buildListPayload({
+        pageNum: toPositiveInt(args.page_num) ?? 1,
+        pageSize: 1,
+        mode,
+        type: toPositiveInt(args.type) ?? undefined,
+        keyword: asNullableString(args.keyword) ?? undefined,
+        queryLogic:
+          args.query_logic === "and" || args.query_logic === "or"
+            ? (args.query_logic as "and" | "or")
+            : undefined,
+        applyIds: asArray(args.apply_ids).map((item) => String(item)),
+        filters: appendTimeRangeFilter(rawFilters, rawTimeRange ?? undefined)
+      })
+      const probeResponse = await client.listRecords(appKey, probePayload, {
+        userId: asNullableString(args.user_id) ?? undefined
+      })
+      const probeResultObj = asObject(probeResponse.result)
+      const resultAmount = toNonNegativeInt(probeResultObj?.resultAmount)
+      const pageAmount = toNonNegativeInt(probeResultObj?.pageAmount)
+      probeResult = {
+        result_amount: resultAmount,
+        page_amount: pageAmount
+      }
+      if (pageAmount !== null && estimatedScanPages !== null) {
+        estimatedScanPages = Math.min(estimatedScanPages, pageAmount)
+      }
+      if (resultAmount !== null && estimatedItemsUpperBound !== null) {
+        estimatedItemsUpperBound = Math.min(estimatedItemsUpperBound, resultAmount)
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      reasons.push(`probe skipped: ${message}`)
+      params.warnings.push(`probe failed: ${message}`)
+    }
+  }
+
+  return {
+    page_size: pageSize,
+    requested_pages: requestedPages,
+    scan_max_pages: scanMaxPages,
+    estimated_scan_pages: estimatedScanPages,
+    estimated_items_upper_bound: estimatedItemsUpperBound,
+    may_hit_limits: mayHitLimits,
+    reasons: uniqueStringList(reasons),
+    probe: probeResult
+  }
+}
+
+function scoreFieldMatches(
+  requested: string,
+  fields: FormField[],
+  fuzzy: boolean,
+  topK: number
+): Array<{
+  que_id: string | number
+  que_title: string | null
+  que_type: unknown
+  score: number
+  match_type: string
+}> {
+  const normalizedRequested = requested.trim().toLowerCase()
+  const requestedIsId = isNumericKey(normalizedRequested)
+  const scored: Array<{
+    que_id: string | number
+    que_title: string | null
+    que_type: unknown
+    score: number
+    match_type: string
+  }> = []
+
+  for (const field of fields) {
+    if (field.queId === undefined || field.queId === null) {
+      continue
+    }
+    const queId = normalizeQueId(field.queId)
+    const title = asNullableString(field.queTitle)
+    const normalizedTitle = (title ?? "").trim().toLowerCase()
+
+    let score = 0
+    let matchType = "none"
+    if (requestedIsId && isNumericKey(String(queId)) && Number(queId) === Number(normalizedRequested)) {
+      score = 1
+      matchType = "id_exact"
+    } else if (normalizedTitle && normalizedTitle === normalizedRequested) {
+      score = 0.98
+      matchType = "title_exact"
+    } else if (normalizedTitle && normalizedTitle.startsWith(normalizedRequested)) {
+      score = 0.9
+      matchType = "title_prefix"
+    } else if (normalizedTitle && normalizedTitle.includes(normalizedRequested)) {
+      score = 0.84
+      matchType = "title_contains"
+    } else if (fuzzy && normalizedTitle) {
+      const similarity = normalizedTextSimilarity(normalizedRequested, normalizedTitle)
+      if (similarity >= 0.3) {
+        score = similarity
+        matchType = "title_fuzzy"
+      }
+    }
+
+    if (score <= 0) {
+      continue
+    }
+    scored.push({
+      que_id: queId,
+      que_title: title,
+      que_type: field.queType,
+      score: Number(score.toFixed(4)),
+      match_type: matchType
+    })
+  }
+
+  return scored.sort((a, b) => b.score - a.score).slice(0, topK)
+}
+
+function normalizedTextSimilarity(left: string, right: string): number {
+  if (!left || !right) {
+    return 0
+  }
+  if (left === right) {
+    return 1
+  }
+  const leftBigrams = buildBigrams(left)
+  const rightBigrams = buildBigrams(right)
+  if (leftBigrams.size === 0 || rightBigrams.size === 0) {
+    return 0
+  }
+  let intersection = 0
+  for (const item of leftBigrams) {
+    if (rightBigrams.has(item)) {
+      intersection += 1
+    }
+  }
+  const union = leftBigrams.size + rightBigrams.size - intersection
+  return union > 0 ? intersection / union : 0
+}
+
+function buildBigrams(text: string): Set<string> {
+  const normalized = text.replace(/\s+/g, "")
+  if (normalized.length <= 1) {
+    return new Set([normalized])
+  }
+  const out = new Set<string>()
+  for (let index = 0; index < normalized.length - 1; index += 1) {
+    out.add(normalized.slice(index, index + 2))
+  }
+  return out
+}
+
+function resolveExportDir(input?: string): string {
+  const raw = input?.trim() ?? ""
+  const candidate = raw || EXPORT_BASE_DIR
+  return path.isAbsolute(candidate) ? candidate : path.resolve(process.cwd(), candidate)
+}
+
+function buildExportFileName(params: {
+  fileName?: string
+  format: "csv" | "json"
+  appKey: string
+  exportId: string
+}): string {
+  const extension = `.${params.format}`
+  if (params.fileName?.trim()) {
+    const safe = sanitizeFileName(params.fileName.trim())
+    if (safe.toLowerCase().endsWith(extension)) {
+      return safe
+    }
+    return `${safe}${extension}`
+  }
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "Z")
+  return `qf-${params.appKey}-${stamp}-${params.exportId.slice(0, 8)}${extension}`
+}
+
+function sanitizeFileName(value: string): string {
+  const stripped = value.replace(/[\/\\?%*:|"<>]/g, "_").replace(/\s+/g, " ").trim()
+  return stripped || "qingflow-export"
+}
+
+function collectRowColumns(rows: Array<Record<string, unknown>>): string[] {
+  const ordered = new Set<string>()
+  ordered.add("apply_id")
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      if (!ordered.has(key)) {
+        ordered.add(key)
+      }
+    }
+  }
+  return Array.from(ordered)
+}
+
+function buildCsvContent(rows: Array<Record<string, unknown>>, columns: string[]): string {
+  const lines: string[] = []
+  lines.push(columns.map((column) => escapeCsvCell(column)).join(","))
+  for (const row of rows) {
+    const line = columns
+      .map((column) => normalizeCsvValue(row[column]))
+      .map((value) => escapeCsvCell(value))
+      .join(",")
+    lines.push(line)
+  }
+  return `${lines.join("\n")}\n`
+}
+
+function normalizeCsvValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return ""
+  }
+  if (typeof value === "string") {
+    return value
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value)
+  }
+  return JSON.stringify(value)
+}
+
+function escapeCsvCell(value: string): string {
+  if (!/[,"\n\r]/.test(value)) {
+    return value
+  }
+  return `"${value.replace(/"/g, "\"\"")}"`
 }
 
 function buildEvidencePayload(
@@ -2993,6 +4313,476 @@ function buildRecordGetArgsFromQuery(
   })
 }
 
+async function executeFieldResolve(
+  args: z.infer<typeof fieldResolveInputSchema>
+): Promise<z.infer<typeof fieldResolveOutputSchema>> {
+  const response = await getFormCached(args.app_key, undefined, false)
+  const index = buildFieldIndex(response.result)
+  const allFields = Array.from(index.byId.values())
+  const topK = args.top_k ?? 3
+  const fuzzy = args.fuzzy ?? true
+  const requestsRaw = args.queries && args.queries.length > 0 ? args.queries : [args.query]
+  const requests = requestsRaw
+    .map((item) => String(item ?? "").trim())
+    .filter((item) => item.length > 0)
+
+  const results = requests.map((requested) => ({
+    requested,
+    matches: scoreFieldMatches(requested, allFields, fuzzy, topK)
+  }))
+
+  return {
+    ok: true,
+    data: {
+      app_key: args.app_key,
+      query_count: requests.length,
+      results
+    },
+    meta: buildMeta(response)
+  }
+}
+
+async function executeQueryPlan(
+  args: z.infer<typeof queryPlanInputSchema>
+): Promise<z.infer<typeof queryPlanOutputSchema>> {
+  const normalizedTool = normalizePlanToolName(args.tool)
+  const rawArguments = asObject(parseJsonLikeDeep(args.arguments)) ?? {}
+  const { normalizedArguments, validation } = normalizePlanArguments(normalizedTool, rawArguments)
+
+  const fieldMapping: Array<{
+    role: string
+    requested: string
+    resolved: boolean
+    que_id: string | number | null
+    que_title: string | null
+    que_type: unknown
+    reason: string | null
+  }> = []
+  if (args.resolve_fields !== false) {
+    const appKey = asNullableString(normalizedArguments.app_key)
+    if (appKey) {
+      const form = await getFormCached(appKey, asNullableString(normalizedArguments.user_id) ?? undefined, false)
+      const index = buildFieldIndex(form.result)
+      const candidates = collectPlanFieldCandidates(normalizedTool, normalizedArguments)
+      for (const candidate of candidates) {
+        fieldMapping.push(resolvePlanFieldCandidate(candidate, index))
+      }
+    } else {
+      validation.warnings.push("skip field resolve: app_key missing")
+    }
+  }
+
+  const estimate = await estimatePlanExecution({
+    tool: normalizedTool,
+    normalizedArguments,
+    probe: args.probe !== false,
+    warnings: validation.warnings
+  })
+
+  return {
+    ok: true,
+    data: {
+      tool: normalizedTool,
+      normalized_arguments: normalizedArguments,
+      validation,
+      field_mapping: fieldMapping,
+      estimate
+    },
+    meta: {
+      version: SERVER_VERSION,
+      generated_at: new Date().toISOString()
+    }
+  }
+}
+
+async function executeRecordsBatchGet(
+  args: z.infer<typeof batchGetInputSchema>
+): Promise<{
+  payload: z.infer<typeof batchGetOutputSchema>
+  message: string
+}> {
+  if (!args.select_columns?.length) {
+    throw missingRequiredFieldError({
+      field: "select_columns",
+      tool: "qf_records_batch_get",
+      fixHint:
+        "Provide select_columns as an array (<=2), for example: {\"apply_ids\":[\"...\"],\"select_columns\":[0]}"
+    })
+  }
+  const outputProfile = resolveOutputProfile(args.output_profile)
+  const queryId = randomUUID()
+  const requestedApplyIds = uniqueStringList(args.apply_ids.map((item) => String(item)))
+  const normalizedSelectors = normalizeColumnSelectors(args.select_columns)
+  const selectedColumnsForRow =
+    args.max_columns !== undefined
+      ? normalizedSelectors.slice(0, args.max_columns)
+      : normalizedSelectors
+
+  const rows: Array<Record<string, unknown>> = []
+  const missingApplyIds: string[] = []
+  let metaResponse: ReturnType<typeof buildMeta> | null = null
+
+  for (const applyId of requestedApplyIds) {
+    try {
+      const response = await client.getRecord(applyId)
+      metaResponse = metaResponse ?? buildMeta(response)
+      const record = asObject(response.result) ?? {}
+      rows.push(
+        buildFlatRowFromAnswers({
+          applyId: (record.applyId as string | number | null | undefined) ?? applyId,
+          answers: asArray(record.answers),
+          selectedColumns: selectedColumnsForRow
+        })
+      )
+    } catch (error) {
+      if (
+        error instanceof QingflowApiError &&
+        (error.httpStatus === 404 || error.errCode === 404)
+      ) {
+        missingApplyIds.push(applyId)
+        continue
+      }
+      throw error
+    }
+  }
+
+  const completeness: z.infer<typeof completenessSchema> = {
+    result_amount: requestedApplyIds.length,
+    returned_items: rows.length,
+    fetched_pages: 1,
+    requested_pages: 1,
+    actual_scanned_pages: 1,
+    has_more: false,
+    next_page_token: null,
+    is_complete: missingApplyIds.length === 0,
+    partial: missingApplyIds.length > 0,
+    omitted_items: missingApplyIds.length,
+    omitted_chars: 0
+  }
+  const evidence = buildEvidencePayload(
+    {
+      query_id: queryId,
+      app_key: args.app_key,
+      selected_columns: selectedColumnsForRow,
+      filters: [
+        {
+          apply_ids: requestedApplyIds
+        }
+      ],
+      time_range: null
+    },
+    [1]
+  )
+
+  const payload: z.infer<typeof batchGetOutputSchema> = {
+    ok: true,
+    data: {
+      app_key: args.app_key,
+      requested_apply_ids: requestedApplyIds,
+      found_count: rows.length,
+      missing_apply_ids: missingApplyIds,
+      rows,
+      applied_limits: {
+        column_cap: args.max_columns ?? null,
+        selected_columns: selectedColumnsForRow
+      },
+      ...(isVerboseProfile(outputProfile)
+        ? {
+            completeness,
+            evidence
+          }
+        : {})
+    },
+    output_profile: outputProfile,
+    ...(isVerboseProfile(outputProfile)
+      ? {
+          completeness,
+          evidence,
+          error_code: null,
+          fix_hint: null
+        }
+      : {}),
+    next_page_token: null,
+    ...(isVerboseProfile(outputProfile) && metaResponse
+      ? {
+          meta: metaResponse
+        }
+      : {})
+  }
+
+  return {
+    payload,
+    message:
+      missingApplyIds.length > 0
+        ? `Fetched ${rows.length}/${requestedApplyIds.length} records (missing ${missingApplyIds.length})`
+        : `Fetched ${rows.length} records`
+  }
+}
+
+async function executeRecordsExport(
+  format: "csv" | "json",
+  args: z.infer<typeof exportInputSchema>
+): Promise<{
+  payload: z.infer<typeof exportOutputSchema>
+  message: string
+}> {
+  if (!args.app_key) {
+    throw missingRequiredFieldError({
+      field: "app_key",
+      tool: `qf_export_${format}`,
+      fixHint: `Provide app_key, for example: {"app_key":"21b3d559","select_columns":[0]}`
+    })
+  }
+  if (!args.select_columns?.length) {
+    throw missingRequiredFieldError({
+      field: "select_columns",
+      tool: `qf_export_${format}`,
+      fixHint:
+        "Provide select_columns as an array (<=2), for example: {\"select_columns\":[0,\"客户名称\"]}"
+    })
+  }
+
+  const outputProfile = resolveOutputProfile(args.output_profile)
+  const queryId = randomUUID()
+  const pageNum = resolveStartPage(args.page_num, args.page_token, args.app_key)
+  const requestedPages = args.requested_pages ?? EXPORT_DEFAULT_PAGES
+  const scanMaxPages = args.scan_max_pages ?? requestedPages
+  const maxRows = Math.min(args.max_rows ?? EXPORT_MAX_ROWS, EXPORT_MAX_ROWS)
+  const startedAt = Date.now()
+  const adaptivePaging = createAdaptivePagingState(args.page_size ?? DEFAULT_PAGE_SIZE)
+  const effectiveFilters = appendTimeRangeFilter(args.filters, args.time_range)
+  assertTimeRangeFilterApplied(`qf_export_${format}`, args.time_range, effectiveFilters)
+  if (hasDateLikeRangeFilters(effectiveFilters)) {
+    const form = await getFormCached(args.app_key, args.user_id, false)
+    const index = buildFieldIndex(form.result)
+    validateDateRangeFilters(effectiveFilters, index, `qf_export_${format}`)
+  }
+  const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
+
+  let currentPage = pageNum
+  let fetchedPages = 0
+  let hasMore = false
+  let nextPageNum: number | null = null
+  let resultAmount: number | null = null
+  let pageAmount: number | null = null
+  let responseMeta: ReturnType<typeof buildMeta> | null = null
+  const sourcePages: number[] = []
+  const rawItems: unknown[] = []
+
+  while (
+    fetchedPages < requestedPages &&
+    fetchedPages < scanMaxPages &&
+    rawItems.length < maxRows
+  ) {
+    if (fetchedPages > 0 && isExecutionBudgetExceeded(startedAt)) {
+      hasMore = true
+      nextPageNum = currentPage
+      break
+    }
+
+    const activePageSize = adaptivePaging.current_page_size
+    const listPayload = buildListPayload({
+      pageNum: currentPage,
+      pageSize: activePageSize,
+      mode: args.mode,
+      type: args.type,
+      keyword: args.keyword,
+      queryLogic: args.query_logic,
+      applyIds: args.apply_ids,
+      sort: normalizedSort,
+      filters: effectiveFilters
+    })
+    const fetchStartedAt = Date.now()
+    const response = await client.listRecords(args.app_key, listPayload, { userId: args.user_id })
+    const fetchMs = Date.now() - fetchStartedAt
+    responseMeta = responseMeta ?? buildMeta(response)
+    fetchedPages += 1
+    sourcePages.push(currentPage)
+
+    const result = asObject(response.result)
+    const pageItems = asArray(result?.result)
+    const remained = Math.max(0, maxRows - rawItems.length)
+    rawItems.push(...pageItems.slice(0, remained))
+
+    resultAmount = resultAmount ?? toNonNegativeInt(result?.resultAmount)
+    pageAmount = pageAmount ?? toPositiveInt(result?.pageAmount)
+    hasMore = pageAmount !== null ? currentPage < pageAmount : pageItems.length === activePageSize
+    if (rawItems.length >= maxRows && (hasMore || pageItems.length > remained)) {
+      hasMore = true
+    }
+    nextPageNum = hasMore ? currentPage + 1 : null
+
+    const adaptiveDecision = applyAdaptivePaging({
+      state: adaptivePaging,
+      fetchedPages,
+      requestedPages,
+      fetchMs,
+      startedAt
+    })
+    if (adaptiveDecision.shouldStop && hasMore) {
+      nextPageNum = nextPageNum ?? currentPage + 1
+      break
+    }
+
+    if (!hasMore) {
+      break
+    }
+    currentPage += 1
+  }
+
+  if (!responseMeta) {
+    throw new Error(`Failed to export ${format}: empty response`)
+  }
+
+  const normalizedItems = rawItems.map((raw) => normalizeRecordItem(raw, true))
+  const projection = projectRecordItemsColumns({
+    items: normalizedItems,
+    includeAnswers: true,
+    maxColumns: args.max_columns,
+    selectColumns: args.select_columns
+  })
+  if (normalizedItems.length > 0 && projection.matchedAnswersCount === 0) {
+    throw new InputValidationError({
+      message: `No answers matched select_columns (${args.select_columns
+        .map((item) => String(item))
+        .join(", ")}).`,
+      errorCode: "COLUMN_SELECTOR_NOT_FOUND",
+      fixHint:
+        "Use qf_form_get to confirm que_id/que_title. If parameters were stringified, pass native JSON arrays (or plain arrays) for select_columns.",
+      details: {
+        select_columns: args.select_columns
+      }
+    })
+  }
+  const selectedColumnsForRows =
+    args.max_columns !== undefined
+      ? projection.selectedColumns.slice(0, args.max_columns)
+      : projection.selectedColumns
+  const rows = buildFlatRowsFromItems({
+    items: normalizedItems,
+    selectedColumns: selectedColumnsForRows
+  })
+
+  const exportId = randomUUID()
+  const exportDir = resolveExportDir(args.export_dir)
+  const filePath = path.join(
+    exportDir,
+    buildExportFileName({
+      fileName: args.file_name,
+      format,
+      appKey: args.app_key,
+      exportId
+    })
+  )
+  await fs.mkdir(path.dirname(filePath), { recursive: true })
+
+  const columns = collectRowColumns(rows)
+  if (format === "json") {
+    await fs.writeFile(filePath, JSON.stringify(rows, null, 2), "utf8")
+  } else {
+    await fs.writeFile(filePath, buildCsvContent(rows, columns), "utf8")
+  }
+  const fileStat = await fs.stat(filePath)
+
+  const knownResultAmount = resultAmount ?? rows.length
+  const omittedItems = Math.max(0, knownResultAmount - rows.length)
+  const nextPageToken =
+    hasMore && nextPageNum
+      ? encodeContinuationToken({
+          app_key: args.app_key,
+          next_page_num: nextPageNum,
+          page_size: adaptivePaging.current_page_size
+        })
+      : null
+  const completeness: z.infer<typeof completenessSchema> = {
+    result_amount: knownResultAmount,
+    returned_items: rows.length,
+    fetched_pages: fetchedPages,
+    requested_pages: requestedPages,
+    actual_scanned_pages: fetchedPages,
+    has_more: hasMore,
+    next_page_token: nextPageToken,
+    is_complete: !hasMore && omittedItems === 0,
+    partial: hasMore || omittedItems > 0,
+    omitted_items: omittedItems,
+    omitted_chars: 0
+  }
+  const evidence = buildEvidencePayload(
+    {
+      query_id: queryId,
+      app_key: args.app_key,
+      selected_columns: selectedColumnsForRows,
+      filters: echoFilters(effectiveFilters),
+      time_range: args.time_range
+        ? {
+            column: String(args.time_range.column),
+            from: args.time_range.from ?? null,
+            to: args.time_range.to ?? null,
+            timezone: args.time_range.timezone ?? null
+          }
+        : null
+    },
+    sourcePages
+  )
+
+  if ((args.strict_full ?? false) && !completeness.is_complete) {
+    throw new NeedMoreDataError(
+      `Export ${format} result is incomplete. Continue with next_page_token or increase requested_pages.`,
+      {
+        code: "NEED_MORE_DATA",
+        completeness,
+        evidence
+      }
+    )
+  }
+
+  const payload: z.infer<typeof exportOutputSchema> = {
+    ok: true,
+    data: {
+      export_id: exportId,
+      format,
+      app_key: args.app_key,
+      file_path: filePath,
+      file_size_bytes: fileStat.size,
+      row_count: rows.length,
+      columns,
+      preview: rows.slice(0, EXPORT_PREVIEW_ROWS),
+      ...(isVerboseProfile(outputProfile)
+        ? {
+            completeness,
+            evidence,
+            execution: {
+              scanned_pages: fetchedPages,
+              requested_pages: requestedPages,
+              page_size: args.page_size ?? DEFAULT_PAGE_SIZE,
+              truncated: !completeness.is_complete
+            }
+          }
+        : {})
+    },
+    output_profile: outputProfile,
+    ...(isVerboseProfile(outputProfile)
+      ? {
+          completeness,
+          evidence,
+          error_code: null,
+          fix_hint: null
+        }
+      : {}),
+    next_page_token: completeness.next_page_token,
+    ...(isVerboseProfile(outputProfile)
+      ? {
+          meta: responseMeta
+        }
+      : {})
+  }
+
+  return {
+    payload,
+    message: `Exported ${rows.length} rows to ${filePath}`
+  }
+}
+
 async function executeRecordsList(
   args: z.infer<typeof listInputSchema>
 ): Promise<{
@@ -3022,6 +4812,7 @@ async function executeRecordsList(
   const queryId = randomUUID()
   const pageNum = resolveStartPage(args.page_num, args.page_token, args.app_key)
   const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
+  const adaptivePaging = createAdaptivePagingState(pageSize)
   const requestedPages = args.requested_pages ?? 1
   const scanMaxPages = args.scan_max_pages ?? requestedPages
   const effectiveFilters = appendTimeRangeFilter(args.filters, args.time_range)
@@ -3051,9 +4842,10 @@ async function executeRecordsList(
       break
     }
 
+    const activePageSize = adaptivePaging.current_page_size
     const payload = buildListPayload({
       pageNum: currentPage,
-      pageSize,
+      pageSize: activePageSize,
       mode: args.mode,
       type: args.type,
       keyword: args.keyword,
@@ -3062,7 +4854,9 @@ async function executeRecordsList(
       sort: normalizedSort,
       filters: effectiveFilters
     })
+    const fetchStartedAt = Date.now()
     const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
+    const fetchMs = Date.now() - fetchStartedAt
     responseMeta = responseMeta ?? buildMeta(response)
 
     const result = asObject(response.result)
@@ -3073,8 +4867,21 @@ async function executeRecordsList(
 
     resultAmount = resultAmount ?? toNonNegativeInt(result?.resultAmount)
     pageAmount = pageAmount ?? toPositiveInt(result?.pageAmount)
-    hasMore = pageAmount !== null ? currentPage < pageAmount : rawItems.length === pageSize
+    hasMore = pageAmount !== null ? currentPage < pageAmount : rawItems.length === activePageSize
     nextPageNum = hasMore ? currentPage + 1 : null
+
+    const adaptiveDecision = applyAdaptivePaging({
+      state: adaptivePaging,
+      fetchedPages,
+      requestedPages,
+      fetchMs,
+      startedAt
+    })
+    if (adaptiveDecision.shouldStop && hasMore) {
+      nextPageNum = nextPageNum ?? currentPage + 1
+      break
+    }
+
     if (!hasMore) {
       break
     }
@@ -3143,7 +4950,7 @@ async function executeRecordsList(
       ? encodeContinuationToken({
           app_key: args.app_key,
           next_page_num: nextPageNum,
-          page_size: pageSize
+          page_size: adaptivePaging.current_page_size
         })
       : null
 
@@ -3343,6 +5150,15 @@ interface SummaryColumn {
   que_type: unknown
 }
 
+type AggregateMetricName = "count" | "sum" | "avg" | "min" | "max"
+
+interface AggregateMetricAccumulator {
+  count: number
+  sum: number
+  min: number | null
+  max: number | null
+}
+
 async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Promise<{
   data: z.infer<typeof querySummaryOutputSchema>
   meta: ReturnType<typeof buildMeta>
@@ -3375,6 +5191,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   const requestedPages = args.requested_pages ?? scanMaxPages
   const startPage = resolveStartPage(args.page_num, args.page_token, args.app_key)
   const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
+  const adaptivePaging = createAdaptivePagingState(pageSize)
   const rowCap = Math.min(args.max_rows ?? DEFAULT_ROW_LIMIT, DEFAULT_ROW_LIMIT)
   const timezone = args.time_range?.timezone ?? "Asia/Shanghai"
 
@@ -3442,9 +5259,10 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       break
     }
 
+    const activePageSize = adaptivePaging.current_page_size
     const payload = buildListPayload({
       pageNum: currentPage,
-      pageSize,
+      pageSize: activePageSize,
       mode: args.mode,
       type: args.type,
       keyword: args.keyword,
@@ -3453,7 +5271,9 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       sort: normalizedSort,
       filters: summaryFilters
     })
+    const fetchStartedAt = Date.now()
     const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
+    const fetchMs = Date.now() - fetchStartedAt
     summaryMeta = summaryMeta ?? buildMeta(response)
     scannedPages += 1
     sourcePages.push(currentPage)
@@ -3462,7 +5282,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     const rawItems = asArray(result?.result)
     const pageAmount = toPositiveInt(result?.pageAmount)
     resultAmount = resultAmount ?? toNonNegativeInt(result?.resultAmount)
-    hasMore = pageAmount !== null ? currentPage < pageAmount : rawItems.length === pageSize
+    hasMore = pageAmount !== null ? currentPage < pageAmount : rawItems.length === activePageSize
     nextPageNum = hasMore ? currentPage + 1 : null
 
     for (const rawItem of rawItems) {
@@ -3505,6 +5325,18 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
         bucket.amount += amountContribution
       }
       byDay.set(dayKey, bucket)
+    }
+
+    const adaptiveDecision = applyAdaptivePaging({
+      state: adaptivePaging,
+      fetchedPages: scannedPages,
+      requestedPages,
+      fetchMs,
+      startedAt
+    })
+    if (adaptiveDecision.shouldStop && hasMore) {
+      nextPageNum = nextPageNum ?? currentPage + 1
+      break
     }
 
     if (!hasMore) {
@@ -3566,7 +5398,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       ? encodeContinuationToken({
           app_key: args.app_key,
           next_page_num: nextPageNum,
-          page_size: pageSize
+          page_size: adaptivePaging.current_page_size
         })
       : null
   const completeness: z.infer<typeof completenessSchema> = {
@@ -3657,19 +5489,28 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
   const includeNegative = args.stat_policy?.include_negative ?? true
   const includeNull = args.stat_policy?.include_null ?? false
   const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
+  const adaptivePaging = createAdaptivePagingState(pageSize)
   const scanMaxPages = args.scan_max_pages ?? DEFAULT_SCAN_MAX_PAGES
   const requestedPages = args.requested_pages ?? scanMaxPages
   const startPage = resolveStartPage(args.page_num, args.page_token, args.app_key)
   const maxGroups = args.max_groups ?? 200
   const timezone = args.time_range?.timezone ?? "Asia/Shanghai"
+  const timeBucket = args.time_bucket ?? null
 
   const form = await getFormCached(args.app_key, args.user_id, false)
   const index = buildFieldIndex(form.result)
   const groupColumns = resolveSummaryColumns(args.group_by, index, "group_by")
-  const amountColumn =
-    args.amount_column !== undefined
-      ? resolveSummaryColumn(args.amount_column, index, "amount_column")
-      : null
+  const amountSelectors =
+    args.amount_columns && args.amount_columns.length > 0
+      ? args.amount_columns
+      : args.amount_column !== undefined
+        ? [args.amount_column]
+        : []
+  const amountColumns = amountSelectors.length
+    ? resolveSummaryColumns(amountSelectors, index, "amount_columns")
+    : []
+  const primaryAmountColumn = amountColumns[0] ?? null
+  const metrics = resolveAggregateMetrics(args.metrics, amountColumns.length > 0)
   const timeColumn = args.time_range ? resolveSummaryColumn(args.time_range.column, index, "time_range.column") : null
 
   const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
@@ -3686,7 +5527,11 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
   const listState: ListQueryState = {
     query_id: queryId,
     app_key: args.app_key,
-    selected_columns: groupColumns.map((item) => item.requested),
+    selected_columns: uniqueStringList([
+      ...groupColumns.map((item) => item.requested),
+      ...amountColumns.map((item) => item.requested),
+      ...(timeColumn ? [timeColumn.requested] : [])
+    ]),
     filters: echoFilters(aggregateFilters),
     time_range: timeColumn
       ? {
@@ -3708,7 +5553,16 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
   let responseMeta: ReturnType<typeof buildMeta> | null = null
   let totalAmount = 0
   const sourcePages: number[] = []
-  const groupStats = new Map<string, { group: Record<string, unknown>; count: number; amount: number }>()
+  const groupStats = new Map<
+    string,
+    {
+      group: Record<string, unknown>
+      count: number
+      amount: number
+      metrics: Map<string, AggregateMetricAccumulator>
+    }
+  >()
+  const summaryMetricStats = new Map<string, AggregateMetricAccumulator>()
 
   while (scannedPages < requestedPages && scannedPages < scanMaxPages) {
     if (scannedPages > 0 && isExecutionBudgetExceeded(startedAt)) {
@@ -3717,9 +5571,10 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       break
     }
 
+    const activePageSize = adaptivePaging.current_page_size
     const payload = buildListPayload({
       pageNum: currentPage,
-      pageSize,
+      pageSize: activePageSize,
       mode: args.mode,
       type: args.type,
       keyword: args.keyword,
@@ -3728,7 +5583,9 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       sort: normalizedSort,
       filters: aggregateFilters
     })
+    const fetchStartedAt = Date.now()
     const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
+    const fetchMs = Date.now() - fetchStartedAt
     responseMeta = responseMeta ?? buildMeta(response)
     scannedPages += 1
     sourcePages.push(currentPage)
@@ -3737,7 +5594,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     const rawItems = asArray(result?.result)
     const pageAmount = toPositiveInt(result?.pageAmount)
     resultAmount = resultAmount ?? toNonNegativeInt(result?.resultAmount)
-    hasMore = pageAmount !== null ? currentPage < pageAmount : rawItems.length === pageSize
+    hasMore = pageAmount !== null ? currentPage < pageAmount : rawItems.length === activePageSize
     nextPageNum = hasMore ? currentPage + 1 : null
 
     for (const rawItem of rawItems) {
@@ -3749,24 +5606,61 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       for (const column of groupColumns) {
         group[column.requested] = extractSummaryColumnValue(answers, column)
       }
+      if (timeBucket && timeColumn) {
+        group[`time_bucket_${timeBucket}`] = toTimeBucket(
+          extractSummaryColumnValue(answers, timeColumn),
+          timezone,
+          timeBucket
+        )
+      }
       const groupKey = stableJson(group)
-      const bucket = groupStats.get(groupKey) ?? { group, count: 0, amount: 0 }
+      const bucket =
+        groupStats.get(groupKey) ??
+        {
+          group,
+          count: 0,
+          amount: 0,
+          metrics: new Map<string, AggregateMetricAccumulator>()
+        }
       bucket.count += 1
 
-      if (amountColumn) {
+      for (const amountColumn of amountColumns) {
+        const metricKey = amountColumn.requested
         const amountValue = extractSummaryColumnValue(answers, amountColumn)
         const numericAmount = toFiniteAmount(amountValue)
         if (numericAmount === null) {
           if (includeNull) {
-            // Keep group count while amount contributes 0.
+            // Include in group count only.
           }
-        } else if (includeNegative || numericAmount >= 0) {
+          continue
+        }
+        if (!includeNegative && numericAmount < 0) {
+          continue
+        }
+        const groupAccumulator = getOrCreateMetricAccumulator(bucket.metrics, metricKey)
+        updateMetricAccumulator(groupAccumulator, numericAmount)
+        const summaryAccumulator = getOrCreateMetricAccumulator(summaryMetricStats, metricKey)
+        updateMetricAccumulator(summaryAccumulator, numericAmount)
+
+        if (primaryAmountColumn && metricKey === primaryAmountColumn.requested) {
           bucket.amount += numericAmount
           totalAmount += numericAmount
         }
       }
 
       groupStats.set(groupKey, bucket)
+    }
+
+    const adaptiveDecision = applyAdaptivePaging({
+      state: adaptivePaging,
+      fetchedPages: scannedPages,
+      requestedPages,
+      fetchMs,
+      startedAt
+    })
+    if (adaptiveDecision.shouldStop && hasMore) {
+      nextPageNum = nextPageNum ?? currentPage + 1
+      break
     }
 
     if (!hasMore) {
@@ -3787,7 +5681,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       ? encodeContinuationToken({
           app_key: args.app_key,
           next_page_num: nextPageNum,
-          page_size: pageSize
+          page_size: adaptivePaging.current_page_size
         })
       : null
   const completeness: z.infer<typeof completenessSchema> = {
@@ -3823,13 +5717,23 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       group: bucket.group,
       count: bucket.count,
       count_ratio: scannedRecords > 0 ? bucket.count / scannedRecords : 0,
-      amount_total: amountColumn ? bucket.amount : null,
+      amount_total: primaryAmountColumn ? bucket.amount : null,
       amount_ratio:
-        amountColumn && totalAmount !== 0
+        primaryAmountColumn && totalAmount !== 0
           ? bucket.amount / totalAmount
-          : amountColumn
+          : primaryAmountColumn
             ? 0
-            : null
+            : null,
+      ...(metrics.length > 0
+        ? {
+            metrics: buildAggregateMetricRecord({
+              metrics,
+              amountColumns,
+              metricStats: bucket.metrics,
+              rowCount: bucket.count
+            })
+          }
+        : {})
     }))
 
   const fieldMapping = [
@@ -3840,17 +5744,13 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       que_title: item.que_title,
       que_type: item.que_type
     })),
-    ...(amountColumn
-      ? [
-          {
-            role: "amount" as const,
-            requested: amountColumn.requested,
-            que_id: amountColumn.que_id,
-            que_title: amountColumn.que_title,
-            que_type: amountColumn.que_type
-          }
-        ]
-      : []),
+    ...amountColumns.map((item) => ({
+      role: "amount" as const,
+      requested: item.requested,
+      que_id: item.que_id,
+      que_title: item.que_title,
+      que_type: item.que_type
+    })),
     ...(timeColumn
       ? [
           {
@@ -3871,7 +5771,17 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
         app_key: args.app_key,
         summary: {
           total_count: scannedRecords,
-          total_amount: amountColumn ? totalAmount : null
+          total_amount: primaryAmountColumn ? totalAmount : null,
+          ...(metrics.length > 0
+            ? {
+                metrics: buildAggregateMetricRecord({
+                  metrics,
+                  amountColumns,
+                  metricStats: summaryMetricStats,
+                  rowCount: scannedRecords
+                })
+              }
+            : {})
         },
         groups,
         ...(isVerboseProfile(outputProfile)
@@ -3883,7 +5793,9 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
                 stat_policy: {
                   include_negative: includeNegative,
                   include_null: includeNull
-                }
+                },
+                metrics,
+                time_bucket: timeBucket
               }
             }
           : {})
@@ -4095,6 +6007,117 @@ function formatDateBucket(value: Date, timezone: string): string {
   } catch {
     return value.toISOString().slice(0, 10)
   }
+}
+
+function toTimeBucket(
+  value: unknown,
+  timezone: string,
+  bucket: "day" | "week" | "month"
+): string {
+  const dayBucket = toDayBucket(value, timezone)
+  if (dayBucket === "unknown") {
+    return dayBucket
+  }
+  if (bucket === "day") {
+    return dayBucket
+  }
+  if (bucket === "month") {
+    return dayBucket.slice(0, 7)
+  }
+  return toIsoWeekBucket(dayBucket)
+}
+
+function toIsoWeekBucket(dayBucket: string): string {
+  const parsed = new Date(`${dayBucket}T00:00:00Z`)
+  if (Number.isNaN(parsed.getTime())) {
+    return "unknown"
+  }
+  const date = new Date(parsed.getTime())
+  const weekday = date.getUTCDay() || 7
+  date.setUTCDate(date.getUTCDate() + 4 - weekday)
+  const year = date.getUTCFullYear()
+  const yearStart = new Date(Date.UTC(year, 0, 1))
+  const week = Math.ceil(((date.getTime() - yearStart.getTime()) / 86400000 + 1) / 7)
+  return `${year}-W${String(week).padStart(2, "0")}`
+}
+
+function resolveAggregateMetrics(
+  metrics: Array<AggregateMetricName> | undefined,
+  hasAmountColumns: boolean
+): AggregateMetricName[] {
+  if (metrics && metrics.length > 0) {
+    return uniqueStringList(metrics).filter(
+      (item): item is AggregateMetricName =>
+        item === "count" || item === "sum" || item === "avg" || item === "min" || item === "max"
+    )
+  }
+  return hasAmountColumns ? ["count", "sum"] : ["count"]
+}
+
+function getOrCreateMetricAccumulator(
+  map: Map<string, AggregateMetricAccumulator>,
+  key: string
+): AggregateMetricAccumulator {
+  const existing = map.get(key)
+  if (existing) {
+    return existing
+  }
+  const created: AggregateMetricAccumulator = {
+    count: 0,
+    sum: 0,
+    min: null,
+    max: null
+  }
+  map.set(key, created)
+  return created
+}
+
+function updateMetricAccumulator(accumulator: AggregateMetricAccumulator, value: number): void {
+  accumulator.count += 1
+  accumulator.sum += value
+  accumulator.min = accumulator.min === null ? value : Math.min(accumulator.min, value)
+  accumulator.max = accumulator.max === null ? value : Math.max(accumulator.max, value)
+}
+
+function buildAggregateMetricRecord(params: {
+  metrics: AggregateMetricName[]
+  amountColumns: SummaryColumn[]
+  metricStats: Map<string, AggregateMetricAccumulator>
+  rowCount: number
+}): Record<string, Record<string, number | null>> {
+  const output: Record<string, Record<string, number | null>> = {}
+  if (params.amountColumns.length === 0) {
+    const rowMetrics: Record<string, number | null> = {}
+    for (const metric of params.metrics) {
+      if (metric === "count") {
+        rowMetrics.count = params.rowCount
+      } else {
+        rowMetrics[metric] = null
+      }
+    }
+    output.rows = rowMetrics
+    return output
+  }
+
+  for (const column of params.amountColumns) {
+    const stats = params.metricStats.get(column.requested)
+    const record: Record<string, number | null> = {}
+    for (const metric of params.metrics) {
+      if (metric === "count") {
+        record.count = stats ? stats.count : 0
+      } else if (metric === "sum") {
+        record.sum = stats ? stats.sum : 0
+      } else if (metric === "avg") {
+        record.avg = stats && stats.count > 0 ? stats.sum / stats.count : null
+      } else if (metric === "min") {
+        record.min = stats ? stats.min : null
+      } else if (metric === "max") {
+        record.max = stats ? stats.max : null
+      }
+    }
+    output[column.requested] = record
+  }
+  return output
 }
 
 function buildListPayload(params: {

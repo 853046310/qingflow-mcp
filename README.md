@@ -4,8 +4,13 @@ This MCP server wraps Qingflow OpenAPI for:
 
 - `qf_apps_list`
 - `qf_form_get`
+- `qf_field_resolve`
+- `qf_query_plan`
 - `qf_records_list`
 - `qf_record_get`
+- `qf_records_batch_get`
+- `qf_export_csv`
+- `qf_export_json`
 - `qf_query` (unified read entry: list / record / summary)
 - `qf_records_aggregate` (deterministic grouped metrics)
 - `qf_record_create`
@@ -39,6 +44,11 @@ Optional:
 export QINGFLOW_FORM_CACHE_TTL_MS=300000
 export QINGFLOW_REQUEST_TIMEOUT_MS=18000
 export QINGFLOW_EXECUTION_BUDGET_MS=20000
+export QINGFLOW_ADAPTIVE_PAGING=1
+export QINGFLOW_ADAPTIVE_MIN_PAGE_SIZE=20
+export QINGFLOW_ADAPTIVE_TARGET_PAGE_MS=1200
+export QINGFLOW_EXPORT_MAX_ROWS=10000
+export QINGFLOW_EXPORT_DIR="/tmp/qingflow-mcp-exports"
 ```
 
 ## Run
@@ -95,10 +105,10 @@ Global install from GitHub:
 npm i -g git+https://github.com/853046310/qingflow-mcp.git
 ```
 
-Install latest from npm:
+Install from npm (pinned version):
 
 ```bash
-npm i -g qingflow-mcp@latest
+npm i -g qingflow-mcp@0.3.12
 ```
 
 Or one-click installer:
@@ -252,10 +262,37 @@ Aggregate example (`qf_records_aggregate`):
 {
   "app_key": "your_app_key",
   "group_by": ["归属部门", "归属销售"],
-  "amount_column": "报价总金额",
+  "amount_columns": ["报价总金额"],
+  "metrics": ["count", "sum", "avg", "min", "max"],
+  "time_bucket": "day",
   "requested_pages": 10,
   "scan_max_pages": 10,
   "strict_full": true
+}
+```
+
+Batch detail example (`qf_records_batch_get`):
+
+```json
+{
+  "app_key": "your_app_key",
+  "apply_ids": ["497600278750478338", "497600278750478339"],
+  "select_columns": [1, "客户名称"],
+  "max_columns": 2
+}
+```
+
+Export example (`qf_export_json`):
+
+```json
+{
+  "app_key": "your_app_key",
+  "mode": "all",
+  "page_size": 50,
+  "requested_pages": 5,
+  "max_rows": 500,
+  "select_columns": [1, "客户名称"],
+  "file_name": "报价单导出.json"
 }
 ```
 
