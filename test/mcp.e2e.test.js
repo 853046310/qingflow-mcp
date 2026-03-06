@@ -657,6 +657,20 @@ async function callToolRaw(client, name, args) {
   throw new Error(`Tool ${name} returned no structured JSON payload: ${debug}`)
 }
 
+async function callToolProtocolError(client, name, args) {
+  const result = await client.callTool({
+    name,
+    arguments: args
+  })
+
+  assert.equal(result?.isError, true, `${name} should fail at MCP validation boundary`)
+  const textItems = Array.isArray(result?.content)
+    ? result.content.filter((item) => item?.type === "text" && typeof item?.text === "string")
+    : []
+  assert.ok(textItems.length > 0, `${name} should return text error content`)
+  return textItems.map((item) => item.text).join("\n")
+}
+
 function firstRowValue(row) {
   if (!row || typeof row !== "object") {
     return null
@@ -728,6 +742,26 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     expectSchemaProps("qf_query", ["query_mode", "app_key", "select_columns", "amount_column"])
     expectSchemaProps("qf_records_aggregate", ["app_key", "group_by", "metrics", "time_range"])
     expectSchemaProps("qf_record_create", ["app_key", "fields", "answers"])
+
+    const listSchema = byName.get("qf_records_list").inputSchema
+    assert.equal(listSchema.additionalProperties, false)
+    assert.equal(listSchema.properties.page_size.type, "integer")
+    assert.equal(listSchema.properties.page_size.maximum, 200)
+    assert.ok(!("anyOf" in listSchema.properties.page_size))
+    assert.equal(listSchema.properties.select_columns.type, "array")
+    assert.equal(listSchema.properties.filters.type, "array")
+    assert.ok(Array.isArray(listSchema.required))
+    assert.ok(listSchema.required.includes("app_key"))
+    assert.ok(listSchema.required.includes("select_columns"))
+
+    const aggregateSchema = byName.get("qf_records_aggregate").inputSchema
+    assert.equal(aggregateSchema.additionalProperties, false)
+    assert.equal(aggregateSchema.properties.page_size.type, "integer")
+    assert.equal(aggregateSchema.properties.group_by.type, "array")
+    assert.equal(aggregateSchema.properties.time_range.type, "object")
+    assert.ok(Array.isArray(aggregateSchema.required))
+    assert.ok(aggregateSchema.required.includes("app_key"))
+    assert.ok(aggregateSchema.required.includes("group_by"))
   })
 
   await t.test("cli mode can list tools and call one tool", async () => {
@@ -778,10 +812,11 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.ok(item.required.includes("select_columns"))
     assert.equal(item.limits.page_size_max, 200)
     assert.equal(item.limits.select_columns_max, 2)
-    assert.ok(Array.isArray(item.aliases.select_columns))
-    assert.ok(item.aliases.select_columns.includes("selectColumns"))
-    assert.ok(Array.isArray(item.aliases.output_profile))
-    assert.ok(item.aliases.output_profile.includes("outputProfile"))
+    assert.deepEqual(item.aliases, {})
+    assert.equal(
+      item.limits.input_contract,
+      "strict JSON only; numbers/arrays/objects/booleans must use native JSON types"
+    )
     assert.equal(item.limits.output_profile, "compact|verbose (default compact)")
     assert.equal(item.minimal_example.app_key, "21b3d559")
     assert.ok(Array.isArray(item.minimal_example.select_columns))
@@ -967,8 +1002,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(firstDay, "2026-02-01")
   })
 
-  await t.test("qf_records_list accepts stringified select_columns/filters/max_rows", async () => {
-    const listed = await callTool(mcp.client, "qf_records_list", {
+  await t.test("qf_records_list rejects stringified select_columns/filters/max_rows at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_records_list", {
       app_key: APP_KEY,
       mode: "all",
       page_size: "20",
@@ -977,13 +1012,12 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       filters: "[{\"que_id\":1003,\"min_value\":\"2026-01-02\",\"max_value\":\"2026-01-02\"}]"
     })
 
-    assert.equal(listed.ok, true)
-    assert.equal(listed.data.rows.length, 2)
-    assert.equal(listed.completeness.returned_items, 2)
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /qf_records_list/)
   })
 
-  await t.test("qf_query list mode tolerates double-stringified params", async () => {
-    const listed = await callTool(mcp.client, "qf_query", {
+  await t.test("qf_query list mode rejects double-stringified params at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_query", {
       query_mode: "list",
       app_key: APP_KEY,
       mode: "all",
@@ -994,14 +1028,12 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
         "\"[{\\\"que_id\\\":1003,\\\"min_value\\\":\\\"2026-01-02\\\",\\\"max_value\\\":\\\"2026-01-02\\\"}]\""
     })
 
-    assert.equal(listed.ok, true)
-    assert.equal(listed.data.mode, "list")
-    assert.equal(listed.data.list.rows.length, 2)
-    assert.equal(listed.data.list.completeness.returned_items, 2)
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /qf_query/)
   })
 
-  await t.test("qf_query list mode accepts camelCase aliases", async () => {
-    const listed = await callTool(mcp.client, "qf_query", {
+  await t.test("qf_query list mode rejects camelCase aliases at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_query", {
       queryMode: "list",
       appKey: APP_KEY,
       mode: "all",
@@ -1010,14 +1042,12 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       selectColumns: [1001]
     })
 
-    assert.equal(listed.ok, true)
-    assert.equal(listed.data.mode, "list")
-    assert.equal(listed.data.list.rows.length, 2)
-    assert.equal(listed.data.list.completeness.returned_items, 2)
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /select_columns|app_key|qf_query/)
   })
 
-  await t.test("qf_query list mode auto-normalizes model-style date_range filter", async () => {
-    const listed = await callTool(mcp.client, "qf_query", {
+  await t.test("qf_query list mode rejects model-style date_range filter at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_query", {
       query_mode: "list",
       app_key: APP_KEY,
       mode: "all",
@@ -1036,10 +1066,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       ]
     })
 
-    assert.equal(listed.ok, true)
-    assert.equal(listed.data.mode, "list")
-    assert.equal(listed.data.list.pagination.result_amount, 2)
-    assert.equal(listed.data.list.rows.length, 2)
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /select_columns|filters|qf_query/)
   })
 
   await t.test("qf_records_list returns deterministic pagination token", async () => {
@@ -1389,8 +1417,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(summary.data.summary.meta.execution.truncated, true)
   })
 
-  await t.test("qf_query summary tolerates double-stringified amount_column", async () => {
-    const summary = await callTool(mcp.client, "qf_query", {
+  await t.test("qf_query summary rejects double-stringified amount_column at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_query", {
       query_mode: "summary",
       app_key: APP_KEY,
       mode: "all",
@@ -1402,14 +1430,12 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       strict_full: "\"false\""
     })
 
-    assert.equal(summary.ok, true)
-    assert.equal(summary.data.mode, "summary")
-    assert.equal(summary.data.summary.summary.total_count, 6)
-    assert.equal(summary.data.summary.summary.total_amount, 350)
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /amount_column|page_size|select_columns/)
   })
 
-  await t.test("qf_query list mode missing select_columns returns structured error", async () => {
-    const failed = await callTool(mcp.client, "qf_query", {
+  await t.test("qf_query list mode missing select_columns is rejected by MCP schema", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_query", {
       query_mode: "list",
       app_key: APP_KEY,
       mode: "all",
@@ -1417,13 +1443,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       max_rows: 2
     })
 
-    assert.equal(failed.ok, false)
-    assert.equal(failed.error_code, "MISSING_REQUIRED_FIELD")
-    assert.equal(typeof failed.fix_hint, "string")
-    assert.match(failed.message, /Missing required field "select_columns"/)
-    assert.ok(Array.isArray(failed.example_calls))
-    assert.equal(failed.example_calls[0].tool, "qf_query")
-    assert.ok(Array.isArray(failed.example_calls[0].arguments.select_columns))
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /select_columns/)
   })
 
   await t.test("qf_query list mode uses default row limit when max_rows is omitted", async () => {
@@ -1602,8 +1623,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.ok(aggregated.data.groups.every((item) => item.metrics && item.metrics["1002"]))
   })
 
-  await t.test("qf_records_aggregate accepts stringified group_by", async () => {
-    const aggregated = await callTool(mcp.client, "qf_records_aggregate", {
+  await t.test("qf_records_aggregate rejects stringified group_by at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_records_aggregate", {
       app_key: APP_KEY,
       mode: "all",
       group_by: "[1003]",
@@ -1614,13 +1635,12 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       strict_full: "true"
     })
 
-    assert.equal(aggregated.ok, true)
-    assert.equal(aggregated.data.summary.total_count, 6)
-    assert.equal(aggregated.completeness.is_complete, true)
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /group_by|page_size|strict_full/)
   })
 
-  await t.test("qf_records_aggregate accepts camelCase aliases", async () => {
-    const aggregated = await callTool(mcp.client, "qf_records_aggregate", {
+  await t.test("qf_records_aggregate rejects camelCase aliases at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_records_aggregate", {
       appKey: APP_KEY,
       mode: "all",
       groupBy: [1003],
@@ -1631,13 +1651,12 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       strictFull: true
     })
 
-    assert.equal(aggregated.ok, true)
-    assert.equal(aggregated.data.summary.total_count, 6)
-    assert.equal(aggregated.completeness.is_complete, true)
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /app_key|group_by|qf_records_aggregate/)
   })
 
-  await t.test("qf_records_aggregate accepts model-style group/date/amount fields", async () => {
-    const aggregated = await callTool(mcp.client, "qf_records_aggregate", {
+  await t.test("qf_records_aggregate rejects model-style group/date/amount fields at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_records_aggregate", {
       app_key: APP_KEY,
       mode: "all",
       group_by: [{ que_id: 1003 }],
@@ -1651,14 +1670,12 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       strict_full: true
     })
 
-    assert.equal(aggregated.ok, true)
-    assert.equal(aggregated.data.summary.total_count, 5)
-    assert.equal(aggregated.data.summary.total_amount, 280)
-    assert.equal(aggregated.completeness.is_complete, true)
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /group_by|amount_que_ids|date_field|date_from|date_to/)
   })
 
-  await t.test("qf_records_aggregate tolerates double-stringified group_by/amount", async () => {
-    const aggregated = await callTool(mcp.client, "qf_records_aggregate", {
+  await t.test("qf_records_aggregate rejects double-stringified group_by/amount at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_records_aggregate", {
       app_key: APP_KEY,
       mode: "all",
       group_by: "\"[1003]\"",
@@ -1669,9 +1686,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       strict_full: "\"true\""
     })
 
-    assert.equal(aggregated.ok, true)
-    assert.equal(aggregated.data.summary.total_count, 6)
-    assert.equal(aggregated.completeness.is_complete, true)
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /group_by|amount_column|page_size/)
   })
 
   await t.test("create + update + operation are still working", async () => {

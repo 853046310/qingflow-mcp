@@ -351,86 +351,60 @@ const formSuccessOutputSchema = z.object({
 })
 const formOutputSchema = formSuccessOutputSchema
 
-const stringLikeSchema = z.string().min(1)
-const columnSelectorLikeSchema = z.union([stringLikeSchema, z.number().int()])
-const columnReferenceLikeSchema = z.union([
-  columnSelectorLikeSchema,
-  z
-    .object({
-      que_id: columnSelectorLikeSchema.optional(),
-      queId: columnSelectorLikeSchema.optional()
-    })
-    .passthrough()
-])
-const booleanLikeSchema = z.union([z.boolean(), stringLikeSchema])
+const publicStringSchema = z.string().min(1)
+const publicFieldSelectorSchema = z.union([publicStringSchema, z.number().int()])
 
-function positiveIntLikeSchema(max?: number) {
-  const base = z.number().int().positive()
-  return z.union([max !== undefined ? base.max(max) : base, stringLikeSchema])
-}
+const publicSortItemSchema = z.object({
+  que_id: publicFieldSelectorSchema,
+  ascend: z.boolean().optional()
+})
 
-function nonNegativeIntLikeSchema(max?: number) {
-  const base = z.number().int().nonnegative()
-  return z.union([max !== undefined ? base.max(max) : base, stringLikeSchema])
-}
+const publicFilterItemSchema = z.object({
+  que_id: publicFieldSelectorSchema.optional(),
+  search_key: publicStringSchema.optional(),
+  search_keys: z.array(publicStringSchema).optional(),
+  min_value: publicStringSchema.optional(),
+  max_value: publicStringSchema.optional(),
+  scope: z.number().int().optional(),
+  search_options: z.array(publicFieldSelectorSchema).optional(),
+  search_user_ids: z.array(publicStringSchema).optional()
+})
 
-const publicSortItemSchema = z
-  .object({
-    que_id: columnSelectorLikeSchema,
-    ascend: booleanLikeSchema.optional()
-  })
-  .passthrough()
+const publicTimeRangeSchema = z.object({
+  column: publicFieldSelectorSchema,
+  from: publicStringSchema.optional(),
+  to: publicStringSchema.optional(),
+  timezone: publicStringSchema.optional()
+})
 
-const publicFilterItemSchema = z
-  .object({
-    que_id: columnSelectorLikeSchema.optional(),
-    search_key: stringLikeSchema.optional(),
-    search_keys: z.union([z.array(stringLikeSchema), stringLikeSchema]).optional(),
-    min_value: stringLikeSchema.optional(),
-    max_value: stringLikeSchema.optional(),
-    scope: z.union([z.number().int(), stringLikeSchema]).optional(),
-    search_options: z.union([z.array(columnSelectorLikeSchema), stringLikeSchema]).optional(),
-    search_user_ids: z.union([z.array(stringLikeSchema), stringLikeSchema]).optional()
-  })
-  .passthrough()
+const publicStatPolicySchema = z.object({
+  include_negative: z.boolean().optional(),
+  include_null: z.boolean().optional()
+})
 
-const publicTimeRangeSchema = z
-  .object({
-    column: columnSelectorLikeSchema,
-    from: stringLikeSchema.optional(),
-    to: stringLikeSchema.optional(),
-    timezone: stringLikeSchema.optional()
-  })
-  .passthrough()
+const publicAnswerInputSchema = z.object({
+  que_id: publicFieldSelectorSchema.optional(),
+  queId: publicFieldSelectorSchema.optional(),
+  que_title: publicStringSchema.optional(),
+  queTitle: publicStringSchema.optional(),
+  que_type: z.unknown().optional(),
+  queType: z.unknown().optional(),
+  value: z.unknown().optional(),
+  values: z.array(z.unknown()).optional(),
+  table_values: z.array(z.array(z.unknown())).optional(),
+  tableValues: z.array(z.array(z.unknown())).optional()
+})
 
-const publicStatPolicySchema = z
-  .object({
-    include_negative: booleanLikeSchema.optional(),
-    include_null: booleanLikeSchema.optional()
-  })
-  .passthrough()
+const publicApplyUserSchema = z.object({
+  email: publicStringSchema.optional(),
+  areaCode: publicStringSchema.optional(),
+  mobile: publicStringSchema.optional()
+})
 
-const publicAnswerInputSchema = z
-  .object({
-    que_id: columnSelectorLikeSchema.optional(),
-    queId: columnSelectorLikeSchema.optional(),
-    que_title: stringLikeSchema.optional(),
-    queTitle: stringLikeSchema.optional(),
-    que_type: z.unknown().optional(),
-    queType: z.unknown().optional(),
-    value: z.unknown().optional(),
-    values: z.union([z.array(z.unknown()), stringLikeSchema]).optional(),
-    table_values: z.union([z.array(z.array(z.unknown())), stringLikeSchema]).optional(),
-    tableValues: z.union([z.array(z.array(z.unknown())), stringLikeSchema]).optional()
-  })
-  .passthrough()
-
-const toolSpecInputPublicSchema = z
-  .object({
-    tool_name: stringLikeSchema.optional(),
-    include_all: booleanLikeSchema.optional()
-  })
-  .passthrough()
+const toolSpecInputPublicSchema = z.object({
+  tool_name: publicStringSchema.optional(),
+  include_all: z.boolean().optional()
+})
 
 const toolSpecInputSchema = z.preprocess(
   normalizeToolSpecInput,
@@ -463,13 +437,14 @@ const toolSpecOutputSchema = z.object({
 
 const listInputPublicSchema = z
   .object({
-    app_key: stringLikeSchema.optional(),
-    user_id: stringLikeSchema.optional(),
-    page_num: positiveIntLikeSchema().optional(),
-    page_token: stringLikeSchema.optional(),
-    page_size: positiveIntLikeSchema(200).optional(),
-    requested_pages: positiveIntLikeSchema(500).optional(),
-    scan_max_pages: positiveIntLikeSchema(500).optional(),
+    app_key: publicStringSchema,
+    user_id: publicStringSchema.optional(),
+    page_num: z.number().int().positive().optional(),
+    page_token: publicStringSchema.optional(),
+    raw_next_page_token: publicStringSchema.optional(),
+    page_size: z.number().int().positive().max(200).optional(),
+    requested_pages: z.number().int().positive().max(500).optional(),
+    scan_max_pages: z.number().int().positive().max(500).optional(),
     mode: z
       .enum([
         "todo",
@@ -486,27 +461,21 @@ const listInputPublicSchema = z
         "cc"
       ])
       .optional(),
-    type: z.union([z.number().int().min(1).max(12), stringLikeSchema]).optional(),
+    type: z.number().int().min(1).max(12).optional(),
     keyword: z.string().optional(),
-    query_logic: z.union([z.enum(["and", "or"]), stringLikeSchema]).optional(),
-    apply_ids: z.union([z.array(z.union([z.string(), z.number()])), stringLikeSchema]).optional(),
-    sort: z.union([z.array(publicSortItemSchema), stringLikeSchema]).optional(),
-    filters: z.union([z.array(publicFilterItemSchema), stringLikeSchema]).optional(),
-    time_range: z.union([publicTimeRangeSchema, stringLikeSchema]).optional(),
-    max_rows: positiveIntLikeSchema(200).optional(),
-    max_items: positiveIntLikeSchema(200).optional(),
-    max_columns: positiveIntLikeSchema(MAX_COLUMN_LIMIT).optional(),
-    select_columns: z
-      .union([
-        z.array(columnReferenceLikeSchema).min(1).max(MAX_COLUMN_LIMIT),
-        stringLikeSchema
-      ])
-      .optional(),
-    include_answers: booleanLikeSchema.optional(),
-    strict_full: booleanLikeSchema.optional(),
-    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional()
+    query_logic: z.enum(["and", "or"]).optional(),
+    apply_ids: z.array(z.union([z.string(), z.number()])).optional(),
+    sort: z.array(publicSortItemSchema).optional(),
+    filters: z.array(publicFilterItemSchema).optional(),
+    time_range: publicTimeRangeSchema.optional(),
+    max_rows: z.number().int().positive().max(200).optional(),
+    max_items: z.number().int().positive().max(200).optional(),
+    max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
+    select_columns: z.array(publicFieldSelectorSchema).min(1).max(MAX_COLUMN_LIMIT),
+    include_answers: z.boolean().optional(),
+    strict_full: z.boolean().optional(),
+    output_profile: outputProfileSchema.optional()
   })
-  .passthrough()
 
 const listInputSchema = z
   .preprocess(
@@ -619,17 +588,11 @@ const listOutputSchema = listSuccessOutputSchema
 
 const recordGetInputPublicSchema = z
   .object({
-    apply_id: columnSelectorLikeSchema.optional(),
-    max_columns: positiveIntLikeSchema(MAX_COLUMN_LIMIT).optional(),
-    select_columns: z
-      .union([
-        z.array(columnReferenceLikeSchema).min(1).max(MAX_COLUMN_LIMIT),
-        stringLikeSchema
-      ])
-      .optional(),
-    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional()
+    apply_id: publicFieldSelectorSchema,
+    max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
+    select_columns: z.array(publicFieldSelectorSchema).min(1).max(MAX_COLUMN_LIMIT),
+    output_profile: outputProfileSchema.optional()
   })
-  .passthrough()
 
 const recordGetInputSchema = z.preprocess(
   normalizeRecordGetInput,
@@ -670,14 +633,13 @@ const recordGetOutputSchema = recordGetSuccessOutputSchema
 
 const createInputPublicSchema = z
   .object({
-    app_key: stringLikeSchema.optional(),
-    user_id: stringLikeSchema.optional(),
-    force_refresh_form: booleanLikeSchema.optional(),
-    apply_user: z.union([z.record(z.unknown()), stringLikeSchema]).optional(),
-    answers: z.union([z.array(publicAnswerInputSchema), stringLikeSchema]).optional(),
-    fields: z.union([z.record(z.unknown()), stringLikeSchema]).optional()
+    app_key: publicStringSchema,
+    user_id: publicStringSchema.optional(),
+    force_refresh_form: z.boolean().optional(),
+    apply_user: publicApplyUserSchema.optional(),
+    answers: z.array(publicAnswerInputSchema).optional(),
+    fields: z.record(z.unknown()).optional()
   })
-  .passthrough()
 
 const createInputSchema = z
   .object({
@@ -712,14 +674,13 @@ const createOutputSchema = createSuccessOutputSchema
 
 const updateInputPublicSchema = z
   .object({
-    apply_id: columnSelectorLikeSchema.optional(),
-    app_key: stringLikeSchema.optional(),
-    user_id: stringLikeSchema.optional(),
-    force_refresh_form: booleanLikeSchema.optional(),
-    answers: z.union([z.array(publicAnswerInputSchema), stringLikeSchema]).optional(),
-    fields: z.union([z.record(z.unknown()), stringLikeSchema]).optional()
+    apply_id: publicFieldSelectorSchema,
+    app_key: publicStringSchema.optional(),
+    user_id: publicStringSchema.optional(),
+    force_refresh_form: z.boolean().optional(),
+    answers: z.array(publicAnswerInputSchema).optional(),
+    fields: z.record(z.unknown()).optional()
   })
-  .passthrough()
 
 const updateInputSchema = z
   .object({
@@ -757,14 +718,15 @@ const operationOutputSchema = operationSuccessOutputSchema
 
 const queryInputPublicSchema = z
   .object({
-    query_mode: z.union([z.enum(["auto", "list", "record", "summary"]), stringLikeSchema]).optional(),
-    app_key: stringLikeSchema.optional(),
-    apply_id: columnSelectorLikeSchema.optional(),
-    user_id: stringLikeSchema.optional(),
-    page_num: positiveIntLikeSchema().optional(),
-    page_token: stringLikeSchema.optional(),
-    page_size: positiveIntLikeSchema(200).optional(),
-    requested_pages: positiveIntLikeSchema(500).optional(),
+    query_mode: z.enum(["auto", "list", "record", "summary"]).optional(),
+    app_key: publicStringSchema.optional(),
+    apply_id: publicFieldSelectorSchema.optional(),
+    user_id: publicStringSchema.optional(),
+    page_num: z.number().int().positive().optional(),
+    page_token: publicStringSchema.optional(),
+    raw_next_page_token: publicStringSchema.optional(),
+    page_size: z.number().int().positive().max(200).optional(),
+    requested_pages: z.number().int().positive().max(500).optional(),
     mode: z
       .enum([
         "todo",
@@ -781,30 +743,24 @@ const queryInputPublicSchema = z
         "cc"
       ])
       .optional(),
-    type: z.union([z.number().int().min(1).max(12), stringLikeSchema]).optional(),
+    type: z.number().int().min(1).max(12).optional(),
     keyword: z.string().optional(),
-    query_logic: z.union([z.enum(["and", "or"]), stringLikeSchema]).optional(),
-    apply_ids: z.union([z.array(z.union([z.string(), z.number()])), stringLikeSchema]).optional(),
-    sort: z.union([z.array(publicSortItemSchema), stringLikeSchema]).optional(),
-    filters: z.union([z.array(publicFilterItemSchema), stringLikeSchema]).optional(),
-    max_rows: positiveIntLikeSchema(200).optional(),
-    max_items: positiveIntLikeSchema(200).optional(),
-    max_columns: positiveIntLikeSchema(MAX_COLUMN_LIMIT).optional(),
-    select_columns: z
-      .union([
-        z.array(columnReferenceLikeSchema).min(1).max(MAX_COLUMN_LIMIT),
-        stringLikeSchema
-      ])
-      .optional(),
-    include_answers: booleanLikeSchema.optional(),
-    amount_column: z.union([columnReferenceLikeSchema, stringLikeSchema]).optional(),
-    time_range: z.union([publicTimeRangeSchema, stringLikeSchema]).optional(),
-    stat_policy: z.union([publicStatPolicySchema, stringLikeSchema]).optional(),
-    scan_max_pages: positiveIntLikeSchema(500).optional(),
-    strict_full: booleanLikeSchema.optional(),
-    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional()
+    query_logic: z.enum(["and", "or"]).optional(),
+    apply_ids: z.array(z.union([z.string(), z.number()])).optional(),
+    sort: z.array(publicSortItemSchema).optional(),
+    filters: z.array(publicFilterItemSchema).optional(),
+    max_rows: z.number().int().positive().max(200).optional(),
+    max_items: z.number().int().positive().max(200).optional(),
+    max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
+    select_columns: z.array(publicFieldSelectorSchema).min(1).max(MAX_COLUMN_LIMIT),
+    include_answers: z.boolean().optional(),
+    amount_column: publicFieldSelectorSchema.optional(),
+    time_range: publicTimeRangeSchema.optional(),
+    stat_policy: publicStatPolicySchema.optional(),
+    scan_max_pages: z.number().int().positive().max(500).optional(),
+    strict_full: z.boolean().optional(),
+    output_profile: outputProfileSchema.optional()
   })
-  .passthrough()
 
 const queryInputSchema = z
   .preprocess(
@@ -961,13 +917,14 @@ const queryOutputSchema = querySuccessOutputSchema
 
 const aggregateInputPublicSchema = z
   .object({
-    app_key: stringLikeSchema.optional(),
-    user_id: stringLikeSchema.optional(),
-    page_num: positiveIntLikeSchema().optional(),
-    page_token: stringLikeSchema.optional(),
-    page_size: positiveIntLikeSchema(200).optional(),
-    requested_pages: positiveIntLikeSchema(500).optional(),
-    scan_max_pages: positiveIntLikeSchema(500).optional(),
+    app_key: publicStringSchema,
+    user_id: publicStringSchema.optional(),
+    page_num: z.number().int().positive().optional(),
+    page_token: publicStringSchema.optional(),
+    raw_next_page_token: publicStringSchema.optional(),
+    page_size: z.number().int().positive().max(200).optional(),
+    requested_pages: z.number().int().positive().max(500).optional(),
+    scan_max_pages: z.number().int().positive().max(500).optional(),
     mode: z
       .enum([
         "todo",
@@ -984,33 +941,23 @@ const aggregateInputPublicSchema = z
         "cc"
       ])
       .optional(),
-    type: z.union([z.number().int().min(1).max(12), stringLikeSchema]).optional(),
+    type: z.number().int().min(1).max(12).optional(),
     keyword: z.string().optional(),
-    query_logic: z.union([z.enum(["and", "or"]), stringLikeSchema]).optional(),
-    apply_ids: z.union([z.array(z.union([z.string(), z.number()])), stringLikeSchema]).optional(),
-    sort: z.union([z.array(publicSortItemSchema), stringLikeSchema]).optional(),
-    filters: z.union([z.array(publicFilterItemSchema), stringLikeSchema]).optional(),
-    time_range: z.union([publicTimeRangeSchema, stringLikeSchema]).optional(),
-    group_by: z
-      .union([z.array(columnReferenceLikeSchema).min(1).max(20), stringLikeSchema])
-      .optional(),
-    amount_column: z.union([columnReferenceLikeSchema, stringLikeSchema]).optional(),
-    amount_columns: z
-      .union([z.array(columnReferenceLikeSchema).min(1).max(5), stringLikeSchema])
-      .optional(),
-    metrics: z
-      .union([
-        z.array(z.enum(["count", "sum", "avg", "min", "max"])).min(1).max(5),
-        stringLikeSchema
-      ])
-      .optional(),
-    time_bucket: z.union([z.enum(["day", "week", "month"]), stringLikeSchema]).optional(),
-    stat_policy: z.union([publicStatPolicySchema, stringLikeSchema]).optional(),
-    max_groups: positiveIntLikeSchema(2000).optional(),
-    strict_full: booleanLikeSchema.optional(),
-    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional()
+    query_logic: z.enum(["and", "or"]).optional(),
+    apply_ids: z.array(z.union([z.string(), z.number()])).optional(),
+    sort: z.array(publicSortItemSchema).optional(),
+    filters: z.array(publicFilterItemSchema).optional(),
+    time_range: publicTimeRangeSchema.optional(),
+    group_by: z.array(publicFieldSelectorSchema).min(1).max(20),
+    amount_column: publicFieldSelectorSchema.optional(),
+    amount_columns: z.array(publicFieldSelectorSchema).min(1).max(5).optional(),
+    metrics: z.array(z.enum(["count", "sum", "avg", "min", "max"])).min(1).max(5).optional(),
+    time_bucket: z.enum(["day", "week", "month"]).optional(),
+    stat_policy: publicStatPolicySchema.optional(),
+    max_groups: z.number().int().positive().max(2000).optional(),
+    strict_full: z.boolean().optional(),
+    output_profile: outputProfileSchema.optional()
   })
-  .passthrough()
 
 const aggregateInputSchema = z
   .preprocess(
@@ -1142,13 +1089,12 @@ const aggregateOutputSchema = z.object({
 
 const fieldResolveInputPublicSchema = z
   .object({
-    app_key: stringLikeSchema.optional(),
-    query: columnSelectorLikeSchema.optional(),
-    queries: z.union([z.array(columnSelectorLikeSchema).min(1).max(50), stringLikeSchema]).optional(),
-    top_k: positiveIntLikeSchema(10).optional(),
-    fuzzy: booleanLikeSchema.optional()
+    app_key: publicStringSchema,
+    query: publicFieldSelectorSchema.optional(),
+    queries: z.array(publicFieldSelectorSchema).min(1).max(50).optional(),
+    top_k: z.number().int().positive().max(10).optional(),
+    fuzzy: z.boolean().optional()
   })
-  .passthrough()
 
 const fieldResolveInputSchema = z.preprocess(
   normalizeFieldResolveInput,
@@ -1188,12 +1134,11 @@ const fieldResolveOutputSchema = z.object({
 
 const queryPlanInputPublicSchema = z
   .object({
-    tool: stringLikeSchema.optional(),
-    arguments: z.union([z.record(z.unknown()), stringLikeSchema]).optional(),
-    resolve_fields: booleanLikeSchema.optional(),
-    probe: booleanLikeSchema.optional()
+    tool: publicStringSchema,
+    arguments: z.record(z.unknown()).optional(),
+    resolve_fields: z.boolean().optional(),
+    probe: z.boolean().optional()
   })
-  .passthrough()
 
 const queryPlanInputSchema = z.preprocess(
   normalizeQueryPlanInput,
@@ -1253,19 +1198,13 @@ const queryPlanOutputSchema = z.object({
 
 const batchGetInputPublicSchema = z
   .object({
-    app_key: stringLikeSchema.optional(),
-    user_id: stringLikeSchema.optional(),
-    apply_ids: z.union([z.array(columnSelectorLikeSchema).min(1).max(200), stringLikeSchema]).optional(),
-    select_columns: z
-      .union([
-        z.array(columnReferenceLikeSchema).min(1).max(MAX_COLUMN_LIMIT),
-        stringLikeSchema
-      ])
-      .optional(),
-    max_columns: positiveIntLikeSchema(MAX_COLUMN_LIMIT).optional(),
-    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional()
+    app_key: publicStringSchema,
+    user_id: publicStringSchema.optional(),
+    apply_ids: z.array(publicFieldSelectorSchema).min(1).max(200),
+    select_columns: z.array(publicFieldSelectorSchema).min(1).max(MAX_COLUMN_LIMIT),
+    max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
+    output_profile: outputProfileSchema.optional()
   })
-  .passthrough()
 
 const batchGetInputSchema = z.preprocess(
   normalizeBatchGetInput,
@@ -1305,13 +1244,14 @@ const batchGetOutputSchema = z.object({
 
 const exportInputPublicSchema = z
   .object({
-    app_key: stringLikeSchema.optional(),
-    user_id: stringLikeSchema.optional(),
-    page_num: positiveIntLikeSchema().optional(),
-    page_token: stringLikeSchema.optional(),
-    page_size: positiveIntLikeSchema(200).optional(),
-    requested_pages: positiveIntLikeSchema(500).optional(),
-    scan_max_pages: positiveIntLikeSchema(500).optional(),
+    app_key: publicStringSchema,
+    user_id: publicStringSchema.optional(),
+    page_num: z.number().int().positive().optional(),
+    page_token: publicStringSchema.optional(),
+    raw_next_page_token: publicStringSchema.optional(),
+    page_size: z.number().int().positive().max(200).optional(),
+    requested_pages: z.number().int().positive().max(500).optional(),
+    scan_max_pages: z.number().int().positive().max(500).optional(),
     mode: z
       .enum([
         "todo",
@@ -1328,27 +1268,21 @@ const exportInputPublicSchema = z
         "cc"
       ])
       .optional(),
-    type: z.union([z.number().int().min(1).max(12), stringLikeSchema]).optional(),
+    type: z.number().int().min(1).max(12).optional(),
     keyword: z.string().optional(),
-    query_logic: z.union([z.enum(["and", "or"]), stringLikeSchema]).optional(),
-    apply_ids: z.union([z.array(z.union([z.string(), z.number()])), stringLikeSchema]).optional(),
-    sort: z.union([z.array(publicSortItemSchema), stringLikeSchema]).optional(),
-    filters: z.union([z.array(publicFilterItemSchema), stringLikeSchema]).optional(),
-    time_range: z.union([publicTimeRangeSchema, stringLikeSchema]).optional(),
-    max_rows: positiveIntLikeSchema(EXPORT_MAX_ROWS).optional(),
-    max_columns: positiveIntLikeSchema(MAX_COLUMN_LIMIT).optional(),
-    select_columns: z
-      .union([
-        z.array(columnReferenceLikeSchema).min(1).max(MAX_COLUMN_LIMIT),
-        stringLikeSchema
-      ])
-      .optional(),
-    strict_full: booleanLikeSchema.optional(),
-    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional(),
-    export_dir: stringLikeSchema.optional(),
-    file_name: stringLikeSchema.optional()
+    query_logic: z.enum(["and", "or"]).optional(),
+    apply_ids: z.array(z.union([z.string(), z.number()])).optional(),
+    sort: z.array(publicSortItemSchema).optional(),
+    filters: z.array(publicFilterItemSchema).optional(),
+    time_range: publicTimeRangeSchema.optional(),
+    max_rows: z.number().int().positive().max(EXPORT_MAX_ROWS).optional(),
+    max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
+    select_columns: z.array(publicFieldSelectorSchema).min(1).max(MAX_COLUMN_LIMIT),
+    strict_full: z.boolean().optional(),
+    output_profile: outputProfileSchema.optional(),
+    export_dir: publicStringSchema.optional(),
+    file_name: publicStringSchema.optional()
   })
-  .passthrough()
 
 const exportInputSchema = z.preprocess(
   normalizeExportInput,
@@ -2508,12 +2442,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       required: [],
       limits: {
         tool_name: "optional; when omitted returns all tool specs",
-        include_all: "default=false; true returns all specs even when tool_name is set"
+        include_all: "default=false; true returns all specs even when tool_name is set",
+        input_contract: "strict JSON only; booleans must use native JSON boolean"
       },
-      aliases: collectAliasHints(["tool_name", "include_all"], {
-        tool_name: ["tool", "name", "toolName"],
-        include_all: ["includeAll"]
-      }),
+      aliases: {},
       minimal_example: {
         tool_name: "qf_records_list"
       }
@@ -2548,13 +2480,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       required: ["app_key", "query or queries"],
       limits: {
         query_count_max: 50,
-        top_k_max: 10
+        top_k_max: 10,
+        input_contract: "strict JSON only; queries must be native array when provided"
       },
-      aliases: collectAliasHints(["app_key"], {
-        query: ["field", "name"],
-        queries: ["fields", "names"],
-        top_k: ["topK"]
-      }),
+      aliases: {},
       minimal_example: {
         app_key: "21b3d559",
         queries: ["客户名称", "报价总金额"],
@@ -2566,13 +2495,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       required: ["tool"],
       limits: {
         tool:
-          "qf_records_list|qf_record_get|qf_query|qf_records_aggregate|qf_records_batch_get|qf_export_csv|qf_export_json"
+          "qf_records_list|qf_record_get|qf_query|qf_records_aggregate|qf_records_batch_get|qf_export_csv|qf_export_json",
+        input_contract: "strict JSON only; arguments must be a native JSON object"
       },
-      aliases: collectAliasHints([], {
-        arguments: ["args"],
-        resolve_fields: ["resolveFields"],
-        probe: ["withProbe"]
-      }),
+      aliases: {},
       minimal_example: {
         tool: "qf_query",
         arguments: {
@@ -2594,32 +2520,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         max_items_max: 200,
         max_columns_max: MAX_COLUMN_LIMIT,
         select_columns_max: MAX_COLUMN_LIMIT,
-        output_profile: "compact|verbose (default compact)"
+        output_profile: "compact|verbose (default compact)",
+        input_contract: "strict JSON only; numbers/arrays/objects/booleans must use native JSON types"
       },
-      aliases: collectAliasHints(
-        [
-          "app_key",
-          "user_id",
-          "page_num",
-          "page_token",
-          "page_size",
-          "requested_pages",
-          "scan_max_pages",
-          "max_rows",
-          "max_items",
-          "max_columns",
-          "select_columns",
-          "output_profile",
-          "strict_full",
-          "include_answers",
-          "time_range"
-        ],
-        {
-          select_columns: ["columns", "selected_columns", "selectedColumns"],
-          max_rows: ["limit", "row_limit", "rowLimit"],
-          output_profile: ["outputProfile", "responseProfile", "profile"]
-        }
-      ),
+      aliases: {},
       minimal_example: {
         app_key: "21b3d559",
         mode: "all",
@@ -2635,15 +2539,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       limits: {
         max_columns_max: MAX_COLUMN_LIMIT,
         select_columns_max: MAX_COLUMN_LIMIT,
-        output_profile: "compact|verbose (default compact)"
+        output_profile: "compact|verbose (default compact)",
+        input_contract: "strict JSON only; select_columns must be a native array"
       },
-      aliases: collectAliasHints(
-        ["apply_id", "max_columns", "select_columns", "output_profile"],
-        {
-          select_columns: ["columns", "selected_columns", "selectedColumns"],
-          output_profile: ["outputProfile", "responseProfile", "profile"]
-        }
-      ),
+      aliases: {},
       minimal_example: {
         apply_id: "497600278750478338",
         select_columns: [0, "客户名称"],
@@ -2657,15 +2556,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       limits: {
         apply_ids_max: 200,
         max_columns_max: MAX_COLUMN_LIMIT,
-        select_columns_max: MAX_COLUMN_LIMIT
+        select_columns_max: MAX_COLUMN_LIMIT,
+        input_contract: "strict JSON only; apply_ids/select_columns must be native arrays"
       },
-      aliases: collectAliasHints(
-        ["app_key", "apply_ids", "select_columns", "max_columns", "output_profile"],
-        {
-          select_columns: ["columns", "selected_columns", "selectedColumns"],
-          output_profile: ["outputProfile", "responseProfile", "profile"]
-        }
-      ),
+      aliases: {},
       minimal_example: {
         app_key: "21b3d559",
         apply_ids: ["497600278750478338", "497600278750478339"],
@@ -2681,30 +2575,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         scan_max_pages_max: 500,
         max_rows_max: EXPORT_MAX_ROWS,
         max_columns_max: MAX_COLUMN_LIMIT,
-        select_columns_max: MAX_COLUMN_LIMIT
+        select_columns_max: MAX_COLUMN_LIMIT,
+        input_contract: "strict JSON only; select_columns/time_range must use native JSON types"
       },
-      aliases: collectAliasHints(
-        [
-          "app_key",
-          "page_num",
-          "page_token",
-          "page_size",
-          "requested_pages",
-          "scan_max_pages",
-          "max_rows",
-          "max_columns",
-          "select_columns",
-          "file_name",
-          "export_dir",
-          "output_profile"
-        ],
-        {
-          select_columns: ["columns", "selected_columns", "selectedColumns"],
-          output_profile: ["outputProfile", "responseProfile", "profile"],
-          file_name: ["filename"],
-          export_dir: ["output_dir", "outputDir"]
-        }
-      ),
+      aliases: {},
       minimal_example: {
         app_key: "21b3d559",
         mode: "all",
@@ -2723,30 +2597,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         scan_max_pages_max: 500,
         max_rows_max: EXPORT_MAX_ROWS,
         max_columns_max: MAX_COLUMN_LIMIT,
-        select_columns_max: MAX_COLUMN_LIMIT
+        select_columns_max: MAX_COLUMN_LIMIT,
+        input_contract: "strict JSON only; select_columns/time_range must use native JSON types"
       },
-      aliases: collectAliasHints(
-        [
-          "app_key",
-          "page_num",
-          "page_token",
-          "page_size",
-          "requested_pages",
-          "scan_max_pages",
-          "max_rows",
-          "max_columns",
-          "select_columns",
-          "file_name",
-          "export_dir",
-          "output_profile"
-        ],
-        {
-          select_columns: ["columns", "selected_columns", "selectedColumns"],
-          output_profile: ["outputProfile", "responseProfile", "profile"],
-          file_name: ["filename"],
-          export_dir: ["output_dir", "outputDir"]
-        }
-      ),
+      aliases: {},
       minimal_example: {
         app_key: "21b3d559",
         mode: "all",
@@ -2772,36 +2626,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         max_items_max: 200,
         max_columns_max: MAX_COLUMN_LIMIT,
         select_columns_max: MAX_COLUMN_LIMIT,
-        output_profile: "compact|verbose (default compact)"
+        output_profile: "compact|verbose (default compact)",
+        input_contract: "strict JSON only; select_columns/time_range/stat_policy must use native JSON types"
       },
-      aliases: collectAliasHints(
-        [
-          "query_mode",
-          "app_key",
-          "apply_id",
-          "page_num",
-          "page_token",
-          "page_size",
-          "requested_pages",
-          "scan_max_pages",
-          "max_rows",
-          "max_items",
-          "max_columns",
-          "select_columns",
-          "output_profile",
-          "amount_column",
-          "time_range",
-          "stat_policy",
-          "strict_full"
-        ],
-        {
-          select_columns: ["columns", "selected_columns", "selectedColumns"],
-          max_rows: ["limit", "row_limit", "rowLimit"],
-          amount_column: ["amount_que_ids", "amountQueIds", "amountColumns"],
-          time_range: ["date_field + date_from + date_to"],
-          output_profile: ["outputProfile", "responseProfile", "profile"]
-        }
-      ),
+      aliases: {},
       minimal_example: {
         query_mode: "list",
         app_key: "21b3d559",
@@ -2828,33 +2656,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         group_by_max: 20,
         metrics_supported: ["count", "sum", "avg", "min", "max"],
         time_bucket_supported: ["day", "week", "month"],
-        output_profile: "compact|verbose (default compact)"
+        output_profile: "compact|verbose (default compact)",
+        input_contract: "strict JSON only; group_by/amount_columns/time_range must use native JSON types"
       },
-      aliases: collectAliasHints(
-        [
-          "app_key",
-          "group_by",
-          "amount_column",
-          "amount_columns",
-          "metrics",
-          "time_bucket",
-          "page_num",
-          "page_token",
-          "page_size",
-          "requested_pages",
-          "scan_max_pages",
-          "output_profile",
-          "time_range",
-          "stat_policy",
-          "strict_full"
-        ],
-        {
-          amount_column: ["amount_que_ids", "amountQueIds", "amountColumns"],
-          time_range: ["date_field + date_from + date_to"],
-          time_bucket: ["timeBucket", "bucket"],
-          output_profile: ["outputProfile", "responseProfile", "profile"]
-        }
-      ),
+      aliases: {},
       minimal_example: {
         app_key: "21b3d559",
         mode: "all",
@@ -2877,9 +2682,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       tool: "qf_record_create",
       required: ["app_key", "answers or fields"],
       limits: {
-        write_mode: "Provide either answers[] or fields{}"
+        write_mode: "Provide either answers[] or fields{}",
+        input_contract: "strict JSON only; answers must be array and fields must be object"
       },
-      aliases: collectAliasHints(["app_key", "user_id", "force_refresh_form", "apply_user"], {}),
+      aliases: {},
       minimal_example: {
         app_key: "21b3d559",
         fields: {
@@ -2892,9 +2698,10 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       tool: "qf_record_update",
       required: ["apply_id", "answers or fields"],
       limits: {
-        write_mode: "Provide either answers[] or fields{}"
+        write_mode: "Provide either answers[] or fields{}",
+        input_contract: "strict JSON only; answers must be array and fields must be object"
       },
-      aliases: collectAliasHints(["apply_id", "app_key", "user_id", "force_refresh_form"], {}),
+      aliases: {},
       minimal_example: {
         apply_id: "497600278750478338",
         app_key: "21b3d559",

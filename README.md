@@ -207,7 +207,13 @@ Deterministic read protocol (list/summary/aggregate):
 4. `strict_full=true` makes incomplete results fail fast with `NEED_MORE_DATA`.
    - for `qf_query(summary)`, `strict_full` enforces raw source scan completeness; sample rows may still be capped by `max_rows`, which is reflected by `output_page_complete=false`
 5. Error payloads expose `error_code` and `fix_hint` for actionable retries.
-6. Parameter tolerance supports stringified JSON and numeric/boolean strings for key query fields.
+6. Public MCP `inputSchema` is strict:
+   - numbers must be native JSON numbers
+   - arrays must be native JSON arrays
+   - objects must be native JSON objects
+   - booleans must be native JSON booleans
+   - unknown fields are rejected by the MCP boundary
+7. Use `qf_query_plan` as the only preflight tool when the agent is unsure about arguments. It can normalize loose/model-shaped inputs before a real query is issued.
 
 For `qf_query(summary)` and `qf_records_aggregate`, read `data.summary.completeness` / `data.completeness` before concluding:
 

@@ -18,11 +18,11 @@
    - `select_columns` 最大 `2`
    - `max_columns` 最大 `2`
    - 导出工具 `max_rows` 最大 `10000`（`QINGFLOW_EXPORT_MAX_ROWS`）
-5. 参数容错（P0）：
-   - 支持字符串化 JSON 自动反序列化（如 `select_columns` / `filters` / `group_by`）
-   - 支持双层字符串化 JSON 反序列化（如 `select_columns: "\"[1001,1002]\""`)
-   - 数字字符串自动转 number（如 `max_rows: \"50\"`）
-   - 布尔字符串自动转 boolean（如 `strict_full: \"true\"`）
+5. 参数契约（P1）：
+   - 正式执行工具遵循严格 JSON 契约：number 就是 number，array 就是 array，object 就是 object，boolean 就是 boolean
+   - `additionalProperties=false` 的工具会拒绝未知字段
+   - 不要把数组、对象、数字、布尔写成字符串
+   - 若模型暂时拿不准参数形状，先调用 `qf_query_plan` 做预检，再执行正式工具
 6. 超时保护（P0）：
    - 默认单次上游请求超时：`QINGFLOW_REQUEST_TIMEOUT_MS=18000`
    - 默认工具执行预算：`QINGFLOW_EXECUTION_BUDGET_MS=20000`
@@ -117,6 +117,16 @@
 - 可选：`top_k`, `fuzzy`
 
 ## 6.4 `qf_query_plan`
+
+用途：预检查询参数、字段映射、页数预算与完整性风险；这是唯一允许“先纠偏再执行”的工具。
+
+关键入参：
+- 必填：`tool_name`
+- 可选：`args`
+
+调用要求：
+- 当你不确定字段 id、参数类型、扫描预算是否够用时，先调用 `qf_query_plan`
+- 正式工具不要依赖字符串化参数容错；如果参数不是原生 JSON，MCP 边界会直接拒绝
 
 用途：执行前预检（参数归一化、必填检查、字段映射、扫描规模估算）。
 
