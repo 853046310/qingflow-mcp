@@ -108,7 +108,7 @@ npm i -g git+https://github.com/853046310/qingflow-mcp.git
 Install from npm (pinned version):
 
 ```bash
-npm i -g qingflow-mcp@0.3.13
+npm i -g qingflow-mcp@0.3.14
 ```
 
 Or one-click installer:
@@ -214,7 +214,7 @@ For `qf_query(summary)` and `qf_records_aggregate`, read `data.summary.completen
 1. `raw_scan_complete=false`: source data is not fully scanned, do not produce a final conclusion.
 2. `scan_limit_hit=true`: query stopped because scan budget was hit.
 3. `output_page_complete=false`: source may be complete, but output was truncated by `max_rows` or `max_groups`.
-4. `raw_next_page_token`: use this token to continue raw scan pagination (`next_page_token` remains as a backward-compatible alias).
+4. `raw_next_page_token`: use this token to continue raw scan pagination (`next_page_token` remains as a backward-compatible alias). For `qf_query(summary)` / `qf_records_aggregate`, the token carries cumulative state, so keep query arguments unchanged when resuming.
 
 ## List Query Tips
 

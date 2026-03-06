@@ -51,7 +51,7 @@
 - `scanned_pages`: 实际扫描页数
 - `scan_limit`: 本次扫描页上限
 - `output_page_complete`: 当前输出层是否完整
-- `raw_next_page_token`: 底层源扫描续拉 token
+- `raw_next_page_token`: 底层源扫描续拉 token；对 `qf_query(summary)` / `qf_records_aggregate` 来说，它会携带累计状态，续拉时必须保持查询参数不变
 - `output_next_page_token`: 输出层分页 token（当前一般为 `null`）
 - `stop_reason`: 停止原因（如 `source_exhausted` / `execution_budget` / `adaptive_budget`）
 
@@ -129,6 +129,8 @@
 - `validation`（`valid`/`missing_required`/`warnings`）
 - `field_mapping`
 - `estimate`（页规模和命中上限风险）
+- `ready_for_final_conclusion`（当前计划是否适合直接产出最终结论）
+- `final_conclusion_blockers` / `recommended_next_actions`
 
 ## 6.5 `qf_records_list`
 

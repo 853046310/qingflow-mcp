@@ -64,7 +64,50 @@ interface ContinuationTokenPayload {
   app_key: string
   next_page_num: number
   page_size: number
+  resume_kind?: "summary" | "aggregate"
+  resume_id?: string
 }
+
+interface SummaryContinuationState {
+  query_id: string
+  query_fingerprint: string
+  scanned_records: number
+  total_amount: number
+  missing_count: number
+  by_day: Array<[string, { count: number; amount: number }]>
+  rows: Array<Record<string, unknown>>
+  source_pages: number[]
+  scan_limit_total: number
+}
+
+interface AggregateContinuationState {
+  query_id: string
+  query_fingerprint: string
+  scanned_records: number
+  total_amount: number
+  source_pages: number[]
+  scan_limit_total: number
+  group_stats: Array<{
+    key: string
+    group: Record<string, unknown>
+    count: number
+    amount: number
+    metrics: Array<[string, AggregateMetricAccumulator]>
+  }>
+  summary_metric_stats: Array<[string, AggregateMetricAccumulator]>
+}
+
+type ContinuationCacheEntry =
+  | {
+      expiresAt: number
+      kind: "summary"
+      state: SummaryContinuationState
+    }
+  | {
+      expiresAt: number
+      kind: "aggregate"
+      state: AggregateContinuationState
+    }
 
 class NeedMoreDataError extends Error {
   public readonly code = "NEED_MORE_DATA"
@@ -98,6 +141,9 @@ class InputValidationError extends Error {
 
 const FORM_CACHE_TTL_MS = Number(process.env.QINGFLOW_FORM_CACHE_TTL_MS ?? "300000")
 const formCache = new Map<string, FormCacheEntry>()
+const CONTINUATION_CACHE_TTL_MS =
+  Number(process.env.QINGFLOW_CONTINUATION_CACHE_TTL_MS ?? "900000")
+const continuationCache = new Map<string, ContinuationCacheEntry>()
 const DEFAULT_PAGE_SIZE = 50
 const DEFAULT_SCAN_MAX_PAGES = 10
 const DEFAULT_ROW_LIMIT = 200
@@ -114,7 +160,7 @@ const ADAPTIVE_TARGET_PAGE_MS = toPositiveInt(process.env.QINGFLOW_ADAPTIVE_TARG
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
-const SERVER_VERSION = "0.3.13"
+const SERVER_VERSION = "0.3.14"
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -305,6 +351,87 @@ const formSuccessOutputSchema = z.object({
 })
 const formOutputSchema = formSuccessOutputSchema
 
+const stringLikeSchema = z.string().min(1)
+const columnSelectorLikeSchema = z.union([stringLikeSchema, z.number().int()])
+const columnReferenceLikeSchema = z.union([
+  columnSelectorLikeSchema,
+  z
+    .object({
+      que_id: columnSelectorLikeSchema.optional(),
+      queId: columnSelectorLikeSchema.optional()
+    })
+    .passthrough()
+])
+const booleanLikeSchema = z.union([z.boolean(), stringLikeSchema])
+
+function positiveIntLikeSchema(max?: number) {
+  const base = z.number().int().positive()
+  return z.union([max !== undefined ? base.max(max) : base, stringLikeSchema])
+}
+
+function nonNegativeIntLikeSchema(max?: number) {
+  const base = z.number().int().nonnegative()
+  return z.union([max !== undefined ? base.max(max) : base, stringLikeSchema])
+}
+
+const publicSortItemSchema = z
+  .object({
+    que_id: columnSelectorLikeSchema,
+    ascend: booleanLikeSchema.optional()
+  })
+  .passthrough()
+
+const publicFilterItemSchema = z
+  .object({
+    que_id: columnSelectorLikeSchema.optional(),
+    search_key: stringLikeSchema.optional(),
+    search_keys: z.union([z.array(stringLikeSchema), stringLikeSchema]).optional(),
+    min_value: stringLikeSchema.optional(),
+    max_value: stringLikeSchema.optional(),
+    scope: z.union([z.number().int(), stringLikeSchema]).optional(),
+    search_options: z.union([z.array(columnSelectorLikeSchema), stringLikeSchema]).optional(),
+    search_user_ids: z.union([z.array(stringLikeSchema), stringLikeSchema]).optional()
+  })
+  .passthrough()
+
+const publicTimeRangeSchema = z
+  .object({
+    column: columnSelectorLikeSchema,
+    from: stringLikeSchema.optional(),
+    to: stringLikeSchema.optional(),
+    timezone: stringLikeSchema.optional()
+  })
+  .passthrough()
+
+const publicStatPolicySchema = z
+  .object({
+    include_negative: booleanLikeSchema.optional(),
+    include_null: booleanLikeSchema.optional()
+  })
+  .passthrough()
+
+const publicAnswerInputSchema = z
+  .object({
+    que_id: columnSelectorLikeSchema.optional(),
+    queId: columnSelectorLikeSchema.optional(),
+    que_title: stringLikeSchema.optional(),
+    queTitle: stringLikeSchema.optional(),
+    que_type: z.unknown().optional(),
+    queType: z.unknown().optional(),
+    value: z.unknown().optional(),
+    values: z.union([z.array(z.unknown()), stringLikeSchema]).optional(),
+    table_values: z.union([z.array(z.array(z.unknown())), stringLikeSchema]).optional(),
+    tableValues: z.union([z.array(z.array(z.unknown())), stringLikeSchema]).optional()
+  })
+  .passthrough()
+
+const toolSpecInputPublicSchema = z
+  .object({
+    tool_name: stringLikeSchema.optional(),
+    include_all: booleanLikeSchema.optional()
+  })
+  .passthrough()
+
 const toolSpecInputSchema = z.preprocess(
   normalizeToolSpecInput,
   z.object({
@@ -333,6 +460,53 @@ const toolSpecOutputSchema = z.object({
     generated_at: z.string()
   })
 })
+
+const listInputPublicSchema = z
+  .object({
+    app_key: stringLikeSchema.optional(),
+    user_id: stringLikeSchema.optional(),
+    page_num: positiveIntLikeSchema().optional(),
+    page_token: stringLikeSchema.optional(),
+    page_size: positiveIntLikeSchema(200).optional(),
+    requested_pages: positiveIntLikeSchema(500).optional(),
+    scan_max_pages: positiveIntLikeSchema(500).optional(),
+    mode: z
+      .enum([
+        "todo",
+        "done",
+        "mine_approved",
+        "mine_rejected",
+        "mine_draft",
+        "mine_need_improve",
+        "mine_processing",
+        "all",
+        "all_approved",
+        "all_rejected",
+        "all_processing",
+        "cc"
+      ])
+      .optional(),
+    type: z.union([z.number().int().min(1).max(12), stringLikeSchema]).optional(),
+    keyword: z.string().optional(),
+    query_logic: z.union([z.enum(["and", "or"]), stringLikeSchema]).optional(),
+    apply_ids: z.union([z.array(z.union([z.string(), z.number()])), stringLikeSchema]).optional(),
+    sort: z.union([z.array(publicSortItemSchema), stringLikeSchema]).optional(),
+    filters: z.union([z.array(publicFilterItemSchema), stringLikeSchema]).optional(),
+    time_range: z.union([publicTimeRangeSchema, stringLikeSchema]).optional(),
+    max_rows: positiveIntLikeSchema(200).optional(),
+    max_items: positiveIntLikeSchema(200).optional(),
+    max_columns: positiveIntLikeSchema(MAX_COLUMN_LIMIT).optional(),
+    select_columns: z
+      .union([
+        z.array(columnReferenceLikeSchema).min(1).max(MAX_COLUMN_LIMIT),
+        stringLikeSchema
+      ])
+      .optional(),
+    include_answers: booleanLikeSchema.optional(),
+    strict_full: booleanLikeSchema.optional(),
+    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional()
+  })
+  .passthrough()
 
 const listInputSchema = z
   .preprocess(
@@ -443,6 +617,20 @@ const listSuccessOutputSchema = z.object({
 })
 const listOutputSchema = listSuccessOutputSchema
 
+const recordGetInputPublicSchema = z
+  .object({
+    apply_id: columnSelectorLikeSchema.optional(),
+    max_columns: positiveIntLikeSchema(MAX_COLUMN_LIMIT).optional(),
+    select_columns: z
+      .union([
+        z.array(columnReferenceLikeSchema).min(1).max(MAX_COLUMN_LIMIT),
+        stringLikeSchema
+      ])
+      .optional(),
+    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional()
+  })
+  .passthrough()
+
 const recordGetInputSchema = z.preprocess(
   normalizeRecordGetInput,
   z.object({
@@ -480,6 +668,17 @@ const recordGetSuccessOutputSchema = z.object({
 })
 const recordGetOutputSchema = recordGetSuccessOutputSchema
 
+const createInputPublicSchema = z
+  .object({
+    app_key: stringLikeSchema.optional(),
+    user_id: stringLikeSchema.optional(),
+    force_refresh_form: booleanLikeSchema.optional(),
+    apply_user: z.union([z.record(z.unknown()), stringLikeSchema]).optional(),
+    answers: z.union([z.array(publicAnswerInputSchema), stringLikeSchema]).optional(),
+    fields: z.union([z.record(z.unknown()), stringLikeSchema]).optional()
+  })
+  .passthrough()
+
 const createInputSchema = z
   .object({
     app_key: z.string().min(1),
@@ -510,6 +709,17 @@ const createSuccessOutputSchema = z.object({
   meta: apiMetaSchema
 })
 const createOutputSchema = createSuccessOutputSchema
+
+const updateInputPublicSchema = z
+  .object({
+    apply_id: columnSelectorLikeSchema.optional(),
+    app_key: stringLikeSchema.optional(),
+    user_id: stringLikeSchema.optional(),
+    force_refresh_form: booleanLikeSchema.optional(),
+    answers: z.union([z.array(publicAnswerInputSchema), stringLikeSchema]).optional(),
+    fields: z.union([z.record(z.unknown()), stringLikeSchema]).optional()
+  })
+  .passthrough()
 
 const updateInputSchema = z
   .object({
@@ -544,6 +754,57 @@ const operationSuccessOutputSchema = z.object({
   meta: apiMetaSchema
 })
 const operationOutputSchema = operationSuccessOutputSchema
+
+const queryInputPublicSchema = z
+  .object({
+    query_mode: z.union([z.enum(["auto", "list", "record", "summary"]), stringLikeSchema]).optional(),
+    app_key: stringLikeSchema.optional(),
+    apply_id: columnSelectorLikeSchema.optional(),
+    user_id: stringLikeSchema.optional(),
+    page_num: positiveIntLikeSchema().optional(),
+    page_token: stringLikeSchema.optional(),
+    page_size: positiveIntLikeSchema(200).optional(),
+    requested_pages: positiveIntLikeSchema(500).optional(),
+    mode: z
+      .enum([
+        "todo",
+        "done",
+        "mine_approved",
+        "mine_rejected",
+        "mine_draft",
+        "mine_need_improve",
+        "mine_processing",
+        "all",
+        "all_approved",
+        "all_rejected",
+        "all_processing",
+        "cc"
+      ])
+      .optional(),
+    type: z.union([z.number().int().min(1).max(12), stringLikeSchema]).optional(),
+    keyword: z.string().optional(),
+    query_logic: z.union([z.enum(["and", "or"]), stringLikeSchema]).optional(),
+    apply_ids: z.union([z.array(z.union([z.string(), z.number()])), stringLikeSchema]).optional(),
+    sort: z.union([z.array(publicSortItemSchema), stringLikeSchema]).optional(),
+    filters: z.union([z.array(publicFilterItemSchema), stringLikeSchema]).optional(),
+    max_rows: positiveIntLikeSchema(200).optional(),
+    max_items: positiveIntLikeSchema(200).optional(),
+    max_columns: positiveIntLikeSchema(MAX_COLUMN_LIMIT).optional(),
+    select_columns: z
+      .union([
+        z.array(columnReferenceLikeSchema).min(1).max(MAX_COLUMN_LIMIT),
+        stringLikeSchema
+      ])
+      .optional(),
+    include_answers: booleanLikeSchema.optional(),
+    amount_column: z.union([columnReferenceLikeSchema, stringLikeSchema]).optional(),
+    time_range: z.union([publicTimeRangeSchema, stringLikeSchema]).optional(),
+    stat_policy: z.union([publicStatPolicySchema, stringLikeSchema]).optional(),
+    scan_max_pages: positiveIntLikeSchema(500).optional(),
+    strict_full: booleanLikeSchema.optional(),
+    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional()
+  })
+  .passthrough()
 
 const queryInputSchema = z
   .preprocess(
@@ -698,6 +959,59 @@ const querySuccessOutputSchema = z.object({
 })
 const queryOutputSchema = querySuccessOutputSchema
 
+const aggregateInputPublicSchema = z
+  .object({
+    app_key: stringLikeSchema.optional(),
+    user_id: stringLikeSchema.optional(),
+    page_num: positiveIntLikeSchema().optional(),
+    page_token: stringLikeSchema.optional(),
+    page_size: positiveIntLikeSchema(200).optional(),
+    requested_pages: positiveIntLikeSchema(500).optional(),
+    scan_max_pages: positiveIntLikeSchema(500).optional(),
+    mode: z
+      .enum([
+        "todo",
+        "done",
+        "mine_approved",
+        "mine_rejected",
+        "mine_draft",
+        "mine_need_improve",
+        "mine_processing",
+        "all",
+        "all_approved",
+        "all_rejected",
+        "all_processing",
+        "cc"
+      ])
+      .optional(),
+    type: z.union([z.number().int().min(1).max(12), stringLikeSchema]).optional(),
+    keyword: z.string().optional(),
+    query_logic: z.union([z.enum(["and", "or"]), stringLikeSchema]).optional(),
+    apply_ids: z.union([z.array(z.union([z.string(), z.number()])), stringLikeSchema]).optional(),
+    sort: z.union([z.array(publicSortItemSchema), stringLikeSchema]).optional(),
+    filters: z.union([z.array(publicFilterItemSchema), stringLikeSchema]).optional(),
+    time_range: z.union([publicTimeRangeSchema, stringLikeSchema]).optional(),
+    group_by: z
+      .union([z.array(columnReferenceLikeSchema).min(1).max(20), stringLikeSchema])
+      .optional(),
+    amount_column: z.union([columnReferenceLikeSchema, stringLikeSchema]).optional(),
+    amount_columns: z
+      .union([z.array(columnReferenceLikeSchema).min(1).max(5), stringLikeSchema])
+      .optional(),
+    metrics: z
+      .union([
+        z.array(z.enum(["count", "sum", "avg", "min", "max"])).min(1).max(5),
+        stringLikeSchema
+      ])
+      .optional(),
+    time_bucket: z.union([z.enum(["day", "week", "month"]), stringLikeSchema]).optional(),
+    stat_policy: z.union([publicStatPolicySchema, stringLikeSchema]).optional(),
+    max_groups: positiveIntLikeSchema(2000).optional(),
+    strict_full: booleanLikeSchema.optional(),
+    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional()
+  })
+  .passthrough()
+
 const aggregateInputSchema = z
   .preprocess(
     normalizeAggregateInput,
@@ -826,6 +1140,16 @@ const aggregateOutputSchema = z.object({
   meta: apiMetaSchema.optional()
 })
 
+const fieldResolveInputPublicSchema = z
+  .object({
+    app_key: stringLikeSchema.optional(),
+    query: columnSelectorLikeSchema.optional(),
+    queries: z.union([z.array(columnSelectorLikeSchema).min(1).max(50), stringLikeSchema]).optional(),
+    top_k: positiveIntLikeSchema(10).optional(),
+    fuzzy: booleanLikeSchema.optional()
+  })
+  .passthrough()
+
 const fieldResolveInputSchema = z.preprocess(
   normalizeFieldResolveInput,
   z.object({
@@ -861,6 +1185,15 @@ const fieldResolveOutputSchema = z.object({
   }),
   meta: apiMetaSchema
 })
+
+const queryPlanInputPublicSchema = z
+  .object({
+    tool: stringLikeSchema.optional(),
+    arguments: z.union([z.record(z.unknown()), stringLikeSchema]).optional(),
+    resolve_fields: booleanLikeSchema.optional(),
+    probe: booleanLikeSchema.optional()
+  })
+  .passthrough()
 
 const queryPlanInputSchema = z.preprocess(
   normalizeQueryPlanInput,
@@ -907,13 +1240,32 @@ const queryPlanOutputSchema = z.object({
           page_amount: z.number().int().nonnegative().nullable()
         })
         .nullable()
-    })
+    }),
+    ready_for_final_conclusion: z.boolean(),
+    final_conclusion_blockers: z.array(z.string()),
+    recommended_next_actions: z.array(z.string())
   }),
   meta: z.object({
     version: z.string(),
     generated_at: z.string()
   })
 })
+
+const batchGetInputPublicSchema = z
+  .object({
+    app_key: stringLikeSchema.optional(),
+    user_id: stringLikeSchema.optional(),
+    apply_ids: z.union([z.array(columnSelectorLikeSchema).min(1).max(200), stringLikeSchema]).optional(),
+    select_columns: z
+      .union([
+        z.array(columnReferenceLikeSchema).min(1).max(MAX_COLUMN_LIMIT),
+        stringLikeSchema
+      ])
+      .optional(),
+    max_columns: positiveIntLikeSchema(MAX_COLUMN_LIMIT).optional(),
+    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional()
+  })
+  .passthrough()
 
 const batchGetInputSchema = z.preprocess(
   normalizeBatchGetInput,
@@ -950,6 +1302,53 @@ const batchGetOutputSchema = z.object({
   ...queryContractFields,
   meta: apiMetaSchema.optional()
 })
+
+const exportInputPublicSchema = z
+  .object({
+    app_key: stringLikeSchema.optional(),
+    user_id: stringLikeSchema.optional(),
+    page_num: positiveIntLikeSchema().optional(),
+    page_token: stringLikeSchema.optional(),
+    page_size: positiveIntLikeSchema(200).optional(),
+    requested_pages: positiveIntLikeSchema(500).optional(),
+    scan_max_pages: positiveIntLikeSchema(500).optional(),
+    mode: z
+      .enum([
+        "todo",
+        "done",
+        "mine_approved",
+        "mine_rejected",
+        "mine_draft",
+        "mine_need_improve",
+        "mine_processing",
+        "all",
+        "all_approved",
+        "all_rejected",
+        "all_processing",
+        "cc"
+      ])
+      .optional(),
+    type: z.union([z.number().int().min(1).max(12), stringLikeSchema]).optional(),
+    keyword: z.string().optional(),
+    query_logic: z.union([z.enum(["and", "or"]), stringLikeSchema]).optional(),
+    apply_ids: z.union([z.array(z.union([z.string(), z.number()])), stringLikeSchema]).optional(),
+    sort: z.union([z.array(publicSortItemSchema), stringLikeSchema]).optional(),
+    filters: z.union([z.array(publicFilterItemSchema), stringLikeSchema]).optional(),
+    time_range: z.union([publicTimeRangeSchema, stringLikeSchema]).optional(),
+    max_rows: positiveIntLikeSchema(EXPORT_MAX_ROWS).optional(),
+    max_columns: positiveIntLikeSchema(MAX_COLUMN_LIMIT).optional(),
+    select_columns: z
+      .union([
+        z.array(columnReferenceLikeSchema).min(1).max(MAX_COLUMN_LIMIT),
+        stringLikeSchema
+      ])
+      .optional(),
+    strict_full: booleanLikeSchema.optional(),
+    output_profile: z.union([outputProfileSchema, stringLikeSchema]).optional(),
+    export_dir: stringLikeSchema.optional(),
+    file_name: stringLikeSchema.optional()
+  })
+  .passthrough()
 
 const exportInputSchema = z.preprocess(
   normalizeExportInput,
@@ -1059,7 +1458,7 @@ server.registerTool(
     title: "Qingflow Tool Spec Get",
     description:
       "Return MCP tool parameter requirements, limits, aliases and minimal examples for agent prompt grounding.",
-    inputSchema: toolSpecInputSchema,
+    inputSchema: toolSpecInputPublicSchema,
     outputSchema: toolSpecOutputSchema,
     annotations: {
       readOnlyHint: true,
@@ -1068,9 +1467,10 @@ server.registerTool(
   },
   async (args) => {
     try {
+      const parsedArgs = toolSpecInputSchema.parse(args)
       const allSpecs = buildToolSpecCatalog()
-      const requested = args.tool_name?.trim() ?? null
-      const includeAll = args.include_all ?? false
+      const requested = parsedArgs.tool_name?.trim() ?? null
+      const includeAll = parsedArgs.include_all ?? false
       const normalizedRequested = requested?.toLowerCase() ?? null
 
       let tools = allSpecs
@@ -1213,7 +1613,7 @@ server.registerTool(
     title: "Qingflow Field Resolve",
     description:
       "Resolve natural language field names/aliases into stable que_id mappings for one app.",
-    inputSchema: fieldResolveInputSchema,
+    inputSchema: fieldResolveInputPublicSchema,
     outputSchema: fieldResolveOutputSchema,
     annotations: {
       readOnlyHint: true,
@@ -1222,8 +1622,9 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const payload = await executeFieldResolve(args)
-      return okResult(payload, `Resolved fields for ${args.app_key}`)
+      const parsedArgs = fieldResolveInputSchema.parse(args)
+      const payload = await executeFieldResolve(parsedArgs)
+      return okResult(payload, `Resolved fields for ${parsedArgs.app_key}`)
     } catch (error) {
       return errorResult(error)
     }
@@ -1236,7 +1637,7 @@ server.registerTool(
     title: "Qingflow Query Plan",
     description:
       "Preflight query arguments: normalize inputs, validate required fields, resolve mappings and estimate scan limits before execution.",
-    inputSchema: queryPlanInputSchema,
+    inputSchema: queryPlanInputPublicSchema,
     outputSchema: queryPlanOutputSchema,
     annotations: {
       readOnlyHint: true,
@@ -1245,8 +1646,9 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const payload = await executeQueryPlan(args)
-      return okResult(payload, `Planned ${args.tool}`)
+      const parsedArgs = queryPlanInputSchema.parse(args)
+      const payload = await executeQueryPlan(parsedArgs)
+      return okResult(payload, `Planned ${parsedArgs.tool}`)
     } catch (error) {
       return errorResult(error)
     }
@@ -1258,7 +1660,7 @@ server.registerTool(
   {
     title: "Qingflow Records List",
     description: "List records with pagination, filters and sorting.",
-    inputSchema: listInputSchema,
+    inputSchema: listInputPublicSchema,
     outputSchema: listOutputSchema,
     annotations: {
       readOnlyHint: true,
@@ -1267,7 +1669,8 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const executed = await executeRecordsList(args)
+      const parsedArgs = listInputSchema.parse(args)
+      const executed = await executeRecordsList(parsedArgs)
       return okResult(executed.payload, executed.message)
     } catch (error) {
       return errorResult(error)
@@ -1280,7 +1683,7 @@ server.registerTool(
   {
     title: "Qingflow Record Get",
     description: "Get one record by applyId.",
-    inputSchema: recordGetInputSchema,
+    inputSchema: recordGetInputPublicSchema,
     outputSchema: recordGetOutputSchema,
     annotations: {
       readOnlyHint: true,
@@ -1289,7 +1692,8 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const executed = await executeRecordGet(args)
+      const parsedArgs = recordGetInputSchema.parse(args)
+      const executed = await executeRecordGet(parsedArgs)
       return okResult(executed.payload, executed.message)
     } catch (error) {
       return errorResult(error)
@@ -1302,7 +1706,7 @@ server.registerTool(
   {
     title: "Qingflow Records Batch Get",
     description: "Fetch multiple records by apply_ids in one call and return strict flat rows.",
-    inputSchema: batchGetInputSchema,
+    inputSchema: batchGetInputPublicSchema,
     outputSchema: batchGetOutputSchema,
     annotations: {
       readOnlyHint: true,
@@ -1311,7 +1715,8 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const payload = await executeRecordsBatchGet(args)
+      const parsedArgs = batchGetInputSchema.parse(args)
+      const payload = await executeRecordsBatchGet(parsedArgs)
       return okResult(payload.payload, payload.message)
     } catch (error) {
       return errorResult(error)
@@ -1325,7 +1730,7 @@ server.registerTool(
     title: "Qingflow Export CSV",
     description:
       "Export list query result to a CSV file and return file path + summary instead of large inline payloads.",
-    inputSchema: exportInputSchema,
+    inputSchema: exportInputPublicSchema,
     outputSchema: exportOutputSchema,
     annotations: {
       readOnlyHint: true,
@@ -1334,7 +1739,8 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const executed = await executeRecordsExport("csv", args)
+      const parsedArgs = exportInputSchema.parse(args)
+      const executed = await executeRecordsExport("csv", parsedArgs)
       return okResult(executed.payload, executed.message)
     } catch (error) {
       return errorResult(error)
@@ -1348,7 +1754,7 @@ server.registerTool(
     title: "Qingflow Export JSON",
     description:
       "Export list query result to a JSON file and return file path + summary instead of large inline payloads.",
-    inputSchema: exportInputSchema,
+    inputSchema: exportInputPublicSchema,
     outputSchema: exportOutputSchema,
     annotations: {
       readOnlyHint: true,
@@ -1357,7 +1763,8 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const executed = await executeRecordsExport("json", args)
+      const parsedArgs = exportInputSchema.parse(args)
+      const executed = await executeRecordsExport("json", parsedArgs)
       return okResult(executed.payload, executed.message)
     } catch (error) {
       return errorResult(error)
@@ -1371,7 +1778,7 @@ server.registerTool(
     title: "Qingflow Unified Query",
     description:
       "Unified read entry for list/record/summary. Use query_mode=auto to route automatically.",
-    inputSchema: queryInputSchema,
+    inputSchema: queryInputPublicSchema,
     outputSchema: queryOutputSchema,
     annotations: {
       readOnlyHint: true,
@@ -1380,10 +1787,11 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const routedMode = resolveQueryMode(args)
+      const parsedArgs = queryInputSchema.parse(args)
+      const routedMode = resolveQueryMode(parsedArgs)
 
       if (routedMode === "record") {
-        const recordArgs = buildRecordGetArgsFromQuery(args)
+        const recordArgs = buildRecordGetArgsFromQuery(parsedArgs)
         const executed = await executeRecordGet(recordArgs)
         const completeness = executed.completeness
         const evidence = executed.evidence
@@ -1416,7 +1824,7 @@ server.registerTool(
       }
 
       if (routedMode === "summary") {
-        const executed = await executeRecordsSummary(args)
+        const executed = await executeRecordsSummary(parsedArgs)
         const completeness = executed.completeness
         const evidence = executed.evidence
         return okResult(
@@ -1447,7 +1855,7 @@ server.registerTool(
         )
       }
 
-      const listArgs = buildListArgsFromQuery(args)
+      const listArgs = buildListArgsFromQuery(parsedArgs)
       const executed = await executeRecordsList(listArgs)
       const completeness = executed.completeness
       const evidence = executed.evidence
@@ -1489,7 +1897,7 @@ server.registerTool(
     title: "Qingflow Record Create",
     description:
       "Create one record. Supports explicit answers and ergonomic fields mapping (title or queId).",
-    inputSchema: createInputSchema,
+    inputSchema: createInputPublicSchema,
     outputSchema: createOutputSchema,
     annotations: {
       readOnlyHint: false,
@@ -1498,26 +1906,31 @@ server.registerTool(
   },
   async (args) => {
     try {
+      const parsedArgs = createInputSchema.parse(args)
       const form =
-        needsFormResolution(args.fields) || Boolean(args.force_refresh_form)
-          ? await getFormCached(args.app_key, args.user_id, Boolean(args.force_refresh_form))
+        needsFormResolution(parsedArgs.fields) || Boolean(parsedArgs.force_refresh_form)
+          ? await getFormCached(
+              parsedArgs.app_key,
+              parsedArgs.user_id,
+              Boolean(parsedArgs.force_refresh_form)
+            )
           : null
 
       const normalizedAnswers = resolveAnswers({
-        explicitAnswers: args.answers,
-        fields: args.fields,
+        explicitAnswers: parsedArgs.answers,
+        fields: parsedArgs.fields,
         form: form?.result
       })
 
       const payload: Record<string, unknown> = {
         answers: normalizedAnswers
       }
-      if (args.apply_user) {
-        payload.applyUser = args.apply_user
+      if (parsedArgs.apply_user) {
+        payload.applyUser = parsedArgs.apply_user
       }
 
-      const response = await client.createRecord(args.app_key, payload, {
-        userId: args.user_id
+      const response = await client.createRecord(parsedArgs.app_key, payload, {
+        userId: parsedArgs.user_id
       })
 
       const result = asObject(response.result)
@@ -1531,7 +1944,7 @@ server.registerTool(
           },
           meta: buildMeta(response)
         },
-        `Create request sent for app ${args.app_key}`
+        `Create request sent for app ${parsedArgs.app_key}`
       )
     } catch (error) {
       return errorResult(error)
@@ -1544,7 +1957,7 @@ server.registerTool(
   {
     title: "Qingflow Record Update",
     description: "Patch one record by applyId with explicit answers or ergonomic fields mapping.",
-    inputSchema: updateInputSchema,
+    inputSchema: updateInputPublicSchema,
     outputSchema: updateOutputSchema,
     annotations: {
       readOnlyHint: false,
@@ -1553,26 +1966,31 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const requiresForm = needsFormResolution(args.fields)
-      if (requiresForm && !args.app_key) {
+      const parsedArgs = updateInputSchema.parse(args)
+      const requiresForm = needsFormResolution(parsedArgs.fields)
+      if (requiresForm && !parsedArgs.app_key) {
         throw new Error("app_key is required when fields uses title-based keys")
       }
 
       const form =
-        requiresForm && args.app_key
-          ? await getFormCached(args.app_key, args.user_id, Boolean(args.force_refresh_form))
+        requiresForm && parsedArgs.app_key
+          ? await getFormCached(
+              parsedArgs.app_key,
+              parsedArgs.user_id,
+              Boolean(parsedArgs.force_refresh_form)
+            )
           : null
 
       const normalizedAnswers = resolveAnswers({
-        explicitAnswers: args.answers,
-        fields: args.fields,
+        explicitAnswers: parsedArgs.answers,
+        fields: parsedArgs.fields,
         form: form?.result
       })
 
       const response = await client.updateRecord(
-        String(args.apply_id),
+        String(parsedArgs.apply_id),
         { answers: normalizedAnswers },
-        { userId: args.user_id }
+        { userId: parsedArgs.user_id }
       )
       const result = asObject(response.result)
 
@@ -1585,7 +2003,7 @@ server.registerTool(
           },
           meta: buildMeta(response)
         },
-        `Update request sent for apply ${String(args.apply_id)}`
+        `Update request sent for apply ${String(parsedArgs.apply_id)}`
       )
     } catch (error) {
       return errorResult(error)
@@ -1631,7 +2049,7 @@ server.registerTool(
     title: "Qingflow Records Aggregate",
     description:
       "Aggregate records by group_by columns with optional amount metrics. Designed for deterministic, auditable statistics.",
-    inputSchema: aggregateInputSchema,
+    inputSchema: aggregateInputPublicSchema,
     outputSchema: aggregateOutputSchema,
     annotations: {
       readOnlyHint: true,
@@ -1640,7 +2058,8 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const executed = await executeRecordsAggregate(args)
+      const parsedArgs = aggregateInputSchema.parse(args)
+      const executed = await executeRecordsAggregate(parsedArgs)
       return okResult(executed.payload, executed.message)
     } catch (error) {
       return errorResult(error)
@@ -1996,6 +2415,9 @@ const COMMON_INPUT_ALIASES: Record<string, string> = {
   pageNum: "page_num",
   pageSize: "page_size",
   pageToken: "page_token",
+  rawNextPageToken: "page_token",
+  raw_next_page_token: "page_token",
+  rawPageToken: "page_token",
   requestedPages: "requested_pages",
   scanMaxPages: "scan_max_pages",
   queryMode: "query_mode",
@@ -3284,11 +3706,167 @@ function decodeContinuationToken(token: string): ContinuationTokenPayload {
   if (!appKey || !nextPageNum || !pageSize) {
     throw new Error("Invalid page_token payload")
   }
+  const resumeKind =
+    obj?.resume_kind === "summary" || obj?.resume_kind === "aggregate"
+      ? obj.resume_kind
+      : undefined
+  const resumeId = asNullableString(obj?.resume_id) ?? undefined
   return {
     app_key: appKey,
     next_page_num: nextPageNum,
-    page_size: pageSize
+    page_size: pageSize,
+    ...(resumeKind ? { resume_kind: resumeKind } : {}),
+    ...(resumeId ? { resume_id: resumeId } : {})
   }
+}
+
+function resolveContinuationPayload(
+  pageToken: string | undefined,
+  appKey: string
+): ContinuationTokenPayload | null {
+  if (!pageToken) {
+    return null
+  }
+  const payload = decodeContinuationToken(pageToken)
+  if (payload.app_key !== appKey) {
+    throw new Error(
+      `page_token app_key mismatch: token for ${payload.app_key}, request for ${appKey}`
+    )
+  }
+  return payload
+}
+
+function buildQueryFingerprint(value: unknown): string {
+  return stableJson(value)
+}
+
+function loadContinuationState(
+  kind: "summary",
+  payload: ContinuationTokenPayload | null,
+  queryFingerprint: string,
+  tool: string
+): { resumeId: string; state: SummaryContinuationState } | null
+function loadContinuationState(
+  kind: "aggregate",
+  payload: ContinuationTokenPayload | null,
+  queryFingerprint: string,
+  tool: string
+): { resumeId: string; state: AggregateContinuationState } | null
+function loadContinuationState(
+  kind: "summary" | "aggregate",
+  payload: ContinuationTokenPayload | null,
+  queryFingerprint: string,
+  tool: string
+):
+  | { resumeId: string; state: SummaryContinuationState | AggregateContinuationState }
+  | null {
+  if (!payload) {
+    return null
+  }
+  if (payload.resume_kind !== kind || !payload.resume_id) {
+    throw new InputValidationError({
+      message: `${tool} received a page_token that cannot resume aggregated state`,
+      errorCode: "INVALID_PAGE_TOKEN",
+      fixHint: `Reuse the raw_next_page_token returned by ${tool}, or restart the query without page_token.`,
+      details: {
+        tool,
+        expected_resume_kind: kind,
+        received_resume_kind: payload.resume_kind ?? null
+      }
+    })
+  }
+
+  const state = getContinuationState(kind, payload.resume_id)
+  if (!state) {
+    throw new InputValidationError({
+      message: `${tool} continuation state expired`,
+      errorCode: "CONTINUATION_EXPIRED",
+      fixHint: "Restart the query without page_token to rebuild the aggregate from page 1.",
+      details: {
+        tool,
+        resume_id: payload.resume_id
+      }
+    })
+  }
+
+  if (state.query_fingerprint !== queryFingerprint) {
+    throw new InputValidationError({
+      message: `${tool} page_token no longer matches the current query arguments`,
+      errorCode: "CONTINUATION_MISMATCH",
+      fixHint:
+        "When continuing a summary/aggregate query, keep app_key, filters, time_range, grouping, selected columns and stat options unchanged.",
+      details: {
+        tool,
+        resume_id: payload.resume_id
+      }
+    })
+  }
+
+  return {
+    resumeId: payload.resume_id,
+    state
+  }
+}
+
+function setContinuationState(
+  kind: "summary",
+  state: SummaryContinuationState,
+  resumeId?: string
+): string
+function setContinuationState(
+  kind: "aggregate",
+  state: AggregateContinuationState,
+  resumeId?: string
+): string
+function setContinuationState(
+  kind: "summary" | "aggregate",
+  state: SummaryContinuationState | AggregateContinuationState,
+  resumeId?: string
+): string {
+  const id = resumeId ?? randomUUID()
+  continuationCache.set(id, {
+    kind,
+    state: state as SummaryContinuationState & AggregateContinuationState,
+    expiresAt: Date.now() + CONTINUATION_CACHE_TTL_MS
+  } as ContinuationCacheEntry)
+  return id
+}
+
+function getContinuationState(
+  kind: "summary",
+  resumeId: string
+): SummaryContinuationState | null
+function getContinuationState(
+  kind: "aggregate",
+  resumeId: string
+): AggregateContinuationState | null
+function getContinuationState(
+  kind: "summary" | "aggregate",
+  resumeId: string
+): SummaryContinuationState | AggregateContinuationState | null
+function getContinuationState(
+  kind: "summary" | "aggregate",
+  resumeId: string
+): SummaryContinuationState | AggregateContinuationState | null {
+  const hit = continuationCache.get(resumeId)
+  if (!hit) {
+    return null
+  }
+  if (hit.expiresAt <= Date.now()) {
+    continuationCache.delete(resumeId)
+    return null
+  }
+  if (hit.kind !== kind) {
+    throw new Error(`page_token continuation kind mismatch: expected ${kind}, got ${hit.kind}`)
+  }
+  return hit.state
+}
+
+function deleteContinuationState(resumeId: string | undefined): void {
+  if (!resumeId) {
+    return
+  }
+  continuationCache.delete(resumeId)
 }
 
 function isExecutionBudgetExceeded(startedAt: number): boolean {
@@ -3827,6 +4405,91 @@ async function estimatePlanExecution(params: {
     may_hit_limits: mayHitLimits,
     reasons: uniqueStringList(reasons),
     probe: probeResult
+  }
+}
+
+function assessPlanReadiness(params: {
+  tool: string
+  normalizedArguments: Record<string, unknown>
+  validation: {
+    valid: boolean
+    missing_required: string[]
+    warnings: string[]
+  }
+  fieldMapping: Array<{
+    role: string
+    requested: string
+    resolved: boolean
+    reason: string | null
+  }>
+  estimate: z.infer<typeof queryPlanOutputSchema>["data"]["estimate"]
+}): {
+  ready_for_final_conclusion: boolean
+  final_conclusion_blockers: string[]
+  recommended_next_actions: string[]
+} {
+  const blockers: string[] = []
+  const actions: string[] = []
+
+  if (!params.validation.valid) {
+    blockers.push("arguments are not valid")
+    actions.push("Fix missing_required and warnings before execution.")
+  }
+
+  const unresolved = params.fieldMapping.filter((item) => !item.resolved)
+  if (unresolved.length > 0) {
+    blockers.push(
+      `unresolved fields: ${unresolved.map((item) => `${item.role}:${item.requested}`).join(", ")}`
+    )
+    actions.push("Use qf_form_get or qf_field_resolve to resolve field ids before execution.")
+  }
+
+  const tool = params.tool
+  const routedMode =
+    tool === "qf_query"
+      ? resolveQueryMode(params.normalizedArguments as z.infer<typeof queryInputSchema>)
+      : null
+  const strictFull = params.normalizedArguments.strict_full === true
+  const scanLimit = resolveScanLimit(
+    params.estimate.requested_pages ?? 1,
+    params.estimate.scan_max_pages ?? params.estimate.requested_pages ?? 1
+  )
+  const pageSize = params.estimate.page_size ?? null
+  const probeResultAmount = params.estimate.probe?.result_amount ?? null
+  const requiredPagesFromProbe =
+    probeResultAmount !== null && pageSize !== null
+      ? Math.max(1, Math.ceil(probeResultAmount / pageSize))
+      : null
+
+  if (tool === "qf_records_list" || (tool === "qf_query" && routedMode === "list")) {
+    blockers.push("list mode is not a safe final-analysis endpoint")
+    actions.push("Use qf_query(summary) or qf_records_aggregate for final statistics.")
+  }
+
+  if (tool === "qf_records_batch_get" || tool === "qf_export_csv" || tool === "qf_export_json") {
+    blockers.push(`${tool} is a data retrieval/export endpoint, not a final-analysis endpoint`)
+    actions.push("Use qf_query(summary) or qf_records_aggregate for final statistics.")
+  }
+
+  if (tool === "qf_records_aggregate" || (tool === "qf_query" && routedMode === "summary")) {
+    if (!strictFull) {
+      blockers.push("strict_full must be true for final conclusions")
+      actions.push("Set strict_full=true so incomplete raw scans fail with NEED_MORE_DATA.")
+    }
+    if (requiredPagesFromProbe !== null && scanLimit < requiredPagesFromProbe) {
+      blockers.push(
+        `scan budget is smaller than estimated page count (${scanLimit} < ${requiredPagesFromProbe})`
+      )
+      actions.push("Increase requested_pages/scan_max_pages or continue with raw_next_page_token.")
+    }
+  }
+
+  actions.push("After execution, still verify completeness.raw_scan_complete=true before concluding.")
+
+  return {
+    ready_for_final_conclusion: blockers.length === 0,
+    final_conclusion_blockers: uniqueStringList(blockers),
+    recommended_next_actions: uniqueStringList(actions)
   }
 }
 
@@ -4434,6 +5097,18 @@ async function executeQueryPlan(
     probe: args.probe !== false,
     warnings: validation.warnings
   })
+  const readiness = assessPlanReadiness({
+    tool: normalizedTool,
+    normalizedArguments,
+    validation,
+    fieldMapping: fieldMapping.map((item) => ({
+      role: item.role,
+      requested: item.requested,
+      resolved: item.resolved,
+      reason: item.reason
+    })),
+    estimate
+  })
 
   return {
     ok: true,
@@ -4442,7 +5117,10 @@ async function executeQueryPlan(
       normalized_arguments: normalizedArguments,
       validation,
       field_mapping: fieldMapping,
-      estimate
+      estimate,
+      ready_for_final_conclusion: readiness.ready_for_final_conclusion,
+      final_conclusion_blockers: readiness.final_conclusion_blockers,
+      recommended_next_actions: readiness.recommended_next_actions
     },
     meta: {
       version: SERVER_VERSION,
@@ -5215,6 +5893,198 @@ interface AggregateMetricAccumulator {
   max: number | null
 }
 
+function normalizeSortForFingerprint(
+  sort: Array<{ que_id: string | number; ascend?: boolean }> | undefined
+): Array<{ que_id: string; ascend: boolean }> {
+  return (sort ?? []).map((item) => ({
+    que_id: String(item.que_id),
+    ascend: item.ascend !== false
+  }))
+}
+
+function cloneByDayBuckets(
+  source: Array<[string, { count: number; amount: number }]>
+): Array<[string, { count: number; amount: number }]> {
+  return source.map(([day, bucket]) => [day, { count: bucket.count, amount: bucket.amount }])
+}
+
+function cloneMetricAccumulator(accumulator: AggregateMetricAccumulator): AggregateMetricAccumulator {
+  return {
+    count: accumulator.count,
+    sum: accumulator.sum,
+    min: accumulator.min,
+    max: accumulator.max
+  }
+}
+
+function serializeMetricAccumulatorMap(
+  map: Map<string, AggregateMetricAccumulator>
+): Array<[string, AggregateMetricAccumulator]> {
+  return Array.from(map.entries()).map(([key, value]) => [key, cloneMetricAccumulator(value)])
+}
+
+function restoreMetricAccumulatorMap(
+  values: Array<[string, AggregateMetricAccumulator]>
+): Map<string, AggregateMetricAccumulator> {
+  return new Map(
+    values.map(([key, value]) => [
+      key,
+      {
+        count: value.count,
+        sum: value.sum,
+        min: value.min,
+        max: value.max
+      }
+    ])
+  )
+}
+
+function serializeAggregateGroupStats(
+  groupStats: Map<
+    string,
+    {
+      group: Record<string, unknown>
+      count: number
+      amount: number
+      metrics: Map<string, AggregateMetricAccumulator>
+    }
+  >
+): AggregateContinuationState["group_stats"] {
+  return Array.from(groupStats.entries()).map(([key, bucket]) => ({
+    key,
+    group: bucket.group,
+    count: bucket.count,
+    amount: bucket.amount,
+    metrics: serializeMetricAccumulatorMap(bucket.metrics)
+  }))
+}
+
+function restoreAggregateGroupStats(
+  values: AggregateContinuationState["group_stats"]
+): Map<
+  string,
+  {
+    group: Record<string, unknown>
+    count: number
+    amount: number
+    metrics: Map<string, AggregateMetricAccumulator>
+  }
+> {
+  return new Map(
+    values.map((item) => [
+      item.key,
+      {
+        group: item.group,
+        count: item.count,
+        amount: item.amount,
+        metrics: restoreMetricAccumulatorMap(item.metrics)
+      }
+    ])
+  )
+}
+
+function buildSummaryContinuationFingerprint(params: {
+  app_key: string
+  mode: string | undefined
+  type: number | undefined
+  keyword: string | undefined
+  query_logic: "and" | "or" | undefined
+  apply_ids: Array<string | number> | undefined
+  sort: Array<{ que_id: string | number; ascend?: boolean }> | undefined
+  filters: Array<Record<string, unknown>>
+  select_columns: SummaryColumn[]
+  amount_column: SummaryColumn | null
+  time_column: SummaryColumn | null
+  time_range:
+    | {
+        from?: string
+        to?: string
+        timezone?: string
+      }
+    | undefined
+  stat_policy: {
+    include_negative: boolean
+    include_null: boolean
+  }
+  row_cap: number
+}): string {
+  return buildQueryFingerprint({
+    kind: "summary",
+    app_key: params.app_key,
+    mode: params.mode ?? null,
+    type: params.type ?? null,
+    keyword: params.keyword ?? null,
+    query_logic: params.query_logic ?? null,
+    apply_ids: uniqueStringList((params.apply_ids ?? []).map((item) => String(item))),
+    sort: normalizeSortForFingerprint(params.sort),
+    filters: params.filters,
+    select_columns: params.select_columns.map((item) => String(item.que_id)),
+    amount_column: params.amount_column ? String(params.amount_column.que_id) : null,
+    time_range: params.time_column
+      ? {
+          column: String(params.time_column.que_id),
+          from: params.time_range?.from ?? null,
+          to: params.time_range?.to ?? null,
+          timezone: params.time_range?.timezone ?? null
+        }
+      : null,
+    stat_policy: params.stat_policy,
+    row_cap: params.row_cap
+  })
+}
+
+function buildAggregateContinuationFingerprint(params: {
+  app_key: string
+  mode: string | undefined
+  type: number | undefined
+  keyword: string | undefined
+  query_logic: "and" | "or" | undefined
+  apply_ids: Array<string | number> | undefined
+  sort: Array<{ que_id: string | number; ascend?: boolean }> | undefined
+  filters: Array<Record<string, unknown>>
+  group_by: SummaryColumn[]
+  amount_columns: SummaryColumn[]
+  metrics: AggregateMetricName[]
+  time_column: SummaryColumn | null
+  time_range:
+    | {
+        from?: string
+        to?: string
+        timezone?: string
+      }
+    | undefined
+  time_bucket: "day" | "week" | "month" | null
+  stat_policy: {
+    include_negative: boolean
+    include_null: boolean
+  }
+}): string {
+  return buildQueryFingerprint({
+    kind: "aggregate",
+    app_key: params.app_key,
+    mode: params.mode ?? null,
+    type: params.type ?? null,
+    keyword: params.keyword ?? null,
+    query_logic: params.query_logic ?? null,
+    apply_ids: uniqueStringList((params.apply_ids ?? []).map((item) => String(item))),
+    sort: normalizeSortForFingerprint(params.sort),
+    filters: params.filters,
+    group_by: params.group_by.map((item) => String(item.que_id)),
+    amount_columns: params.amount_columns.map((item) => String(item.que_id)),
+    metrics: params.metrics,
+    time_range: params.time_column
+      ? {
+          column: String(params.time_column.que_id),
+          from: params.time_range?.from ?? null,
+          to: params.time_range?.to ?? null,
+          timezone: params.time_range?.timezone ?? null
+        }
+      : null,
+    time_bucket: params.time_bucket,
+    stat_policy: params.stat_policy
+  })
+}
+
 async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Promise<{
   data: z.infer<typeof querySummaryOutputSchema>
   meta: ReturnType<typeof buildMeta>
@@ -5238,14 +6108,13 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     })
   }
   const outputProfile = resolveOutputProfile(args.output_profile)
-
-  const queryId = randomUUID()
   const strictFull = args.strict_full ?? true
   const includeNegative = args.stat_policy?.include_negative ?? true
   const includeNull = args.stat_policy?.include_null ?? false
   const scanMaxPages = args.scan_max_pages ?? DEFAULT_SCAN_MAX_PAGES
   const requestedPages = args.requested_pages ?? scanMaxPages
-  const startPage = resolveStartPage(args.page_num, args.page_token, args.app_key)
+  const continuationPayload = resolveContinuationPayload(args.page_token, args.app_key)
+  const startPage = continuationPayload?.next_page_num ?? args.page_num ?? 1
   const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
   const adaptivePaging = createAdaptivePagingState(pageSize)
   const rowCap = Math.min(args.max_rows ?? DEFAULT_ROW_LIMIT, DEFAULT_ROW_LIMIT)
@@ -5278,6 +6147,33 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   }
   validateDateRangeFilters(summaryFilters, index, "qf_query(summary)")
 
+  const queryFingerprint = buildSummaryContinuationFingerprint({
+    app_key: args.app_key,
+    mode: args.mode,
+    type: args.type,
+    keyword: args.keyword,
+    query_logic: args.query_logic,
+    apply_ids: args.apply_ids,
+    sort: normalizedSort,
+    filters: echoFilters(summaryFilters),
+    select_columns: effectiveColumns,
+    amount_column: amountColumn,
+    time_column: timeColumn,
+    time_range: args.time_range,
+    stat_policy: {
+      include_negative: includeNegative,
+      include_null: includeNull
+    },
+    row_cap: rowCap
+  })
+  const resumed = loadContinuationState(
+    "summary",
+    continuationPayload,
+    queryFingerprint,
+    "qf_query(summary)"
+  )
+  const queryId = resumed?.state.query_id ?? randomUUID()
+
   const listState: ListQueryState = {
     query_id: queryId,
     app_key: args.app_key,
@@ -5295,22 +6191,27 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
 
   let currentPage = startPage
   const startedAt = Date.now()
-  let scannedPages = 0
-  let scannedRecords = 0
+  const callScanLimit = resolveScanLimit(requestedPages, scanMaxPages)
+  let scannedPagesThisCall = 0
+  let scannedPagesTotal = resumed?.state.source_pages.length ?? 0
+  let scannedRecords = resumed?.state.scanned_records ?? 0
   let hasMore = false
   let nextPageNum: number | null = null
   let resultAmount: number | null = null
   let summaryMeta: ReturnType<typeof buildMeta> | null = null
   let stopReason: string | null = null
-  let totalAmount = 0
-  let missingCount = 0
-  const sourcePages: number[] = []
+  let totalAmount = resumed?.state.total_amount ?? 0
+  let missingCount = resumed?.state.missing_count ?? 0
+  const sourcePages = resumed ? [...resumed.state.source_pages] : []
+  const totalScanLimit = (resumed?.state.scan_limit_total ?? 0) + callScanLimit
 
-  const rows: Array<Record<string, unknown>> = []
-  const byDay = new Map<string, { count: number; amount: number }>()
+  const rows = resumed ? [...resumed.state.rows] : []
+  const byDay = new Map<string, { count: number; amount: number }>(
+    resumed ? cloneByDayBuckets(resumed.state.by_day) : []
+  )
 
-  while (scannedPages < requestedPages && scannedPages < scanMaxPages) {
-    if (scannedPages > 0 && isExecutionBudgetExceeded(startedAt)) {
+  while (scannedPagesThisCall < callScanLimit) {
+    if (scannedPagesThisCall > 0 && isExecutionBudgetExceeded(startedAt)) {
       hasMore = true
       nextPageNum = currentPage
       stopReason = "execution_budget"
@@ -5333,7 +6234,8 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
     const fetchMs = Date.now() - fetchStartedAt
     summaryMeta = summaryMeta ?? buildMeta(response)
-    scannedPages += 1
+    scannedPagesThisCall += 1
+    scannedPagesTotal += 1
     sourcePages.push(currentPage)
 
     const result = asObject(response.result)
@@ -5387,8 +6289,8 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
 
     const adaptiveDecision = applyAdaptivePaging({
       state: adaptivePaging,
-      fetchedPages: scannedPages,
-      requestedPages,
+      fetchedPages: scannedPagesThisCall,
+      requestedPages: callScanLimit,
       fetchMs,
       startedAt
     })
@@ -5452,35 +6354,53 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
 
   const knownResultAmount = resultAmount ?? scannedRecords
   const omittedSourceItems = Math.max(0, knownResultAmount - scannedRecords)
-  const rawNextPageToken =
-    hasMore && nextPageNum
-      ? encodeContinuationToken({
-          app_key: args.app_key,
-          next_page_num: nextPageNum,
-          page_size: adaptivePaging.current_page_size
-        })
-      : null
+  let rawNextPageToken: string | null = null
   const rawScanComplete = !hasMore && omittedSourceItems === 0
+  if (!rawScanComplete && nextPageNum) {
+    const resumeId = setContinuationState(
+      "summary",
+      {
+        query_id: queryId,
+        query_fingerprint: queryFingerprint,
+        scanned_records: scannedRecords,
+        total_amount: totalAmount,
+        missing_count: missingCount,
+        by_day: cloneByDayBuckets(Array.from(byDay.entries())),
+        rows: [...rows],
+        source_pages: [...sourcePages],
+        scan_limit_total: totalScanLimit
+      },
+      resumed?.resumeId
+    )
+    rawNextPageToken = encodeContinuationToken({
+      app_key: args.app_key,
+      next_page_num: nextPageNum,
+      page_size: adaptivePaging.current_page_size,
+      resume_kind: "summary",
+      resume_id: resumeId
+    })
+  } else {
+    deleteContinuationState(resumed?.resumeId)
+  }
   const outputPageComplete = rows.length >= scannedRecords
-  const scanLimit = resolveScanLimit(requestedPages, scanMaxPages)
   const scanLimitHit =
     !rawScanComplete &&
-    (scannedPages >= scanLimit ||
+    (scannedPagesThisCall >= callScanLimit ||
       stopReason === "execution_budget" ||
       stopReason === "adaptive_budget")
   const completeness = buildExtendedCompleteness({
     resultAmount: knownResultAmount,
     returnedItems: scannedRecords,
-    fetchedPages: scannedPages,
-    requestedPages,
+    fetchedPages: scannedPagesTotal,
+    requestedPages: totalScanLimit,
     hasMore,
     nextPageToken: rawNextPageToken,
     omittedItems: omittedSourceItems,
     omittedChars: 0,
     rawScanComplete,
     scanLimitHit,
-    scannedPages,
-    scanLimit,
+    scannedPages: scannedPagesTotal,
+    scanLimit: totalScanLimit,
     outputPageComplete,
     rawNextPageToken,
     outputNextPageToken: null,
@@ -5531,11 +6451,11 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
               },
               execution: {
                 scanned_records: scannedRecords,
-                scanned_pages: scannedPages,
+                scanned_pages: scannedPagesTotal,
                 truncated: !completeness.is_complete,
                 row_cap: rowCap,
                 column_cap: args.max_columns ?? null,
-                scan_max_pages: scanMaxPages
+                scan_max_pages: totalScanLimit
               }
             }
           }
@@ -5555,7 +6475,6 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
   payload: z.infer<typeof aggregateOutputSchema>
   message: string
 }> {
-  const queryId = randomUUID()
   const strictFull = args.strict_full ?? true
   const outputProfile = resolveOutputProfile(args.output_profile)
   const includeNegative = args.stat_policy?.include_negative ?? true
@@ -5564,7 +6483,8 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
   const adaptivePaging = createAdaptivePagingState(pageSize)
   const scanMaxPages = args.scan_max_pages ?? DEFAULT_SCAN_MAX_PAGES
   const requestedPages = args.requested_pages ?? scanMaxPages
-  const startPage = resolveStartPage(args.page_num, args.page_token, args.app_key)
+  const continuationPayload = resolveContinuationPayload(args.page_token, args.app_key)
+  const startPage = continuationPayload?.next_page_num ?? args.page_num ?? 1
   const maxGroups = args.max_groups ?? 200
   const timezone = args.time_range?.timezone ?? "Asia/Shanghai"
   const timeBucket = args.time_bucket ?? null
@@ -5596,6 +6516,34 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
   }
   validateDateRangeFilters(aggregateFilters, index, "qf_records_aggregate")
 
+  const queryFingerprint = buildAggregateContinuationFingerprint({
+    app_key: args.app_key,
+    mode: args.mode,
+    type: args.type,
+    keyword: args.keyword,
+    query_logic: args.query_logic,
+    apply_ids: args.apply_ids,
+    sort: normalizedSort,
+    filters: echoFilters(aggregateFilters),
+    group_by: groupColumns,
+    amount_columns: amountColumns,
+    metrics,
+    time_column: timeColumn,
+    time_range: args.time_range,
+    time_bucket: timeBucket,
+    stat_policy: {
+      include_negative: includeNegative,
+      include_null: includeNull
+    }
+  })
+  const resumed = loadContinuationState(
+    "aggregate",
+    continuationPayload,
+    queryFingerprint,
+    "qf_records_aggregate"
+  )
+  const queryId = resumed?.state.query_id ?? randomUUID()
+
   const listState: ListQueryState = {
     query_id: queryId,
     app_key: args.app_key,
@@ -5617,16 +6565,19 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
 
   let currentPage = startPage
   const startedAt = Date.now()
-  let scannedPages = 0
-  let scannedRecords = 0
+  const callScanLimit = resolveScanLimit(requestedPages, scanMaxPages)
+  let scannedPagesThisCall = 0
+  let scannedPagesTotal = resumed?.state.source_pages.length ?? 0
+  let scannedRecords = resumed?.state.scanned_records ?? 0
   let hasMore = false
   let nextPageNum: number | null = null
   let resultAmount: number | null = null
   let responseMeta: ReturnType<typeof buildMeta> | null = null
   let stopReason: string | null = null
-  let totalAmount = 0
-  const sourcePages: number[] = []
-  const groupStats = new Map<
+  let totalAmount = resumed?.state.total_amount ?? 0
+  const sourcePages = resumed ? [...resumed.state.source_pages] : []
+  const totalScanLimit = (resumed?.state.scan_limit_total ?? 0) + callScanLimit
+  const groupStats: Map<
     string,
     {
       group: Record<string, unknown>
@@ -5634,11 +6585,13 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       amount: number
       metrics: Map<string, AggregateMetricAccumulator>
     }
-  >()
-  const summaryMetricStats = new Map<string, AggregateMetricAccumulator>()
+  > = resumed ? restoreAggregateGroupStats(resumed.state.group_stats) : new Map()
+  const summaryMetricStats = resumed
+    ? restoreMetricAccumulatorMap(resumed.state.summary_metric_stats)
+    : new Map<string, AggregateMetricAccumulator>()
 
-  while (scannedPages < requestedPages && scannedPages < scanMaxPages) {
-    if (scannedPages > 0 && isExecutionBudgetExceeded(startedAt)) {
+  while (scannedPagesThisCall < callScanLimit) {
+    if (scannedPagesThisCall > 0 && isExecutionBudgetExceeded(startedAt)) {
       hasMore = true
       nextPageNum = currentPage
       stopReason = "execution_budget"
@@ -5661,7 +6614,8 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
     const fetchMs = Date.now() - fetchStartedAt
     responseMeta = responseMeta ?? buildMeta(response)
-    scannedPages += 1
+    scannedPagesThisCall += 1
+    scannedPagesTotal += 1
     sourcePages.push(currentPage)
 
     const result = asObject(response.result)
@@ -5727,8 +6681,8 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
 
     const adaptiveDecision = applyAdaptivePaging({
       state: adaptivePaging,
-      fetchedPages: scannedPages,
-      requestedPages,
+      fetchedPages: scannedPagesThisCall,
+      requestedPages: callScanLimit,
       fetchMs,
       startedAt
     })
@@ -5751,36 +6705,53 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
 
   const knownResultAmount = resultAmount ?? scannedRecords
   const omittedSourceItems = Math.max(0, knownResultAmount - scannedRecords)
-  const rawNextPageToken =
-    hasMore && nextPageNum
-      ? encodeContinuationToken({
-          app_key: args.app_key,
-          next_page_num: nextPageNum,
-          page_size: adaptivePaging.current_page_size
-        })
-      : null
+  let rawNextPageToken: string | null = null
   const groupsTotal = groupStats.size
   const rawScanComplete = !hasMore && omittedSourceItems === 0
+  if (!rawScanComplete && nextPageNum) {
+    const resumeId = setContinuationState(
+      "aggregate",
+      {
+        query_id: queryId,
+        query_fingerprint: queryFingerprint,
+        scanned_records: scannedRecords,
+        total_amount: totalAmount,
+        source_pages: [...sourcePages],
+        scan_limit_total: totalScanLimit,
+        group_stats: serializeAggregateGroupStats(groupStats),
+        summary_metric_stats: serializeMetricAccumulatorMap(summaryMetricStats)
+      },
+      resumed?.resumeId
+    )
+    rawNextPageToken = encodeContinuationToken({
+      app_key: args.app_key,
+      next_page_num: nextPageNum,
+      page_size: adaptivePaging.current_page_size,
+      resume_kind: "aggregate",
+      resume_id: resumeId
+    })
+  } else {
+    deleteContinuationState(resumed?.resumeId)
+  }
   const outputPageComplete = groupsTotal <= maxGroups
-  const scanLimit = resolveScanLimit(requestedPages, scanMaxPages)
   const scanLimitHit =
     !rawScanComplete &&
-    (scannedPages >= scanLimit ||
+    (scannedPagesThisCall >= callScanLimit ||
       stopReason === "execution_budget" ||
       stopReason === "adaptive_budget")
   const completeness = buildExtendedCompleteness({
     resultAmount: knownResultAmount,
     returnedItems: scannedRecords,
-    fetchedPages: scannedPages,
-    requestedPages,
+    fetchedPages: scannedPagesTotal,
+    requestedPages: totalScanLimit,
     hasMore,
     nextPageToken: rawNextPageToken,
     omittedItems: omittedSourceItems,
     omittedChars: 0,
     rawScanComplete,
     scanLimitHit,
-    scannedPages,
-    scanLimit,
+    scannedPages: scannedPagesTotal,
+    scanLimit: totalScanLimit,
     outputPageComplete,
     rawNextPageToken,
     outputNextPageToken: null,
