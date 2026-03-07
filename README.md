@@ -5,6 +5,7 @@ This MCP server wraps Qingflow OpenAPI for:
 - `qf_apps_list`
 - `qf_form_get`
 - `qf_field_resolve`
+- `qf_value_probe`
 - `qf_query_plan`
 - `qf_records_list`
 - `qf_record_get`
@@ -108,7 +109,7 @@ npm i -g git+https://github.com/853046310/qingflow-mcp.git
 Install from npm (pinned version):
 
 ```bash
-npm i -g qingflow-mcp@0.4.0
+npm i -g qingflow-mcp@0.4.1
 ```
 
 Or one-click installer:
@@ -145,8 +146,10 @@ MCP client config example:
 
 1. `qf_apps_list` to pick app.
 2. `qf_form_get` to inspect field ids/titles.
-3. `qf_record_create` or `qf_record_update`.
-4. If create/update returns only `request_id`, call `qf_operation_get` to resolve async result.
+3. `qf_field_resolve` for field-name to `que_id` mapping.
+4. `qf_value_probe` when the agent needs candidate field values and explicit match evidence.
+5. `qf_record_create` or `qf_record_update`.
+6. If create/update returns only `request_id`, call `qf_operation_get` to resolve async result.
 
 Full calling contract (Chinese):
 

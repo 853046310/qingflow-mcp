@@ -192,7 +192,7 @@ const ADAPTIVE_TARGET_PAGE_MS = toPositiveInt(process.env.QINGFLOW_ADAPTIVE_TARG
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
-const SERVER_VERSION = "0.4.0"
+const SERVER_VERSION = "0.4.1"
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -277,6 +277,8 @@ const apiMetaSchema = z.object({
 })
 const outputProfileSchema = z.enum(["compact", "verbose"])
 type OutputProfile = z.infer<typeof outputProfileSchema>
+const matchModeValues = ["exact", "normalized", "contains", "prefix", "fuzzy"] as const
+const matchModeSchema = z.enum(matchModeValues)
 
 const completenessSchema = z.object({
   result_amount: z.number().int().nonnegative(),
@@ -297,7 +299,12 @@ const completenessSchema = z.object({
   output_page_complete: z.boolean().optional(),
   raw_next_page_token: z.string().nullable().optional(),
   output_next_page_token: z.string().nullable().optional(),
-  stop_reason: z.string().nullable().optional()
+  stop_reason: z.string().nullable().optional(),
+  provider_result_amount: z.number().int().nonnegative().nullable().optional(),
+  source_record_count: z.number().int().nonnegative().optional(),
+  effective_record_count: z.number().int().nonnegative().optional(),
+  returned_group_count: z.number().int().nonnegative().optional(),
+  total_group_count: z.number().int().nonnegative().optional()
 })
 
 const evidenceSchema = z.object({
@@ -1164,6 +1171,68 @@ const fieldResolveOutputSchema = z.object({
   meta: apiMetaSchema
 })
 
+const valueProbeInputPublicSchema = z
+  .object({
+    app_key: publicStringSchema,
+    field: publicFieldSelectorSchema,
+    query: publicStringSchema.optional(),
+    match_mode: matchModeSchema.optional(),
+    limit: z.number().int().positive().max(50).optional(),
+    scan_max_pages: z.number().int().positive().max(20).optional(),
+    page_size: z.number().int().positive().max(200).optional()
+  })
+  .strict()
+
+const valueProbeInputSchema = z.preprocess(
+  normalizeValueProbeInput,
+  z
+    .object({
+      app_key: z.string().min(1),
+      field: z.union([z.string().min(1), z.number().int()]),
+      query: z.string().optional(),
+      match_mode: matchModeSchema.optional(),
+      limit: z.number().int().positive().max(50).optional(),
+      scan_max_pages: z.number().int().positive().max(20).optional(),
+      page_size: z.number().int().positive().max(200).optional()
+    })
+    .strict()
+)
+
+const valueProbeOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    app_key: z.string(),
+    field: z.object({
+      requested: z.string(),
+      que_id: z.union([z.string(), z.number()]),
+      que_title: z.string().nullable(),
+      que_type: z.unknown()
+    }),
+    query: z.string().nullable(),
+    requested_match_mode: matchModeSchema,
+    effective_match_mode: matchModeSchema,
+    provider_translation: z.string(),
+    scanned_pages: z.number().int().nonnegative(),
+    scanned_records: z.number().int().nonnegative(),
+    provider_result_amount: z.number().int().nonnegative().nullable(),
+    candidates: z.array(
+      z.object({
+        value: z.unknown(),
+        display_value: z.string(),
+        count: z.number().int().nonnegative(),
+        match_strength: z.number().min(0).max(1),
+        matched_texts: z.array(z.string()),
+        matched_as: z.string()
+      })
+    ),
+    matched_values: z.array(z.unknown())
+  }),
+  meta: z.object({
+    version: z.string(),
+    generated_at: z.string()
+  })
+})
+
 const queryPlanInputPublicSchema = z
   .object({
     tool: publicStringSchema,
@@ -1420,13 +1489,7 @@ const exportOutputSchema = z.object({
 })
 
 const canonicalFieldRefSchema = publicFieldSelectorSchema
-const canonicalMatchModeSchema = z.enum([
-  "exact",
-  "normalized",
-  "contains",
-  "prefix",
-  "fuzzy"
-])
+const canonicalMatchModeSchema = matchModeSchema
 const canonicalWhereOpSchema = z.enum([
   "eq",
   "neq",
@@ -1451,6 +1514,7 @@ const canonicalWhereItemSchema = z
     to: z.union([z.string(), z.number()]).optional(),
     match: canonicalMatchModeSchema.optional()
   })
+  .strict()
   .superRefine((value, ctx) => {
     if (value.op === "between") {
       if (value.from === undefined && value.to === undefined) {
@@ -1481,68 +1545,79 @@ const canonicalWhereItemSchema = z
     }
   })
 
-const canonicalSortItemSchema = z.object({
-  field: canonicalFieldRefSchema,
-  direction: canonicalSortDirectionSchema.optional()
-})
+const canonicalSortItemSchema = z
+  .object({
+    field: canonicalFieldRefSchema,
+    direction: canonicalSortDirectionSchema.optional()
+  })
+  .strict()
 
 const canonicalSelectSchema = z.array(canonicalFieldRefSchema).min(1).max(MAX_COLUMN_LIMIT)
 const canonicalGroupBySchema = z.array(canonicalFieldRefSchema).min(1).max(20)
 
-const canonicalBaseQueryInputSchema = z.object({
-  app_key: z.string().min(1),
-  select: canonicalSelectSchema.optional(),
-  where: z.array(canonicalWhereItemSchema).optional(),
-  sort: z.array(canonicalSortItemSchema).optional(),
-  limit: z.number().int().positive().max(DEFAULT_ROW_LIMIT).optional(),
-  cursor: z.string().optional(),
-  page_size: z.number().int().positive().max(200).optional(),
-  requested_pages: z.number().int().positive().max(500).optional(),
-  scan_max_pages: z.number().int().positive().max(500).optional(),
-  strict_full: z.boolean().optional(),
-  output_profile: outputProfileSchema.optional(),
-  user_id: z.string().min(1).optional(),
-  mode: z
-    .enum([
-      "todo",
-      "done",
-      "mine_approved",
-      "mine_rejected",
-      "mine_draft",
-      "mine_need_improve",
-      "mine_processing",
-      "all",
-      "all_approved",
-      "all_rejected",
-      "all_processing",
-      "cc"
-    ])
-    .optional()
-})
+const canonicalBaseQueryInputSchema = z
+  .object({
+    app_key: z.string().min(1),
+    select: canonicalSelectSchema.optional(),
+    where: z.array(canonicalWhereItemSchema).optional(),
+    sort: z.array(canonicalSortItemSchema).optional(),
+    limit: z.number().int().positive().max(DEFAULT_ROW_LIMIT).optional(),
+    cursor: z.string().optional(),
+    page_size: z.number().int().positive().max(200).optional(),
+    requested_pages: z.number().int().positive().max(500).optional(),
+    scan_max_pages: z.number().int().positive().max(500).optional(),
+    strict_full: z.boolean().optional(),
+    output_profile: outputProfileSchema.optional(),
+    user_id: z.string().min(1).optional(),
+    mode: z
+      .enum([
+        "todo",
+        "done",
+        "mine_approved",
+        "mine_rejected",
+        "mine_draft",
+        "mine_need_improve",
+        "mine_processing",
+        "all",
+        "all_approved",
+        "all_rejected",
+        "all_processing",
+        "cc"
+      ])
+      .optional()
+  })
+  .strict()
 
-const canonicalPlanInputSchema = z.object({
-  kind: z.enum(["rows", "record", "aggregate", "export", "mutate"]),
-  query: z.record(z.unknown()).optional(),
-  action: z.record(z.unknown()).optional(),
-  probe: z.boolean().optional(),
-  resolve_fields: z.boolean().optional()
-})
+const canonicalPlanInputSchema = z
+  .object({
+    kind: z.enum(["rows", "record", "aggregate", "export", "mutate"]),
+    query: z.record(z.unknown()).optional(),
+    action: z.record(z.unknown()).optional(),
+    probe: z.boolean().optional(),
+    resolve_fields: z.boolean().optional()
+  })
+  .strict()
 
-const canonicalRowsInputSchema = canonicalBaseQueryInputSchema.extend({
-  select: canonicalSelectSchema
-})
+const canonicalRowsInputSchema = canonicalBaseQueryInputSchema
+  .extend({
+    select: canonicalSelectSchema
+  })
+  .strict()
 
-const canonicalRecordInputSchema = z.object({
-  apply_id: canonicalFieldRefSchema,
-  select: canonicalSelectSchema,
-  output_profile: outputProfileSchema.optional()
-})
+const canonicalRecordInputSchema = z
+  .object({
+    apply_id: canonicalFieldRefSchema,
+    select: canonicalSelectSchema,
+    output_profile: outputProfileSchema.optional()
+  })
+  .strict()
 
 const canonicalAggregateMetricInputSchema = z
   .object({
     column: canonicalFieldRefSchema.optional(),
     op: z.enum(["count", "sum", "avg", "min", "max"])
   })
+  .strict()
   .superRefine((value, ctx) => {
     if (value.op !== "count" && value.column === undefined) {
       ctx.addIssue({
@@ -1552,29 +1627,35 @@ const canonicalAggregateMetricInputSchema = z
     }
   })
 
-const canonicalAggregateInputSchema = canonicalBaseQueryInputSchema.extend({
-  group_by: canonicalGroupBySchema,
-  metrics: z.array(canonicalAggregateMetricInputSchema).min(1).max(10),
-  time_bucket: z.enum(["day", "week", "month"]).optional(),
-  top_n: z.number().int().positive().max(2000).optional()
-})
+const canonicalAggregateInputSchema = canonicalBaseQueryInputSchema
+  .extend({
+    group_by: canonicalGroupBySchema,
+    metrics: z.array(canonicalAggregateMetricInputSchema).min(1).max(10),
+    time_bucket: z.enum(["day", "week", "month"]).optional(),
+    top_n: z.number().int().positive().max(2000).optional()
+  })
+  .strict()
 
-const canonicalMutateInputSchema = z.object({
-  action: z.enum(["create", "update"]),
-  app_key: z.string().min(1).optional(),
-  apply_id: canonicalFieldRefSchema.optional(),
-  user_id: z.string().min(1).optional(),
-  fields: z.record(z.unknown()).optional(),
-  answers: z.array(publicAnswerInputSchema).optional(),
-  force_refresh_form: z.boolean().optional()
-})
+const canonicalMutateInputSchema = z
+  .object({
+    action: z.enum(["create", "update"]),
+    app_key: z.string().min(1).optional(),
+    apply_id: canonicalFieldRefSchema.optional(),
+    user_id: z.string().min(1).optional(),
+    fields: z.record(z.unknown()).optional(),
+    answers: z.array(publicAnswerInputSchema).optional(),
+    force_refresh_form: z.boolean().optional()
+  })
+  .strict()
 
-const canonicalExportInputSchema = canonicalBaseQueryInputSchema.extend({
-  select: canonicalSelectSchema,
-  format: z.enum(["csv", "json"]).optional(),
-  file_name: z.string().min(1).optional(),
-  export_dir: z.string().min(1).optional()
-})
+const canonicalExportInputSchema = canonicalBaseQueryInputSchema
+  .extend({
+    select: canonicalSelectSchema,
+    format: z.enum(["csv", "json"]).optional(),
+    file_name: z.string().min(1).optional(),
+    export_dir: z.string().min(1).optional()
+  })
+  .strict()
 
 const canonicalResourceRefSchema = z.object({
   uri: z.string(),
@@ -1583,11 +1664,18 @@ const canonicalResourceRefSchema = z.object({
   description: z.string().nullable().optional()
 })
 
+const canonicalExecutionPlanSchema = z.object({
+  tool: z.string().nullable(),
+  arguments: z.record(z.unknown()).nullable(),
+  direct_execute: z.boolean()
+})
+
 const canonicalPlanOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     kind: z.string(),
     normalized_query: z.record(z.unknown()),
+    plan: canonicalExecutionPlanSchema,
     internal_tool: z.string().nullable(),
     internal_arguments: z.record(z.unknown()).nullable(),
     field_mapping: z.array(z.record(z.unknown())),
@@ -1649,6 +1737,9 @@ const canonicalAggregateOutputSchema = z.object({
     primary_metric_column: z.string().nullable(),
     summary: z.object({
       record_count: z.number().int().nonnegative(),
+      provider_result_amount: z.number().int().nonnegative().nullable(),
+      returned_group_count: z.number().int().nonnegative(),
+      total_group_count: z.number().int().nonnegative(),
       metrics_by_column: z.record(z.record(z.union([z.number(), z.null()])))
     }),
     groups: z.array(z.record(z.unknown())),
@@ -1874,6 +1965,30 @@ server.registerTool(
 )
 
 server.registerTool(
+  "qf_value_probe",
+  {
+    title: "Qingflow Value Probe",
+    description:
+      "Probe likely field values for one app field, with explicit match mode and matched value evidence.",
+    inputSchema: valueProbeInputPublicSchema,
+    outputSchema: valueProbeOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = valueProbeInputSchema.parse(args)
+      const payload = await executeValueProbe(parsedArgs)
+      return okResult(payload, `Probed values for ${parsedArgs.app_key}:${String(parsedArgs.field)}`)
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
   "qf_query_plan",
   {
     title: "Qingflow Query Plan",
@@ -1913,6 +2028,7 @@ server.registerTool(
   async (args) => {
     try {
       const parsedArgs = canonicalPlanInputSchema.parse(args)
+      const canonicalTool = canonicalExecutorToolForKind(parsedArgs.kind)
       const normalizedLoose = normalizeCanonicalLooseInput(
         parsedArgs.kind,
         parsedArgs.kind === "mutate" ? parsedArgs.action : parsedArgs.query
@@ -1986,6 +2102,11 @@ server.registerTool(
             data: {
               kind: parsedArgs.kind,
               normalized_query: normalizedQuery,
+              plan: {
+                tool: canonicalTool,
+                arguments: normalizedQuery,
+                direct_execute: false
+              },
               internal_tool: internalTool,
               internal_arguments: internalArguments,
               field_mapping: [],
@@ -2026,6 +2147,14 @@ server.registerTool(
           data: {
             kind: parsedArgs.kind,
             normalized_query: normalizedQuery,
+            plan: {
+              tool: canonicalTool,
+              arguments: normalizedQuery,
+              direct_execute:
+                parsedArgs.kind === "mutate"
+                  ? true
+                  : Boolean(plannedPayload?.data.validation.valid && internalArguments)
+            },
             internal_tool: internalTool,
             internal_arguments: internalArguments,
             field_mapping: plannedPayload?.data.field_mapping ?? [],
@@ -2266,6 +2395,11 @@ server.registerTool(
             (asObject(group.metrics) as Record<string, Record<string, number | null>>) ?? {}
         }
       })
+      const providerResultAmount = toNonNegativeInt(completeness.provider_result_amount ?? completeness.result_amount)
+      const returnedGroupCount =
+        toNonNegativeInt(completeness.returned_group_count) ?? groups.length
+      const totalGroupCount =
+        toNonNegativeInt(completeness.total_group_count) ?? groups.length
       const snapshotUri = buildQuerySnapshotResourceUri(queryId)
       const normalizedUri = buildQueryNormalizedResourceUri(queryId)
       const snapshot = {
@@ -2275,6 +2409,9 @@ server.registerTool(
         primary_metric_column: built.primaryMetricColumn,
         summary: {
           record_count: toNonNegativeInt(data.summary.total_count) ?? 0,
+          provider_result_amount: providerResultAmount,
+          returned_group_count: returnedGroupCount,
+          total_group_count: totalGroupCount,
           metrics_by_column: summaryMetrics
         },
         groups,
@@ -2304,6 +2441,9 @@ server.registerTool(
           primary_metric_column: built.primaryMetricColumn,
           summary: {
             record_count: toNonNegativeInt(data.summary.total_count) ?? 0,
+            provider_result_amount: providerResultAmount,
+            returned_group_count: returnedGroupCount,
+            total_group_count: totalGroupCount,
             metrics_by_column: summaryMetrics
           },
           groups,
@@ -3721,6 +3861,25 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       }
     },
     {
+      tool: "qf_value_probe",
+      required: ["app_key", "field"],
+      limits: {
+        limit_max: 50,
+        scan_max_pages_max: 20,
+        page_size_max: 200,
+        match_mode: Array.from(matchModeValues),
+        input_contract: "strict JSON only; use field plus optional query and match_mode"
+      },
+      aliases: {},
+      minimal_example: {
+        app_key: "21b3d559",
+        field: "归属部门",
+        query: "北斗",
+        match_mode: "contains",
+        limit: 10
+      }
+    },
+    {
       tool: "qf_query_plan",
       required: ["tool"],
       limits: {
@@ -4227,6 +4386,40 @@ function normalizeFieldResolveInput(raw: unknown): unknown {
     queries: normalizeSelectorListInput(normalizedObj.queries),
     top_k: coerceNumberLike(normalizedObj.top_k),
     fuzzy: coerceBooleanLike(normalizedObj.fuzzy)
+  }
+}
+
+function normalizeValueProbeInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    appKey: "app_key",
+    fieldId: "field",
+    fieldTitle: "field",
+    name: "field",
+    value: "query",
+    search: "query",
+    searchKey: "query",
+    prefix: "query",
+    match: "match_mode",
+    matchMode: "match_mode",
+    scanMaxPages: "scan_max_pages",
+    pageSize: "page_size"
+  })
+  return {
+    ...normalizedObj,
+    field: normalizeSelectorInputValue(normalizedObj.field),
+    query: normalizedObj.query !== undefined ? coerceStringLike(normalizedObj.query) : undefined,
+    match_mode:
+      typeof normalizedObj.match_mode === "string" && normalizedObj.match_mode.trim()
+        ? normalizedObj.match_mode.trim().toLowerCase()
+        : undefined,
+    limit: coerceNumberLike(normalizedObj.limit),
+    scan_max_pages: coerceNumberLike(normalizedObj.scan_max_pages),
+    page_size: coerceNumberLike(normalizedObj.page_size)
   }
 }
 
@@ -5101,6 +5294,11 @@ function buildExtendedCompleteness(params: {
   rawNextPageToken?: string | null
   outputNextPageToken?: string | null
   stopReason?: string | null
+  providerResultAmount?: number | null
+  sourceRecordCount?: number
+  effectiveRecordCount?: number
+  returnedGroupCount?: number
+  totalGroupCount?: number
 }): z.infer<typeof completenessSchema> {
   const rawScanComplete = params.rawScanComplete ?? (!params.hasMore && params.omittedItems === 0)
   const outputPageComplete = params.outputPageComplete ?? (params.omittedItems === 0 && params.omittedChars === 0)
@@ -5124,7 +5322,14 @@ function buildExtendedCompleteness(params: {
     output_page_complete: outputPageComplete,
     raw_next_page_token: params.rawNextPageToken ?? params.nextPageToken,
     output_next_page_token: params.outputNextPageToken ?? null,
-    stop_reason: params.stopReason ?? null
+    stop_reason: params.stopReason ?? null,
+    provider_result_amount: params.providerResultAmount ?? params.resultAmount,
+    source_record_count: params.sourceRecordCount ?? params.returnedItems,
+    effective_record_count: params.effectiveRecordCount ?? params.returnedItems,
+    ...(params.returnedGroupCount !== undefined
+      ? { returned_group_count: params.returnedGroupCount }
+      : {}),
+    ...(params.totalGroupCount !== undefined ? { total_group_count: params.totalGroupCount } : {})
   }
 }
 
@@ -6333,6 +6538,46 @@ function normalizeCanonicalLooseInput(
     })
   }
 
+  return pickCanonicalLooseFields(kind, out)
+}
+
+function pickCanonicalLooseFields(
+  kind: z.infer<typeof canonicalPlanInputSchema>["kind"],
+  value: Record<string, unknown>
+): Record<string, unknown> {
+  const commonKeys = [
+    "app_key",
+    "select",
+    "where",
+    "sort",
+    "limit",
+    "cursor",
+    "page_size",
+    "requested_pages",
+    "scan_max_pages",
+    "strict_full",
+    "output_profile",
+    "user_id",
+    "mode"
+  ]
+
+  const allowedKeys =
+    kind === "rows"
+      ? commonKeys
+      : kind === "record"
+        ? ["apply_id", "select", "output_profile"]
+        : kind === "aggregate"
+          ? [...commonKeys.filter((item) => item !== "select"), "group_by", "metrics", "time_bucket", "top_n"]
+          : kind === "export"
+            ? [...commonKeys, "format", "file_name", "export_dir"]
+            : ["action", "app_key", "apply_id", "user_id", "fields", "answers", "force_refresh_form"]
+
+  const out: Record<string, unknown> = {}
+  for (const key of allowedKeys) {
+    if (value[key] !== undefined) {
+      out[key] = value[key]
+    }
+  }
   return out
 }
 
@@ -6600,7 +6845,7 @@ async function buildCanonicalAggregateExecution(
     filters: translation.filters,
     sort: translateCanonicalSortToLegacy(input.sort),
     group_by: input.group_by,
-    amount_columns: amountColumns,
+    ...(amountColumns.length > 0 ? { amount_columns: amountColumns } : {}),
     metrics: metricNames,
     time_bucket: input.time_bucket,
     max_groups: input.top_n,
@@ -6671,7 +6916,9 @@ async function buildCanonicalExportExecution(
       scan_max_pages: input.scan_max_pages ?? (input.requested_pages ?? EXPORT_DEFAULT_PAGES),
       strict_full: input.strict_full ?? false,
       mode: input.mode ?? "all",
-      format
+      format,
+      ...(input.file_name ? { file_name: input.file_name } : {}),
+      ...(input.export_dir ? { export_dir: input.export_dir } : {})
     },
     internalTool: format === "csv" ? "qf_export_csv" : "qf_export_json",
     internalArguments,
@@ -6698,7 +6945,10 @@ async function buildCanonicalMutateExecution(
       normalizedQuery: {
         action: input.action,
         app_key: input.app_key ?? null,
-        fields: input.fields ?? null
+        user_id: input.user_id ?? null,
+        fields: input.fields ?? null,
+        answers: input.answers ?? null,
+        force_refresh_form: input.force_refresh_form ?? false
       },
       internalTool: "qf_record_create",
       internalArguments
@@ -6718,11 +6968,32 @@ async function buildCanonicalMutateExecution(
       action: input.action,
       app_key: input.app_key ?? null,
       apply_id: input.apply_id ?? null,
-      fields: input.fields ?? null
+      user_id: input.user_id ?? null,
+      fields: input.fields ?? null,
+      answers: input.answers ?? null,
+      force_refresh_form: input.force_refresh_form ?? false
     },
     internalTool: "qf_record_update",
     internalArguments
   }
+}
+
+function canonicalExecutorToolForKind(
+  kind: z.infer<typeof canonicalPlanInputSchema>["kind"]
+): "qf.query.rows" | "qf.query.record" | "qf.query.aggregate" | "qf.query.export" | "qf.records.mutate" {
+  if (kind === "rows") {
+    return "qf.query.rows"
+  }
+  if (kind === "record") {
+    return "qf.query.record"
+  }
+  if (kind === "aggregate") {
+    return "qf.query.aggregate"
+  }
+  if (kind === "export") {
+    return "qf.query.export"
+  }
+  return "qf.records.mutate"
 }
 
 async function executeFieldResolve(
@@ -6751,6 +7022,46 @@ async function executeFieldResolve(
       results
     },
     meta: buildMeta(response)
+  }
+}
+
+async function executeValueProbe(
+  args: z.infer<typeof valueProbeInputSchema>
+): Promise<z.infer<typeof valueProbeOutputSchema>> {
+  const details = await collectFieldValueCandidatesDetailed({
+    appKey: args.app_key,
+    field: String(args.field),
+    prefix: args.query,
+    match: args.match_mode,
+    limit: args.limit,
+    scanMaxPages: args.scan_max_pages,
+    pageSize: args.page_size
+  })
+
+  return {
+    ok: true,
+    data: {
+      app_key: args.app_key,
+      field: {
+        requested: details.field.requested,
+        que_id: details.field.que_id,
+        que_title: details.field.que_title,
+        que_type: details.field.que_type
+      },
+      query: details.query || null,
+      requested_match_mode: details.requested_match_mode,
+      effective_match_mode: details.effective_match_mode,
+      provider_translation: details.provider_translation,
+      scanned_pages: details.scanned_pages,
+      scanned_records: details.scanned_records,
+      provider_result_amount: details.provider_result_amount,
+      candidates: details.candidates,
+      matched_values: details.candidates.map((item) => item.value)
+    },
+    meta: {
+      version: SERVER_VERSION,
+      generated_at: new Date().toISOString()
+    }
   }
 }
 
@@ -6884,7 +7195,10 @@ async function executeRecordsBatchGet(
     is_complete: missingApplyIds.length === 0,
     partial: missingApplyIds.length > 0,
     omitted_items: missingApplyIds.length,
-    omitted_chars: 0
+    omitted_chars: 0,
+    provider_result_amount: requestedApplyIds.length,
+    source_record_count: rows.length,
+    effective_record_count: rows.length
   }
   const evidence = buildEvidencePayload(
     {
@@ -7132,7 +7446,10 @@ async function executeRecordsExport(
     is_complete: !hasMore && omittedItems === 0,
     partial: hasMore || omittedItems > 0,
     omitted_items: omittedItems,
-    omitted_chars: 0
+    omitted_chars: 0,
+    provider_result_amount: knownResultAmount,
+    source_record_count: rows.length,
+    effective_record_count: rows.length
   }
   const evidence = buildEvidencePayload(
     {
@@ -7393,7 +7710,10 @@ async function executeRecordsList(
     is_complete: isComplete,
     partial: !isComplete,
     omitted_items: omittedItems,
-    omitted_chars: fittedRows.omittedChars
+    omitted_chars: fittedRows.omittedChars,
+    provider_result_amount: knownResultAmount,
+    source_record_count: collectedRawItems.length,
+    effective_record_count: fittedRows.items.length
   }
   const listState: ListQueryState = {
     query_id: queryId,
@@ -7523,7 +7843,10 @@ async function executeRecordGet(
     is_complete: true,
     partial: false,
     omitted_items: 0,
-    omitted_chars: 0
+    omitted_chars: 0,
+    provider_result_amount: 1,
+    source_record_count: 1,
+    effective_record_count: 1
   }
   const evidence: z.infer<typeof recordGetSuccessOutputSchema>["data"]["evidence"] = {
     query_id: queryId,
@@ -8098,7 +8421,10 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     outputPageComplete,
     rawNextPageToken,
     outputNextPageToken: null,
-    stopReason
+    stopReason,
+    providerResultAmount: knownResultAmount,
+    sourceRecordCount: scannedRecords,
+    effectiveRecordCount: scannedRecords
   })
   const evidence = buildEvidencePayload(listState, sourcePages)
 
@@ -8449,7 +8775,12 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     outputPageComplete,
     rawNextPageToken,
     outputNextPageToken: null,
-    stopReason
+    stopReason,
+    providerResultAmount: knownResultAmount,
+    sourceRecordCount: scannedRecords,
+    effectiveRecordCount: scannedRecords,
+    returnedGroupCount: Math.min(groupsTotal, maxGroups),
+    totalGroupCount: groupsTotal
   })
   const evidence = buildEvidencePayload(listState, sourcePages)
 
@@ -9186,41 +9517,127 @@ async function collectFieldValueCandidates(params: {
   prefix?: string
   match?: string
   limit?: number
-}): Promise<Array<{ value: string; count: number; match_strength: number }>> {
+  scanMaxPages?: number
+  pageSize?: number
+}): Promise<
+  Array<{
+    value: unknown
+    display_value: string
+    count: number
+    match_strength: number
+    matched_texts: string[]
+    matched_as: string
+  }>
+> {
+  const details = await collectFieldValueCandidatesDetailed(params)
+  return details.candidates
+}
+
+async function collectFieldValueCandidatesDetailed(params: {
+  appKey: string
+  field: string
+  prefix?: string
+  match?: string
+  limit?: number
+  scanMaxPages?: number
+  pageSize?: number
+}): Promise<{
+  field: SummaryColumn
+  query: string
+  requested_match_mode: (typeof matchModeValues)[number]
+  effective_match_mode: (typeof matchModeValues)[number]
+  provider_translation: string
+  scanned_pages: number
+  scanned_records: number
+  provider_result_amount: number | null
+  candidates: Array<{
+    value: unknown
+    display_value: string
+    count: number
+    match_strength: number
+    matched_texts: string[]
+    matched_as: string
+  }>
+}> {
   const appKey = params.appKey.trim()
   const fieldSelector = params.field.trim()
   if (!appKey || !fieldSelector) {
-    return []
+    throw new InputValidationError({
+      message: "app_key and field are required for qf_value_probe",
+      errorCode: "MISSING_REQUIRED_FIELD",
+      fixHint: "Pass app_key plus field (que_id or field title).",
+      details: {
+        app_key: appKey || null,
+        field: fieldSelector || null
+      }
+    })
   }
 
   const form = await getFormCached(appKey, undefined, false)
   const index = buildFieldIndex(form.result)
   const column = resolveSummaryColumn(fieldSelector, index, "field")
-  const counts = new Map<string, number>()
+  const counts = new Map<
+    string,
+    {
+      value: unknown
+      display_value: string
+      count: number
+      match_strength: number
+      matched_texts: string[]
+      matched_as: string
+    }
+  >()
   let currentPage = 1
+  let scannedPages = 0
+  let scannedRecords = 0
+  let providerResultAmount: number | null = null
 
-  for (let fetched = 0; fetched < 5; fetched += 1) {
+  const query = (params.prefix ?? "").trim()
+  const requestedMatchMode = normalizeMatchMode(params.match)
+  const limit = params.limit ?? 20
+  const scanMaxPages = params.scanMaxPages ?? 5
+  const pageSize = params.pageSize ?? 50
+
+  for (let fetched = 0; fetched < scanMaxPages; fetched += 1) {
     const payload = buildListPayload({
       pageNum: currentPage,
-      pageSize: 50,
+      pageSize,
       mode: "all"
     })
     const response = await client.listRecords(appKey, payload, {})
     const result = asObject(response.result)
     const rawItems = asArray(result?.result)
+    providerResultAmount = providerResultAmount ?? toNonNegativeInt(result?.resultAmount)
+    scannedPages += 1
+    scannedRecords += rawItems.length
     for (const rawItem of rawItems) {
       const record = asObject(rawItem) ?? {}
       const value = extractSummaryColumnValue(asArray(record.answers), column)
-      const candidates = Array.isArray(value) ? value : [value]
-      for (const candidate of candidates) {
-        if (candidate === null || candidate === undefined) {
-          continue
+      if (value === null || value === undefined) {
+        continue
+      }
+      const normalized = normalizeProbeValue(value)
+      if (!normalized.display_value) {
+        continue
+      }
+      const matchDetails = scoreProbeValueMatch(value, query, requestedMatchMode)
+      const existing = counts.get(normalized.key)
+      if (existing) {
+        existing.count += 1
+        if (matchDetails.match_strength > existing.match_strength) {
+          existing.match_strength = matchDetails.match_strength
+          existing.matched_texts = matchDetails.matched_texts
+          existing.matched_as = matchDetails.matched_as
         }
-        const normalized = String(candidate).trim()
-        if (!normalized) {
-          continue
-        }
-        counts.set(normalized, (counts.get(normalized) ?? 0) + 1)
+      } else {
+        counts.set(normalized.key, {
+          value: normalized.value,
+          display_value: normalized.display_value,
+          count: 1,
+          match_strength: matchDetails.match_strength,
+          matched_texts: matchDetails.matched_texts,
+          matched_as: matchDetails.matched_as
+        })
       }
     }
     const pageAmount = toPositiveInt(result?.pageAmount)
@@ -9230,22 +9647,22 @@ async function collectFieldValueCandidates(params: {
     currentPage += 1
   }
 
-  const normalizedPrefix = (params.prefix ?? "").trim().toLowerCase()
-  const match = (params.match ?? "contains").trim().toLowerCase()
-  const limit = params.limit ?? 20
-
-  return Array.from(counts.entries())
-    .map(([value, count]) => ({
-      value,
-      count,
-      match_strength:
-        normalizedPrefix.length === 0
-          ? 1
-          : scoreTextMatch(value, normalizedPrefix, match)
-    }))
+  const candidates = Array.from(counts.values())
     .filter((item) => item.match_strength > 0)
     .sort((a, b) => b.match_strength - a.match_strength || b.count - a.count)
     .slice(0, limit)
+
+  return {
+    field: column,
+    query,
+    requested_match_mode: requestedMatchMode,
+    effective_match_mode: requestedMatchMode,
+    provider_translation: "local_distinct_scan",
+    scanned_pages: scannedPages,
+    scanned_records: scannedRecords,
+    provider_result_amount: providerResultAmount,
+    candidates
+  }
 }
 
 function scoreTextMatch(candidate: string, prefix: string, match: string): number {
@@ -9268,6 +9685,107 @@ function scoreTextMatch(candidate: string, prefix: string, match: string): numbe
   return normalizedCandidate.includes(prefix) ? 0.9 : 0
 }
 
+function normalizeMatchMode(value: unknown): (typeof matchModeValues)[number] {
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase()
+    if (matchModeValues.includes(normalized as (typeof matchModeValues)[number])) {
+      return normalized as (typeof matchModeValues)[number]
+    }
+  }
+  return "contains"
+}
+
+function normalizeProbeValue(value: unknown): {
+  key: string
+  value: unknown
+  display_value: string
+} {
+  if (value === null || value === undefined) {
+    return {
+      key: "null",
+      value,
+      display_value: ""
+    }
+  }
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return {
+      key: stableJson(value),
+      value,
+      display_value: String(value).trim()
+    }
+  }
+  return {
+    key: stableJson(value),
+    value,
+    display_value: stableJson(value)
+  }
+}
+
+function scoreProbeValueMatch(
+  value: unknown,
+  query: string,
+  matchMode: (typeof matchModeValues)[number]
+): {
+  match_strength: number
+  matched_texts: string[]
+  matched_as: string
+} {
+  if (!query) {
+    return {
+      match_strength: 1,
+      matched_texts: [],
+      matched_as: "all"
+    }
+  }
+
+  const normalizedQuery = query.trim().toLowerCase()
+  const normalized = normalizeProbeValue(value)
+  let bestScore = scoreTextMatch(normalized.display_value.toLowerCase(), normalizedQuery, matchMode)
+  let matchedTexts = bestScore > 0 ? [normalized.display_value] : []
+  let matchedAs = bestScore > 0 ? matchMode : "none"
+
+  const leafTexts = flattenProbeLeafTexts(value)
+  for (const leaf of leafTexts) {
+    const score = scoreTextMatch(leaf.toLowerCase(), normalizedQuery, matchMode)
+    if (score > bestScore) {
+      bestScore = score
+      matchedTexts = [leaf]
+      matchedAs = Array.isArray(value)
+        ? `array_${matchMode}`
+        : value && typeof value === "object"
+          ? `object_${matchMode}`
+          : matchMode
+    }
+  }
+
+  return {
+    match_strength: Number(Math.min(1, Math.max(0, bestScore)).toFixed(4)),
+    matched_texts: uniqueStringList(matchedTexts),
+    matched_as: matchedAs
+  }
+}
+
+function flattenProbeLeafTexts(value: unknown, depth = 0): string[] {
+  if (depth > 4 || value === null || value === undefined) {
+    return []
+  }
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    const text = String(value).trim()
+    return text ? [text] : []
+  }
+  if (Array.isArray(value)) {
+    return uniqueStringList(value.flatMap((item) => flattenProbeLeafTexts(item, depth + 1)))
+  }
+  if (typeof value === "object") {
+    return uniqueStringList(
+      Object.values(value as Record<string, unknown>).flatMap((item) =>
+        flattenProbeLeafTexts(item, depth + 1)
+      )
+    )
+  }
+  return []
+}
+
 async function completeFieldValueCandidates(
   appKey: string,
   field: string,
@@ -9281,7 +9799,7 @@ async function completeFieldValueCandidates(
     match,
     limit: 10
   })
-  return candidates.map((item) => item.value)
+  return candidates.map((item) => item.display_value)
 }
 
 function completeQueryIdCandidates(prefix: string): string[] {
@@ -9333,17 +9851,29 @@ async function readFieldValuesResource(uri: string, variables: Variables) {
   if (!appKey || !field) {
     throw new Error("app_key and field are required")
   }
+  const details = await collectFieldValueCandidatesDetailed({
+    appKey,
+    field,
+    prefix,
+    match
+  })
   return jsonResourceResponse(uri, {
     app_key: appKey,
-    field,
-    match,
-    prefix,
-    candidates: await collectFieldValueCandidates({
-      appKey,
-      field,
-      prefix,
-      match
-    })
+    field: {
+      requested: details.field.requested,
+      que_id: details.field.que_id,
+      que_title: details.field.que_title,
+      que_type: details.field.que_type
+    },
+    query: details.query || null,
+    requested_match_mode: details.requested_match_mode,
+    effective_match_mode: details.effective_match_mode,
+    provider_translation: details.provider_translation,
+    scanned_pages: details.scanned_pages,
+    scanned_records: details.scanned_records,
+    provider_result_amount: details.provider_result_amount,
+    candidates: details.candidates,
+    matched_values: details.candidates.map((item) => item.value)
   })
 }
 

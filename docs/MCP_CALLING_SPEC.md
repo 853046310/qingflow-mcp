@@ -1,4 +1,4 @@
-# Qingflow MCP 调用规范（v0.3.x）
+# Qingflow MCP 调用规范（v0.4.x）
 
 本规范用于智能体、前端编排层、后端服务统一接入 `qingflow-mcp`。
 
@@ -115,6 +115,25 @@
 关键入参：
 - 必填：`app_key` + (`query` 或 `queries`)
 - 可选：`top_k`, `fuzzy`
+
+## 6.3.1 `qf_value_probe`
+
+用途：探测某个字段的常见值/候选值，并显式返回匹配模式与命中证据。
+
+关键入参：
+- 必填：`app_key`, `field`
+- 可选：`query`, `match_mode(exact|normalized|contains|prefix|fuzzy)`, `limit`, `scan_max_pages`, `page_size`
+
+返回核心：
+- `field`: 已解析字段元数据（`que_id` / `que_title` / `que_type`）
+- `requested_match_mode` / `effective_match_mode`
+- `provider_translation`
+- `candidates[]`: `value` / `display_value` / `count` / `match_strength` / `matched_texts` / `matched_as`
+- `matched_values`
+
+适用场景：
+- 智能体不确定“北斗/麒麟/追高”是不是某个字段的真实取值
+- 执行正式查询前，需要先确认字段值候选和匹配模式
 
 ## 6.4 `qf_query_plan`
 

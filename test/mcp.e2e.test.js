@@ -744,6 +744,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     const names = tools.tools.map((item) => item.name)
     assert.ok(names.includes("qf_tool_spec_get"))
     assert.ok(names.includes("qf_field_resolve"))
+    assert.ok(names.includes("qf_value_probe"))
     assert.ok(names.includes("qf_query_plan"))
     assert.ok(names.includes("qf_query"))
     assert.ok(names.includes("qf_records_list"))
@@ -774,6 +775,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     }
 
     expectSchemaProps("qf_tool_spec_get", ["tool_name", "include_all"])
+    expectSchemaProps("qf_value_probe", ["app_key", "field", "query", "match_mode"])
     expectSchemaProps("qf_query_plan", ["tool", "arguments", "resolve_fields", "probe"])
     expectSchemaProps("qf_records_list", ["app_key", "page_size", "select_columns", "filters"])
     expectSchemaProps("qf_record_get", ["apply_id", "select_columns"])
@@ -923,6 +925,31 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(resolved.data.results[1].matches[0].que_id, 1002)
   })
 
+  await t.test("qf_value_probe returns matched values with explicit match mode", async () => {
+    const probed = await callTool(mcp.client, "qf_value_probe", {
+      app_key: APP_KEY,
+      field: "客户名称",
+      query: "客户B",
+      match_mode: "exact",
+      limit: 5
+    })
+
+    assert.equal(probed.ok, true)
+    assert.equal(probed.data.field.que_id, 1001)
+    assert.equal(probed.data.requested_match_mode, "exact")
+    assert.equal(probed.data.effective_match_mode, "exact")
+    assert.equal(probed.data.provider_translation, "local_distinct_scan")
+    assert.ok(probed.data.scanned_pages >= 1)
+    assert.ok(probed.data.scanned_records >= 1)
+    assert.equal(probed.data.provider_result_amount, 6)
+    assert.equal(Array.isArray(probed.data.candidates), true)
+    assert.equal(probed.data.candidates[0].value, "客户B")
+    assert.equal(probed.data.candidates[0].display_value, "客户B")
+    assert.equal(probed.data.candidates[0].matched_as, "exact")
+    assert.deepEqual(probed.data.candidates[0].matched_texts, ["客户B"])
+    assert.equal(probed.data.matched_values[0], "客户B")
+  })
+
   await t.test("qf_query_plan normalizes stringified args and estimates pages", async () => {
     const planned = await callTool(mcp.client, "qf_query_plan", {
       tool: "qf_records_list",
@@ -1046,11 +1073,50 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
 
     assert.equal(planned.ok, true)
     assert.equal(planned.data.kind, "rows")
+    assert.equal(planned.data.plan.tool, "qf.query.rows")
+    assert.equal(planned.data.plan.direct_execute, true)
+    assert.equal(planned.data.plan.arguments.app_key, APP_KEY)
+    assert.deepEqual(planned.data.plan.arguments.select, [1001, 1002])
     assert.equal(planned.data.internal_tool, "qf_records_list")
     assert.equal(planned.data.normalized_query.app_key, APP_KEY)
     assert.deepEqual(planned.data.normalized_query.select, [1001, 1002])
     assert.equal(planned.data.validation.valid, true)
     assert.ok(Array.isArray(planned.data.field_mapping))
+  })
+
+  await t.test("qf.query.rows rejects legacy filters at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf.query.rows", {
+      app_key: APP_KEY,
+      select: [1001],
+      filters: [
+        {
+          que_id: 1003,
+          min_value: "2026-01-01",
+          max_value: "2026-01-31"
+        }
+      ]
+    })
+
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /filters|qf\.query\.rows/)
+  })
+
+  await t.test("qf.query.aggregate rejects non-canonical where items at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf.query.aggregate", {
+      app_key: APP_KEY,
+      group_by: [1001],
+      metrics: [{ op: "count" }],
+      where: [
+        {
+          field: 1003,
+          from: "2026-01-01",
+          to: "2026-01-31"
+        }
+      ]
+    })
+
+    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /op|where|qf\.query\.aggregate/)
   })
 
   await t.test("canonical rows query returns resource links and readable query artifacts", async () => {
@@ -1132,12 +1198,43 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(aggregated.ok, true)
     assert.equal(aggregated.data.kind, "aggregate")
     assert.equal(aggregated.data.summary.record_count, 5)
+    assert.equal(aggregated.data.summary.provider_result_amount, 5)
+    assert.equal(aggregated.data.summary.returned_group_count, 3)
+    assert.equal(aggregated.data.summary.total_group_count, 3)
     assert.equal(aggregated.data.summary.metrics_by_column["1002"].sum, 280)
     assert.ok(Array.isArray(aggregated.data.groups))
     assert.ok(aggregated.data.groups[0].metrics_by_column["1002"])
+    assert.equal(aggregated.data.completeness.source_record_count, 5)
+    assert.equal(aggregated.data.completeness.effective_record_count, 5)
+    assert.equal(aggregated.data.completeness.provider_result_amount, 5)
+    assert.equal(aggregated.data.completeness.returned_group_count, 3)
+    assert.equal(aggregated.data.completeness.total_group_count, 3)
     const snapshot = await readResourceJson(mcp.client, aggregated.data.snapshot_resource.uri)
     assert.equal(snapshot.snapshot.kind, "aggregate")
     assert.equal(snapshot.snapshot.summary.metrics_by_column["1002"].avg, 70)
+  })
+
+  await t.test("canonical aggregate exposes source vs provider counts on partial scan", async () => {
+    const aggregated = await callTool(mcp.client, "qf.query.aggregate", {
+      app_key: APP_KEY,
+      group_by: [1001],
+      metrics: [{ op: "count" }],
+      page_size: 2,
+      requested_pages: 1,
+      scan_max_pages: 1,
+      strict_full: false
+    })
+
+    assert.equal(aggregated.ok, true)
+    assert.equal(aggregated.data.summary.record_count, 2)
+    assert.equal(aggregated.data.summary.provider_result_amount, 6)
+    assert.equal(aggregated.data.summary.returned_group_count, 2)
+    assert.equal(aggregated.data.summary.total_group_count, 2)
+    assert.equal(aggregated.data.completeness.source_record_count, 2)
+    assert.equal(aggregated.data.completeness.effective_record_count, 2)
+    assert.equal(aggregated.data.completeness.provider_result_amount, 6)
+    assert.equal(aggregated.data.completeness.raw_scan_complete, false)
+    assert.equal(typeof aggregated.data.cursor, "string")
   })
 
   await t.test("canonical export query returns export resource", async () => {

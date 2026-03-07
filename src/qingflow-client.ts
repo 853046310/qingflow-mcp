@@ -1,3 +1,6 @@
+import { request as httpRequest } from "node:http"
+import { request as httpsRequest } from "node:https"
+
 export type QingflowPrimitive = string | number | boolean | null
 
 export interface QingflowClientConfig {
@@ -160,29 +163,27 @@ export class QingflowClient {
       headers.userId = options.userId
     }
 
-    const init: RequestInit = {
-      method: params.method,
-      headers
-    }
-
+    let requestBody: string | undefined
     if (options.body !== undefined) {
       headers["content-type"] = "application/json"
-      init.body = JSON.stringify(options.body)
+      requestBody = JSON.stringify(options.body)
+      headers["content-length"] = String(Buffer.byteLength(requestBody))
     }
 
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs)
-    init.signal = controller.signal
-
     try {
-      const response = await getFetch()(url, init)
-      const text = await response.text()
+      const response = await sendHttpRequest(url, {
+        method: params.method,
+        headers,
+        body: requestBody,
+        timeoutMs: this.timeoutMs
+      })
+      const text = response.text
       const data = safeJsonParse(text)
 
-      if (!response.ok) {
+      if (response.statusCode < 200 || response.statusCode >= 300) {
         throw new QingflowApiError({
-          message: `Qingflow HTTP ${response.status}`,
-          httpStatus: response.status,
+          message: `Qingflow HTTP ${response.statusCode}`,
+          httpStatus: response.statusCode,
           errMsg: extractErrMsg(data, text),
           details: data ?? text
         })
@@ -191,7 +192,7 @@ export class QingflowClient {
       if (!data || typeof data !== "object") {
         throw new QingflowApiError({
           message: "Qingflow response is not JSON object",
-          httpStatus: response.status,
+          httpStatus: response.statusCode,
           details: text
         })
       }
@@ -200,7 +201,7 @@ export class QingflowClient {
       if (parsed.errCode === null) {
         throw new QingflowApiError({
           message: "Qingflow response missing code field",
-          httpStatus: response.status,
+          httpStatus: response.statusCode,
           details: data
         })
       }
@@ -210,7 +211,7 @@ export class QingflowClient {
           message: `Qingflow API error ${parsed.errCode}: ${parsed.errMsg}`,
           errCode: parsed.errCode,
           errMsg: parsed.errMsg,
-          httpStatus: response.status,
+          httpStatus: response.statusCode,
           details: data
         })
       }
@@ -225,9 +226,9 @@ export class QingflowClient {
         throw error
       }
 
-      if (error instanceof Error && error.name === "AbortError") {
+      if (error instanceof Error && error.message.startsWith("Qingflow request timeout after")) {
         throw new QingflowApiError({
-          message: `Qingflow request timeout after ${this.timeoutMs}ms`
+          message: error.message
         })
       }
 
@@ -235,8 +236,6 @@ export class QingflowClient {
         message: error instanceof Error ? error.message : "Unknown request error",
         details: error
       })
-    } finally {
-      clearTimeout(timer)
     }
   }
 }
@@ -346,13 +345,49 @@ function toFiniteNumber(value: unknown): number | null {
   return null
 }
 
-function getFetch(): typeof fetch {
-  const runtimeFetch = globalThis.fetch
-  if (typeof runtimeFetch === "function") {
-    return runtimeFetch.bind(globalThis) as typeof fetch
+async function sendHttpRequest(
+  url: URL,
+  params: {
+    method: "GET" | "POST"
+    headers: Record<string, string>
+    body?: string
+    timeoutMs: number
   }
+): Promise<{
+  statusCode: number
+  text: string
+}> {
+  const requestImpl = url.protocol === "https:" ? httpsRequest : httpRequest
 
-  throw new QingflowApiError({
-    message: "Global fetch is not available. Use Node.js >= 18."
+  return await new Promise((resolve, reject) => {
+    const req = requestImpl(
+      url,
+      {
+        method: params.method,
+        headers: params.headers
+      },
+      (res) => {
+        const chunks: Buffer[] = []
+        res.on("data", (chunk) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+        })
+        res.on("end", () => {
+          resolve({
+            statusCode: res.statusCode ?? 0,
+            text: Buffer.concat(chunks).toString("utf8")
+          })
+        })
+      }
+    )
+
+    req.setTimeout(params.timeoutMs, () => {
+      req.destroy(new Error(`Qingflow request timeout after ${params.timeoutMs}ms`))
+    })
+    req.on("error", reject)
+
+    if (params.body !== undefined) {
+      req.write(params.body)
+    }
+    req.end()
   })
 }
