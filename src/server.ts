@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
+import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js"
+import { normalizeObjectSchema } from "@modelcontextprotocol/sdk/server/zod-compat.js"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
+import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
 import type { Variables } from "@modelcontextprotocol/sdk/shared/uriTemplate.js"
 import { randomUUID } from "node:crypto"
 import os from "node:os"
@@ -149,7 +152,7 @@ type ContinuationCacheEntry =
     }
 
 class NeedMoreDataError extends Error {
-  public readonly code = "NEED_MORE_DATA"
+  public readonly code = "INCOMPLETE_RESULT"
   public readonly details: Record<string, unknown>
 
   constructor(message: string, details: Record<string, unknown>) {
@@ -289,6 +292,18 @@ const outputProfileSchema = z.enum(["compact", "verbose"])
 type OutputProfile = z.infer<typeof outputProfileSchema>
 const matchModeValues = ["exact", "normalized", "contains", "prefix", "fuzzy"] as const
 const matchModeSchema = z.enum(matchModeValues)
+const PUBLIC_TOOL_NAMES = new Set([
+  "qf_tool_spec_get",
+  "qf_form_get",
+  "qf_field_resolve",
+  "qf_value_probe",
+  "qf.query.plan",
+  "qf.query.rows",
+  "qf.query.record",
+  "qf.query.aggregate",
+  "qf.query.export",
+  "qf.records.mutate"
+])
 
 const completenessSchema = z.object({
   result_amount: z.number().int().nonnegative(),
@@ -325,10 +340,36 @@ const aggregateCompletenessSchema = completenessSchema.omit({
 
 const anyCompletenessSchema = z.union([completenessSchema, aggregateCompletenessSchema])
 
+const canonicalCompletenessSchema = z.object({
+  is_complete: z.boolean(),
+  raw_scan_complete: z.boolean(),
+  scan_limit_hit: z.boolean(),
+  fetched_pages: z.number().int().nonnegative(),
+  requested_pages: z.number().int().positive(),
+  actual_scanned_pages: z.number().int().nonnegative(),
+  scanned_pages: z.number().int().nonnegative(),
+  scan_limit: z.number().int().positive().nullable(),
+  has_more: z.boolean(),
+  next_page_token: z.string().nullable(),
+  stop_reason: z.string().nullable(),
+  output_truncated: z.boolean(),
+  omitted_items: z.number().int().nonnegative(),
+  omitted_chars: z.number().int().nonnegative()
+})
+
 const aggregateSummaryCountSchema = z.object({
   source_record_count: z.number().int().nonnegative(),
   group_assignment_count: z.number().int().nonnegative().nullable(),
   metric_nonnull_record_count: z.number().int().nonnegative().nullable()
+})
+
+const valueProbeCandidateSchema = z.object({
+  value: z.unknown(),
+  display_value: z.string(),
+  observed_count: z.number().int().nonnegative(),
+  score: z.number().min(0).max(1),
+  match: z.string(),
+  matched_texts: z.array(z.string())
 })
 
 const evidenceSchema = z.object({
@@ -341,10 +382,22 @@ const evidenceSchema = z.object({
       column: z.string(),
       from: z.string().nullable(),
       to: z.string().nullable(),
-      timezone: z.string().nullable()
+        timezone: z.string().nullable()
     })
     .nullable(),
-  source_pages: z.array(z.number().int().positive())
+  source_pages: z.array(z.number().int().positive()),
+  match_evidence: z
+    .array(
+      z.object({
+        field: z.union([z.string(), z.number()]),
+        op: z.string(),
+        match: z.string(),
+        requested_value: z.unknown().optional(),
+        requested_values: z.array(z.unknown()).optional(),
+        matched_values: z.array(z.unknown())
+      })
+    )
+    .optional()
 })
 
 const queryContractFields = {
@@ -1249,16 +1302,7 @@ const valueProbeOutputSchema = z.object({
     scanned_pages: z.number().int().nonnegative(),
     scanned_records: z.number().int().nonnegative(),
     provider_result_amount: z.number().int().nonnegative().nullable(),
-    candidates: z.array(
-      z.object({
-        value: z.unknown(),
-        display_value: z.string(),
-        count: z.number().int().nonnegative(),
-        match_strength: z.number().min(0).max(1),
-        matched_texts: z.array(z.string()),
-        matched_as: z.string()
-      })
-    ),
+    candidates: z.array(valueProbeCandidateSchema),
     matched_values: z.array(z.unknown())
   }),
   meta: z.object({
@@ -1633,13 +1677,13 @@ const canonicalPlanInputSchema = z
   })
   .strict()
 
-const canonicalRowsInputSchema = canonicalBaseQueryInputSchema
+const canonicalRowsQuerySchema = canonicalBaseQueryInputSchema
   .extend({
     select: canonicalSelectSchema
   })
   .strict()
 
-const canonicalRecordInputSchema = z
+const canonicalRecordQuerySchema = z
   .object({
     apply_id: canonicalFieldRefSchema,
     select: canonicalSelectSchema,
@@ -1662,7 +1706,7 @@ const canonicalAggregateMetricInputSchema = z
     }
   })
 
-const canonicalAggregateInputSchema = canonicalBaseQueryInputSchema
+const canonicalAggregateQuerySchema = canonicalBaseQueryInputSchema
   .extend({
     group_by: canonicalGroupBySchema,
     metrics: z.array(canonicalAggregateMetricInputSchema).min(1).max(10),
@@ -1671,7 +1715,7 @@ const canonicalAggregateInputSchema = canonicalBaseQueryInputSchema
   })
   .strict()
 
-const canonicalMutateInputSchema = z
+const canonicalMutateQuerySchema = z
   .object({
     action: z.enum(["create", "update"]),
     app_key: z.string().min(1).optional(),
@@ -1683,12 +1727,47 @@ const canonicalMutateInputSchema = z
   })
   .strict()
 
-const canonicalExportInputSchema = canonicalBaseQueryInputSchema
+const canonicalExportQuerySchema = canonicalBaseQueryInputSchema
   .extend({
     select: canonicalSelectSchema,
     format: z.enum(["csv", "json"]).optional(),
     file_name: z.string().min(1).optional(),
     export_dir: z.string().min(1).optional()
+  })
+  .strict()
+
+const canonicalRowsInputSchema = z
+  .object({
+    plan_id: z.string().min(1),
+    query: canonicalRowsQuerySchema.optional()
+  })
+  .strict()
+
+const canonicalRecordInputSchema = z
+  .object({
+    plan_id: z.string().min(1),
+    query: canonicalRecordQuerySchema.optional()
+  })
+  .strict()
+
+const canonicalAggregateInputSchema = z
+  .object({
+    plan_id: z.string().min(1),
+    query: canonicalAggregateQuerySchema.optional()
+  })
+  .strict()
+
+const canonicalMutateInputSchema = z
+  .object({
+    plan_id: z.string().min(1),
+    action: canonicalMutateQuerySchema.optional()
+  })
+  .strict()
+
+const canonicalExportInputSchema = z
+  .object({
+    plan_id: z.string().min(1),
+    query: canonicalExportQuerySchema.optional()
   })
   .strict()
 
@@ -1700,24 +1779,25 @@ const canonicalResourceRefSchema = z.object({
 })
 
 const canonicalExecutionPlanSchema = z.object({
-  tool: z.string().nullable(),
-  arguments: z.record(z.unknown()).nullable(),
-  direct_execute: z.boolean()
+  plan_id: z.string(),
+  kind: z.enum(["rows", "record", "aggregate", "export", "mutate"]),
+  executor_tool: z.string().nullable(),
+  executor_args: z.record(z.unknown()).nullable(),
+  ready: z.boolean(),
+  blockers: z.array(z.string())
 })
 
 const canonicalPlanOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     kind: z.string(),
+    plan_id: z.string(),
     normalized_query: z.record(z.unknown()),
     plan: canonicalExecutionPlanSchema,
-    internal_tool: z.string().nullable(),
-    internal_arguments: z.record(z.unknown()).nullable(),
     field_mapping: z.array(z.record(z.unknown())),
-    validation: z.record(z.unknown()),
     estimate: z.record(z.unknown()),
-    ready_for_final_conclusion: z.boolean(),
-    final_conclusion_blockers: z.array(z.string()),
+    ready: z.boolean(),
+    blockers: z.array(z.string()),
     recommended_next_actions: z.array(z.string()),
     translation_warnings: z.array(z.string())
   }),
@@ -1733,6 +1813,7 @@ const canonicalRowsOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     kind: z.literal("rows"),
+    plan_id: z.string(),
     query_id: z.string(),
     app_key: z.string(),
     normalized_query: z.record(z.unknown()),
@@ -1741,7 +1822,7 @@ const canonicalRowsOutputSchema = z.object({
     cursor: z.string().nullable(),
     snapshot_resource: canonicalResourceRefSchema,
     translation_warnings: z.array(z.string()),
-    completeness: completenessSchema,
+    completeness: canonicalCompletenessSchema,
     evidence: evidenceSchema.optional()
   }),
   meta: apiMetaSchema.optional()
@@ -1751,12 +1832,13 @@ const canonicalRecordOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     kind: z.literal("record"),
+    plan_id: z.string(),
     query_id: z.string(),
     apply_id: z.union([z.string(), z.number(), z.null()]),
     normalized_query: z.record(z.unknown()),
     row: z.record(z.unknown()),
     snapshot_resource: canonicalResourceRefSchema,
-    completeness: completenessSchema,
+    completeness: canonicalCompletenessSchema,
     evidence: z.record(z.unknown()).optional()
   }),
   meta: apiMetaSchema.optional()
@@ -1766,6 +1848,7 @@ const canonicalAggregateOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     kind: z.literal("aggregate"),
+    plan_id: z.string(),
     query_id: z.string(),
     app_key: z.string(),
     normalized_query: z.record(z.unknown()),
@@ -1774,15 +1857,13 @@ const canonicalAggregateOutputSchema = z.object({
       counts: aggregateSummaryCountSchema,
       primary_metric_total: z.number().nullable(),
       primary_metric_missing_count: z.number().int().nonnegative().nullable(),
-      returned_group_count: z.number().int().nonnegative(),
-      total_group_count: z.number().int().nonnegative(),
       metrics_by_column: z.record(z.record(z.union([z.number(), z.null()])))
     }),
     groups: z.array(z.record(z.unknown())),
     cursor: z.string().nullable(),
     snapshot_resource: canonicalResourceRefSchema,
     translation_warnings: z.array(z.string()),
-    completeness: aggregateCompletenessSchema,
+    completeness: canonicalCompletenessSchema,
     evidence: evidenceSchema.optional()
   }),
   meta: apiMetaSchema.optional()
@@ -1792,6 +1873,7 @@ const canonicalMutateOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     kind: z.literal("mutate"),
+    plan_id: z.string(),
     action: z.enum(["create", "update"]),
     query_id: z.string(),
     request_id: z.string().nullable(),
@@ -1805,6 +1887,7 @@ const canonicalExportOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     kind: z.literal("export"),
+    plan_id: z.string(),
     query_id: z.string(),
     export_id: z.string(),
     app_key: z.string(),
@@ -1816,7 +1899,7 @@ const canonicalExportOutputSchema = z.object({
     preview: z.array(z.record(z.unknown())),
     export_resource: canonicalResourceRefSchema,
     snapshot_resource: canonicalResourceRefSchema.optional(),
-    completeness: completenessSchema.optional()
+    completeness: canonicalCompletenessSchema.optional()
   }),
   meta: apiMetaSchema.optional()
 })
@@ -2071,50 +2154,44 @@ server.registerTool(
       )
 
       let normalizedQuery = normalizedLoose
-      let internalTool: string | null =
-        parsedArgs.kind === "rows"
-          ? "qf_records_list"
-          : parsedArgs.kind === "record"
-            ? "qf_record_get"
-            : parsedArgs.kind === "aggregate"
-              ? "qf_records_aggregate"
-              : parsedArgs.kind === "export"
-                ? String(normalizedLoose.format ?? "json").toLowerCase() === "csv"
-                  ? "qf_export_csv"
-                  : "qf_export_json"
-                : null
+      let internalTool: string | null = null
       let internalArguments: Record<string, unknown> | null = null
       let translationWarnings: string[] = []
       let plannedPayload: z.infer<typeof queryPlanOutputSchema> | null = null
+      let ready = false
+      let blockers: string[] = []
+      let fieldMapping: Array<Record<string, unknown>> = []
+      let estimate: Record<string, unknown> = buildEmptyPlanEstimate()
+      let recommendedNextActions: string[] = []
 
       try {
         if (parsedArgs.kind === "rows") {
-          const built = await buildCanonicalRowsExecution(canonicalRowsInputSchema.parse(normalizedLoose))
+          const built = await buildCanonicalRowsExecution(canonicalRowsQuerySchema.parse(normalizedLoose))
           normalizedQuery = built.normalizedQuery
           internalTool = built.internalTool
           internalArguments = built.internalArguments
           translationWarnings = built.translationWarnings
         } else if (parsedArgs.kind === "record") {
-          const built = await buildCanonicalRecordExecution(canonicalRecordInputSchema.parse(normalizedLoose))
+          const built = await buildCanonicalRecordExecution(canonicalRecordQuerySchema.parse(normalizedLoose))
           normalizedQuery = built.normalizedQuery
           internalTool = built.internalTool
           internalArguments = built.internalArguments
         } else if (parsedArgs.kind === "aggregate") {
           const built = await buildCanonicalAggregateExecution(
-            canonicalAggregateInputSchema.parse(normalizedLoose)
+            canonicalAggregateQuerySchema.parse(normalizedLoose)
           )
           normalizedQuery = built.normalizedQuery
           internalTool = built.internalTool
           internalArguments = built.internalArguments
           translationWarnings = built.translationWarnings
         } else if (parsedArgs.kind === "export") {
-          const built = await buildCanonicalExportExecution(canonicalExportInputSchema.parse(normalizedLoose))
+          const built = await buildCanonicalExportExecution(canonicalExportQuerySchema.parse(normalizedLoose))
           normalizedQuery = built.normalizedQuery
           internalTool = built.internalTool
           internalArguments = built.internalArguments
           translationWarnings = built.translationWarnings
         } else {
-          const built = await buildCanonicalMutateExecution(canonicalMutateInputSchema.parse(normalizedLoose))
+          const built = await buildCanonicalMutateExecution(canonicalMutateQuerySchema.parse(normalizedLoose))
           normalizedQuery = built.normalizedQuery
           internalTool = built.internalTool
           internalArguments = built.internalArguments as Record<string, unknown>
@@ -2130,99 +2207,93 @@ server.registerTool(
             })
           )
         }
+        fieldMapping = plannedPayload?.data.field_mapping ?? []
+        estimate = plannedPayload?.data.estimate ?? estimate
+        const validationValid = plannedPayload?.data.validation.valid ?? true
+        const finalReady =
+          plannedPayload?.data.ready_for_final_conclusion ?? parsedArgs.kind === "mutate"
+        const strictFull = normalizedQuery.strict_full === true
+        ready =
+          parsedArgs.kind === "record" || parsedArgs.kind === "mutate"
+            ? true
+            : validationValid && (!strictFull || finalReady)
+        blockers = validationValid
+          ? strictFull
+            ? [...(plannedPayload?.data.final_conclusion_blockers ?? [])]
+            : []
+          : uniqueStringList([
+              ...(plannedPayload?.data.final_conclusion_blockers ?? []),
+              ...(plannedPayload?.data.validation.warnings ?? [])
+            ])
+        recommendedNextActions = plannedPayload?.data.recommended_next_actions ?? []
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        return okResult(
-          {
-            ok: true,
-            data: {
-              kind: parsedArgs.kind,
-              normalized_query: normalizedQuery,
-              plan: {
-                tool: canonicalTool,
-                arguments: normalizedQuery,
-                direct_execute: false
-              },
-              internal_tool: internalTool,
-              internal_arguments: internalArguments,
-              field_mapping: [],
-              validation: {
-                valid: false,
-                missing_required: [],
-                warnings: [message]
-              },
-              estimate: {
-                page_size: null,
-                requested_pages: null,
-                scan_max_pages: null,
-                estimated_scan_pages: null,
-                estimated_items_upper_bound: null,
-                may_hit_limits: false,
-                reasons: [],
-                probe: null
-              },
-              ready_for_final_conclusion: false,
-              final_conclusion_blockers: [message],
-              recommended_next_actions: [
-                "Fix the canonical query shape, then rerun qf.query.plan before execution."
-              ],
-              translation_warnings: translationWarnings
-            },
-            meta: {
-              version: SERVER_VERSION,
-              generated_at: new Date().toISOString()
-            }
+        blockers = [message]
+        ready = false
+        recommendedNextActions = [
+          "Fix the canonical query shape, then rerun qf.query.plan before execution."
+        ]
+      }
+
+      const planId = randomUUID()
+      const executorArgs = ready ? { plan_id: planId } : null
+
+      storeQueryArtifact({
+        queryId: planId,
+        kind: "plan",
+        appKey: asNullableString(asObject(normalizedQuery)?.app_key),
+        normalizedQuery: asObject(normalizedQuery) ?? {},
+        internalTool,
+        internalArguments,
+        snapshot: {
+          kind: "plan",
+          plan_id: planId,
+          executor_kind: parsedArgs.kind,
+          executor_tool: canonicalTool,
+          executor_args: executorArgs,
+          ready,
+          blockers,
+          estimate,
+          field_mapping: fieldMapping,
+          translation_warnings: translationWarnings
+        }
+      })
+
+      const payload: z.infer<typeof canonicalPlanOutputSchema> = {
+        ok: true,
+        data: {
+          kind: parsedArgs.kind,
+          plan_id: planId,
+          normalized_query: asObject(normalizedQuery) ?? {},
+          plan: {
+            plan_id: planId,
+            kind: parsedArgs.kind,
+            executor_tool: ready ? canonicalTool : null,
+            executor_args: ready ? executorArgs : null,
+            ready,
+            blockers
           },
-          `Planned ${parsedArgs.kind} query (invalid)`
-        )
+          field_mapping: fieldMapping,
+          estimate,
+          ready,
+          blockers,
+          recommended_next_actions:
+            recommendedNextActions.length > 0
+              ? recommendedNextActions
+              : ready
+                ? [`Call ${canonicalTool} with {\"plan_id\":\"${planId}\"}.`]
+                : ["Fix blockers, rerun qf.query.plan, then execute the returned plan_id."],
+          translation_warnings: translationWarnings
+        },
+        meta: {
+          version: SERVER_VERSION,
+          generated_at: new Date().toISOString()
+        }
       }
 
       return okResult(
-        {
-          ok: true,
-          data: {
-            kind: parsedArgs.kind,
-            normalized_query: normalizedQuery,
-            plan: {
-              tool: canonicalTool,
-              arguments: normalizedQuery,
-              direct_execute:
-                parsedArgs.kind === "mutate"
-                  ? true
-                  : Boolean(plannedPayload?.data.validation.valid && internalArguments)
-            },
-            internal_tool: internalTool,
-            internal_arguments: internalArguments,
-            field_mapping: plannedPayload?.data.field_mapping ?? [],
-            validation: plannedPayload?.data.validation ?? {
-              valid: true,
-              missing_required: [],
-              warnings: []
-            },
-            estimate: plannedPayload?.data.estimate ?? {
-              page_size: null,
-              requested_pages: null,
-              scan_max_pages: null,
-              estimated_scan_pages: null,
-              estimated_items_upper_bound: null,
-              may_hit_limits: false,
-              reasons: [],
-              probe: null
-            },
-            ready_for_final_conclusion:
-              plannedPayload?.data.ready_for_final_conclusion ?? parsedArgs.kind === "mutate",
-            final_conclusion_blockers:
-              plannedPayload?.data.final_conclusion_blockers ?? [],
-            recommended_next_actions:
-              plannedPayload?.data.recommended_next_actions ?? [],
-            translation_warnings: translationWarnings
-          },
-          meta: {
-            version: SERVER_VERSION,
-            generated_at: new Date().toISOString()
-          }
-        },
-        `Planned canonical ${parsedArgs.kind} query`
+        payload,
+        ready ? `Planned canonical ${parsedArgs.kind} query` : `Planned ${parsedArgs.kind} query (blocked)`
       )
     } catch (error) {
       return errorResult(error)
@@ -2244,31 +2315,64 @@ server.registerTool(
   },
   async (args) => {
     try {
+      const rawArgs = asObject(args)
+      if (!rawArgs?.plan_id) {
+        throw new InputValidationError({
+          message: "qf.query.rows requires plan_id from qf.query.plan",
+          errorCode: "PLAN_REQUIRED",
+          fixHint: "Call qf.query.plan first, then execute qf.query.rows with the returned plan_id."
+        })
+      }
       const parsedArgs = canonicalRowsInputSchema.parse(args)
-      const built = await buildCanonicalRowsExecution(parsedArgs)
-      const executed = await executeRecordsList(built.internalArguments)
+      const planned = getRequiredPlanExecution({
+        planId: parsedArgs.plan_id,
+        expectedKind: "rows",
+        executorTool: "qf.query.rows"
+      })
+      if (parsedArgs.query) {
+        const echoed = await buildCanonicalRowsExecution(parsedArgs.query)
+        assertCanonicalPlanDrift({
+          planId: parsedArgs.plan_id,
+          expected: planned.normalizedQuery,
+          provided: echoed.normalizedQuery,
+          executorTool: "qf.query.rows"
+        })
+      }
+      const executed = await executeRecordsList(listInputSchema.parse(planned.internalArguments))
       const queryId = executed.evidence?.query_id ?? randomUUID()
+      const canonicalCompleteness = toCanonicalCompleteness(executed.completeness)
+      const matchEvidence = await buildCanonicalMatchEvidence({
+        appKey: asNullableString(planned.normalizedQuery.app_key),
+        where: (planned.normalizedQuery.where as Array<z.infer<typeof canonicalWhereItemSchema>> | undefined) ?? []
+      })
+      const evidence = executed.evidence
+        ? {
+            ...executed.evidence,
+            ...(matchEvidence.length > 0 ? { match_evidence: matchEvidence } : {})
+          }
+        : undefined
       const snapshotUri = buildQuerySnapshotResourceUri(queryId)
       const normalizedUri = buildQueryNormalizedResourceUri(queryId)
       const snapshot = {
         kind: "rows",
+        plan_id: parsedArgs.plan_id,
         query_id: queryId,
-        normalized_query: built.normalizedQuery,
+        normalized_query: planned.normalizedQuery,
         rows: executed.payload.data.rows,
         row_count: executed.payload.data.rows.length,
-        cursor: executed.completeness.next_page_token,
-        completeness: executed.completeness,
-        evidence: executed.evidence,
-        translation_warnings: built.translationWarnings
+        cursor: canonicalCompleteness.next_page_token,
+        completeness: canonicalCompleteness,
+        evidence,
+        translation_warnings: []
       }
 
       storeQueryArtifact({
         queryId,
         kind: "rows",
-        appKey: parsedArgs.app_key,
-        normalizedQuery: built.normalizedQuery,
-        internalTool: built.internalTool,
-        internalArguments: built.internalArguments,
+        appKey: asNullableString(planned.normalizedQuery.app_key),
+        normalizedQuery: planned.normalizedQuery,
+        internalTool: planned.internalTool,
+        internalArguments: planned.internalArguments,
         snapshot
       })
 
@@ -2276,20 +2380,21 @@ server.registerTool(
         ok: true,
         data: {
           kind: "rows",
+          plan_id: parsedArgs.plan_id,
           query_id: queryId,
-          app_key: parsedArgs.app_key,
-          normalized_query: built.normalizedQuery,
+          app_key: String(planned.normalizedQuery.app_key ?? ""),
+          normalized_query: planned.normalizedQuery,
           row_count: executed.payload.data.rows.length,
           rows: executed.payload.data.rows,
-          cursor: executed.completeness.next_page_token,
+          cursor: canonicalCompleteness.next_page_token,
           snapshot_resource: buildResourceReference({
             uri: snapshotUri,
             name: "Qingflow Query Snapshot",
             description: "Read this resource to inspect the canonical row result snapshot."
           }),
-          translation_warnings: built.translationWarnings,
-          completeness: executed.completeness,
-          evidence: executed.evidence
+          translation_warnings: [],
+          completeness: canonicalCompleteness,
+          ...(evidence ? { evidence } : {})
         },
         ...(executed.payload.meta ? { meta: executed.payload.meta } : {})
       }
@@ -2326,18 +2431,41 @@ server.registerTool(
   },
   async (args) => {
     try {
+      const rawArgs = asObject(args)
+      if (!rawArgs?.plan_id) {
+        throw new InputValidationError({
+          message: "qf.query.record requires plan_id from qf.query.plan",
+          errorCode: "PLAN_REQUIRED",
+          fixHint: "Call qf.query.plan first, then execute qf.query.record with the returned plan_id."
+        })
+      }
       const parsedArgs = canonicalRecordInputSchema.parse(args)
-      const built = await buildCanonicalRecordExecution(parsedArgs)
-      const executed = await executeRecordGet(built.internalArguments)
+      const planned = getRequiredPlanExecution({
+        planId: parsedArgs.plan_id,
+        expectedKind: "record",
+        executorTool: "qf.query.record"
+      })
+      if (parsedArgs.query) {
+        const echoed = await buildCanonicalRecordExecution(parsedArgs.query)
+        assertCanonicalPlanDrift({
+          planId: parsedArgs.plan_id,
+          expected: planned.normalizedQuery,
+          provided: echoed.normalizedQuery,
+          executorTool: "qf.query.record"
+        })
+      }
+      const executed = await executeRecordGet(recordGetInputSchema.parse(planned.internalArguments))
       const queryId = executed.evidence?.query_id ?? randomUUID()
+      const canonicalCompleteness = toCanonicalCompleteness(executed.completeness)
       const snapshotUri = buildQuerySnapshotResourceUri(queryId)
       const normalizedUri = buildQueryNormalizedResourceUri(queryId)
       const snapshot = {
         kind: "record",
+        plan_id: parsedArgs.plan_id,
         query_id: queryId,
-        normalized_query: built.normalizedQuery,
+        normalized_query: planned.normalizedQuery,
         row: executed.payload.data.row,
-        completeness: executed.completeness,
+        completeness: canonicalCompleteness,
         evidence: executed.evidence
       }
 
@@ -2345,9 +2473,9 @@ server.registerTool(
         queryId,
         kind: "record",
         appKey: null,
-        normalizedQuery: built.normalizedQuery,
-        internalTool: built.internalTool,
-        internalArguments: built.internalArguments,
+        normalizedQuery: planned.normalizedQuery,
+        internalTool: planned.internalTool,
+        internalArguments: planned.internalArguments,
         snapshot
       })
 
@@ -2355,16 +2483,17 @@ server.registerTool(
         ok: true,
         data: {
           kind: "record",
+          plan_id: parsedArgs.plan_id,
           query_id: queryId,
           apply_id: executed.payload.data.apply_id,
-          normalized_query: built.normalizedQuery,
+          normalized_query: planned.normalizedQuery,
           row: executed.payload.data.row,
           snapshot_resource: buildResourceReference({
             uri: snapshotUri,
             name: "Qingflow Record Snapshot",
             description: "Read this resource to inspect the canonical record snapshot."
           }),
-          completeness: executed.completeness,
+          completeness: canonicalCompleteness,
           evidence: executed.evidence
         },
         ...(executed.payload.meta ? { meta: executed.payload.meta } : {})
@@ -2403,17 +2532,49 @@ server.registerTool(
   },
   async (args) => {
     try {
+      const rawArgs = asObject(args)
+      if (!rawArgs?.plan_id) {
+        throw new InputValidationError({
+          message: "qf.query.aggregate requires plan_id from qf.query.plan",
+          errorCode: "PLAN_REQUIRED",
+          fixHint: "Call qf.query.plan first, then execute qf.query.aggregate with the returned plan_id."
+        })
+      }
       const parsedArgs = canonicalAggregateInputSchema.parse(args)
-      const built = await buildCanonicalAggregateExecution(parsedArgs)
-      const executed = await executeRecordsAggregate(built.internalArguments)
+      const planned = getRequiredPlanExecution({
+        planId: parsedArgs.plan_id,
+        expectedKind: "aggregate",
+        executorTool: "qf.query.aggregate"
+      })
+      if (parsedArgs.query) {
+        const echoed = await buildCanonicalAggregateExecution(parsedArgs.query)
+        assertCanonicalPlanDrift({
+          planId: parsedArgs.plan_id,
+          expected: planned.normalizedQuery,
+          provided: echoed.normalizedQuery,
+          executorTool: "qf.query.aggregate"
+        })
+      }
+      const executed = await executeRecordsAggregate(aggregateInputSchema.parse(planned.internalArguments))
       const data = executed.payload.data
-      const completeness = data.completeness ?? executed.payload.completeness
-      if (!completeness) {
+      const rawCompleteness = data.completeness ?? executed.payload.completeness
+      if (!rawCompleteness) {
         throw new Error("Aggregate completeness is missing")
       }
-      const evidence = isVerboseProfile(executed.payload.output_profile ?? "verbose")
+      const canonicalCompleteness = toCanonicalCompleteness(rawCompleteness)
+      const baseEvidence = isVerboseProfile(executed.payload.output_profile ?? "verbose")
         ? (data.evidence as z.infer<typeof evidenceSchema>)
         : null
+      const matchEvidence = await buildCanonicalMatchEvidence({
+        appKey: asNullableString(planned.normalizedQuery.app_key),
+        where: (planned.normalizedQuery.where as Array<z.infer<typeof canonicalWhereItemSchema>> | undefined) ?? []
+      })
+      const evidence = baseEvidence
+        ? {
+            ...baseEvidence,
+            ...(matchEvidence.length > 0 ? { match_evidence: matchEvidence } : {})
+          }
+        : undefined
       const queryId = evidence?.query_id ?? randomUUID()
       const summaryPrimaryMetricTotalRaw = asObject(data.summary)?.primary_metric_total
       const summaryPrimaryMetricTotal =
@@ -2434,10 +2595,6 @@ server.registerTool(
             (asObject(group.metrics_by_column) as Record<string, Record<string, number | null>>) ?? {}
         }
       })
-      const returnedGroupCount =
-        toNonNegativeInt(completeness.returned_group_count) ?? groups.length
-      const totalGroupCount =
-        toNonNegativeInt(completeness.total_group_count) ?? groups.length
       const summaryCounts =
         (asObject(asObject(data.summary)?.counts) as z.infer<typeof aggregateSummaryCountSchema> | null) ?? {
           source_record_count: 0,
@@ -2448,32 +2605,38 @@ server.registerTool(
       const normalizedUri = buildQueryNormalizedResourceUri(queryId)
       const snapshot = {
         kind: "aggregate",
+        plan_id: parsedArgs.plan_id,
         query_id: queryId,
-        normalized_query: built.normalizedQuery,
-        primary_metric_column: built.primaryMetricColumn,
+        normalized_query: planned.normalizedQuery,
+        primary_metric_column:
+          typeof planned.normalizedQuery.metrics === "object" && Array.isArray(planned.normalizedQuery.metrics)
+            ? String(
+                asObject(
+                  asArray(planned.normalizedQuery.metrics).find((item) => asObject(item)?.column !== undefined)
+                )?.column ?? ""
+              ) || null
+            : null,
         summary: {
           counts: summaryCounts,
           primary_metric_total: summaryPrimaryMetricTotal,
           primary_metric_missing_count:
             toNonNegativeInt(asObject(data.summary)?.primary_metric_missing_count) ?? null,
-          returned_group_count: returnedGroupCount,
-          total_group_count: totalGroupCount,
           metrics_by_column: summaryMetrics
         },
         groups,
-        cursor: completeness.next_page_token,
-        completeness,
+        cursor: canonicalCompleteness.next_page_token,
+        completeness: canonicalCompleteness,
         evidence,
-        translation_warnings: built.translationWarnings
+        translation_warnings: []
       }
 
       storeQueryArtifact({
         queryId,
         kind: "aggregate",
-        appKey: parsedArgs.app_key,
-        normalizedQuery: built.normalizedQuery,
-        internalTool: built.internalTool,
-        internalArguments: built.internalArguments,
+        appKey: asNullableString(planned.normalizedQuery.app_key),
+        normalizedQuery: planned.normalizedQuery,
+        internalTool: planned.internalTool,
+        internalArguments: planned.internalArguments,
         snapshot
       })
 
@@ -2481,28 +2644,27 @@ server.registerTool(
         ok: true,
         data: {
           kind: "aggregate",
+          plan_id: parsedArgs.plan_id,
           query_id: queryId,
-          app_key: parsedArgs.app_key,
-          normalized_query: built.normalizedQuery,
-          primary_metric_column: built.primaryMetricColumn,
+          app_key: String(planned.normalizedQuery.app_key ?? ""),
+          normalized_query: planned.normalizedQuery,
+          primary_metric_column: snapshot.primary_metric_column,
           summary: {
             counts: summaryCounts,
             primary_metric_total: summaryPrimaryMetricTotal,
             primary_metric_missing_count:
               toNonNegativeInt(asObject(data.summary)?.primary_metric_missing_count) ?? null,
-            returned_group_count: returnedGroupCount,
-            total_group_count: totalGroupCount,
             metrics_by_column: summaryMetrics
           },
           groups,
-          cursor: completeness.next_page_token,
+          cursor: canonicalCompleteness.next_page_token,
           snapshot_resource: buildResourceReference({
             uri: snapshotUri,
             name: "Qingflow Aggregate Snapshot",
             description: "Read this resource to inspect the canonical aggregate snapshot."
           }),
-          translation_warnings: built.translationWarnings,
-          completeness,
+          translation_warnings: [],
+          completeness: canonicalCompleteness,
           ...(evidence ? { evidence } : {})
         },
         ...(executed.payload.meta ? { meta: executed.payload.meta } : {})
@@ -2540,8 +2702,36 @@ server.registerTool(
   },
   async (args) => {
     try {
+      const rawArgs = asObject(args)
+      if (!rawArgs?.plan_id) {
+        throw new InputValidationError({
+          message: "qf.records.mutate requires plan_id from qf.query.plan",
+          errorCode: "PLAN_REQUIRED",
+          fixHint: "Call qf.query.plan first, then execute qf.records.mutate with the returned plan_id."
+        })
+      }
       const parsedArgs = canonicalMutateInputSchema.parse(args)
-      const built = await buildCanonicalMutateExecution(parsedArgs)
+      const planned = getRequiredPlanExecution({
+        planId: parsedArgs.plan_id,
+        expectedKind: "mutate",
+        executorTool: "qf.records.mutate"
+      })
+      if (parsedArgs.action) {
+        const echoed = await buildCanonicalMutateExecution(parsedArgs.action)
+        assertCanonicalPlanDrift({
+          planId: parsedArgs.plan_id,
+          expected: planned.normalizedQuery,
+          provided: echoed.normalizedQuery,
+          executorTool: "qf.records.mutate"
+        })
+      }
+      const built = {
+        normalizedQuery: planned.normalizedQuery,
+        internalTool: planned.internalTool as "qf_record_create" | "qf_record_update",
+        internalArguments: planned.internalArguments as
+          | z.infer<typeof createInputSchema>
+          | z.infer<typeof updateInputSchema>
+      }
       let payload: z.infer<typeof createOutputSchema> | z.infer<typeof updateOutputSchema>
       let meta: z.infer<typeof apiMetaSchema> | undefined
 
@@ -2621,15 +2811,16 @@ server.registerTool(
       const normalizedUri = buildQueryNormalizedResourceUri(queryId)
       const snapshot = {
         kind: "mutate",
+        plan_id: parsedArgs.plan_id,
         query_id: queryId,
-        action: parsedArgs.action,
+        action: asNullableString(planned.normalizedQuery.action),
         normalized_query: built.normalizedQuery,
         result: payload.data
       }
       storeQueryArtifact({
         queryId,
         kind: "mutate",
-        appKey: asNullableString(parsedArgs.app_key),
+        appKey: asNullableString(planned.normalizedQuery.app_key),
         normalizedQuery: built.normalizedQuery,
         internalTool: built.internalTool,
         internalArguments: built.internalArguments as Record<string, unknown>,
@@ -2640,7 +2831,9 @@ server.registerTool(
         ok: true,
         data: {
           kind: "mutate",
-          action: parsedArgs.action,
+          plan_id: parsedArgs.plan_id,
+          action:
+            String(planned.normalizedQuery.action ?? "update") === "create" ? "create" : "update",
           query_id: queryId,
           request_id: asNullableString(payload.data.request_id),
           ...("apply_id" in payload.data && payload.data.apply_id !== undefined
@@ -2655,7 +2848,7 @@ server.registerTool(
         ...(meta ? { meta } : {})
       }
 
-      return okResultWithLinks(mutatePayload, `${parsedArgs.action} request sent`, [
+      return okResultWithLinks(mutatePayload, `${String(planned.normalizedQuery.action ?? "update")} request sent`, [
         {
           uri: snapshotUri,
           name: "Qingflow Mutation Snapshot",
@@ -2687,17 +2880,48 @@ server.registerTool(
   },
   async (args) => {
     try {
+      const rawArgs = asObject(args)
+      if (!rawArgs?.plan_id) {
+        throw new InputValidationError({
+          message: "qf.query.export requires plan_id from qf.query.plan",
+          errorCode: "PLAN_REQUIRED",
+          fixHint: "Call qf.query.plan first, then execute qf.query.export with the returned plan_id."
+        })
+      }
       const parsedArgs = canonicalExportInputSchema.parse(args)
-      const built = await buildCanonicalExportExecution(parsedArgs)
+      const planned = getRequiredPlanExecution({
+        planId: parsedArgs.plan_id,
+        expectedKind: "export",
+        executorTool: "qf.query.export"
+      })
+      if (parsedArgs.query) {
+        const echoed = await buildCanonicalExportExecution(parsedArgs.query)
+        assertCanonicalPlanDrift({
+          planId: parsedArgs.plan_id,
+          expected: planned.normalizedQuery,
+          provided: echoed.normalizedQuery,
+          executorTool: "qf.query.export"
+        })
+      }
+      const built = {
+        normalizedQuery: planned.normalizedQuery,
+        internalTool: planned.internalTool as "qf_export_csv" | "qf_export_json",
+        internalArguments: exportInputSchema.parse(planned.internalArguments),
+        translationWarnings: []
+      }
       const format = built.internalTool === "qf_export_csv" ? "csv" : "json"
       const executed = await executeRecordsExport(format, built.internalArguments)
       const queryId = executed.payload.data.query_id
       const exportId = executed.payload.data.export_id
+      const canonicalCompleteness = executed.payload.data.completeness
+        ? toCanonicalCompleteness(executed.payload.data.completeness)
+        : undefined
       const snapshotUri = buildQuerySnapshotResourceUri(queryId)
       const normalizedUri = buildQueryNormalizedResourceUri(queryId)
       const exportUri = buildExportResourceUri(exportId)
       const snapshot = {
         kind: "export",
+        plan_id: parsedArgs.plan_id,
         query_id: queryId,
         normalized_query: built.normalizedQuery,
         export_id: exportId,
@@ -2707,14 +2931,14 @@ server.registerTool(
         row_count: executed.payload.data.row_count,
         columns: executed.payload.data.columns,
         preview: executed.payload.data.preview,
-        completeness: executed.payload.data.completeness ?? null,
+        completeness: canonicalCompleteness ?? null,
         translation_warnings: built.translationWarnings
       }
 
       storeQueryArtifact({
         queryId,
         kind: "export",
-        appKey: parsedArgs.app_key,
+        appKey: asNullableString(planned.normalizedQuery.app_key),
         normalizedQuery: built.normalizedQuery,
         internalTool: built.internalTool,
         internalArguments: built.internalArguments,
@@ -2723,7 +2947,7 @@ server.registerTool(
       storeExportArtifact({
         exportId,
         queryId,
-        appKey: parsedArgs.app_key,
+        appKey: asNullableString(planned.normalizedQuery.app_key),
         format,
         filePath: executed.payload.data.file_path,
         fileSizeBytes: executed.payload.data.file_size_bytes,
@@ -2736,9 +2960,10 @@ server.registerTool(
         ok: true,
         data: {
           kind: "export",
+          plan_id: parsedArgs.plan_id,
           query_id: queryId,
           export_id: exportId,
-          app_key: parsedArgs.app_key,
+          app_key: String(planned.normalizedQuery.app_key ?? ""),
           format,
           file_path: executed.payload.data.file_path,
           file_size_bytes: executed.payload.data.file_size_bytes,
@@ -2755,9 +2980,9 @@ server.registerTool(
             name: "Qingflow Export Snapshot",
             description: "Read this resource to inspect the canonical export snapshot."
           }),
-          ...(executed.payload.data.completeness
+          ...(canonicalCompleteness
             ? {
-                completeness: executed.payload.data.completeness
+                completeness: canonicalCompleteness
               }
             : {})
         },
@@ -2786,6 +3011,8 @@ server.registerTool(
     }
   }
 )
+
+installCanonicalToolListHandler()
 
 const appSchemaResourceTemplate = new ResourceTemplate("qingflow://apps/{app_key}/schema", {
   list: undefined,
@@ -3969,27 +4196,13 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       required: [],
       limits: {
         tool_name: "optional; when omitted returns all tool specs",
-        include_all: "default=false; true returns all specs even when tool_name is set",
+        include_all: "default=false; ignored for hidden legacy tools",
         input_contract: "strict JSON only; booleans must use native JSON boolean"
       },
       aliases: {},
       minimal_example: {
-        tool_name: "qf_records_list"
-      }
-    },
-    {
-      tool: "qf_apps_list",
-      required: [],
-      limits: {
-        favourite: "0|1",
-        limit_max: 500,
-        offset_min: 0
+        tool_name: "qf.query.plan"
       },
-      aliases: collectAliasHints(["user_id"], {}),
-      minimal_example: {
-        keyword: "报价",
-        limit: 20
-      }
     },
     {
       tool: "qf_form_get",
@@ -4038,32 +4251,12 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       }
     },
     {
-      tool: "qf_query_plan",
-      required: ["tool"],
-      limits: {
-        tool:
-          "qf_records_list|qf_record_get|qf_query|qf_records_aggregate|qf_records_batch_get|qf_export_csv|qf_export_json",
-        input_contract:
-          'strict JSON only; arguments must be a native JSON object. Target tools reject runtime aliases like from/to/dateFrom/dateTo/searchKey/searchKeys.'
-      },
-      aliases: {},
-      minimal_example: {
-        tool: "qf_query",
-        arguments: {
-          query_mode: "list",
-          app_key: "21b3d559",
-          select_columns: [0, "客户名称"]
-        },
-        resolve_fields: true
-      }
-    },
-    {
       tool: "qf.query.plan",
       required: ["kind"],
       limits: {
         kind: "rows|record|aggregate|export|mutate",
         input_contract:
-          "plan accepts loose model-shaped query objects, but rejects runtime aliases like from/to/dateFrom/dateTo/searchKey/searchKeys before execution"
+          "planner accepts loose model-shaped query objects, canonicalizes them, and returns plan_id + executor_tool + executor_args. Runtime aliases like from/to/dateFrom/dateTo/searchKey/searchKeys are rejected."
       },
       aliases: {},
       minimal_example: {
@@ -4077,305 +4270,65 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
     },
     {
       tool: "qf.query.rows",
-      required: ["app_key", "select"],
+      required: ["plan_id"],
       limits: {
-        limit_max: DEFAULT_ROW_LIMIT,
-        select_max: MAX_COLUMN_LIMIT,
-        page_size_max: 200,
-        requested_pages_max: 500,
-        scan_max_pages_max: 500,
-        input_contract: "strict JSON only; use select/where/sort/limit/cursor"
+        input_contract:
+          "strict JSON only; execute with plan_id from qf.query.plan. Optional query echo must exactly match the planned normalized query."
       },
       aliases: {},
       minimal_example: {
-        app_key: "21b3d559",
-        select: [0, "客户名称"],
-        where: [{ field: "下单日期", op: "between", from: "2026-01-01", to: "2026-01-31" }],
-        limit: 20
+        plan_id: "plan_xxx"
       }
     },
     {
       tool: "qf.query.record",
-      required: ["apply_id", "select"],
+      required: ["plan_id"],
       limits: {
-        select_max: MAX_COLUMN_LIMIT,
-        input_contract: "strict JSON only; use apply_id + select"
+        input_contract:
+          "strict JSON only; execute with plan_id from qf.query.plan. Optional query echo must exactly match the planned normalized query."
       },
       aliases: {},
       minimal_example: {
-        apply_id: "497600278750478338",
-        select: [0, "客户名称"]
+        plan_id: "plan_xxx"
       }
     },
     {
       tool: "qf.query.aggregate",
-      required: ["app_key", "group_by", "metrics"],
+      required: ["plan_id"],
       limits: {
-        group_by_max: 20,
-        top_n_max: 2000,
-        page_size_max: 200,
-        requested_pages_max: 500,
-        scan_max_pages_max: 500,
-        input_contract: "strict JSON only; use where/group_by/metrics/time_bucket"
+        input_contract:
+          "strict JSON only; execute with plan_id from qf.query.plan. Public filtering DSL is where[]. Aggregate business counts live only in summary.counts.*."
       },
       aliases: {},
       minimal_example: {
-        app_key: "21b3d559",
-        where: [{ field: "下单日期", op: "between", from: "2026-01-01", to: "2026-01-31" }],
-        group_by: ["报价类型"],
-        metrics: [{ op: "count" }, { column: "报价总金额", op: "sum" }],
-        strict_full: true
+        plan_id: "plan_xxx"
       }
     },
     {
       tool: "qf.records.mutate",
-      required: ["action", "create: app_key", "update: apply_id"],
+      required: ["plan_id"],
       limits: {
-        action: "create|update",
-        input_contract: "strict JSON only; use fields or answers"
+        input_contract:
+          "strict JSON only; execute with plan_id from qf.query.plan. Optional action echo must exactly match the planned normalized action."
       },
       aliases: {},
       minimal_example: {
-        action: "create",
-        app_key: "21b3d559",
-        fields: {
-          客户名称: "测试客户"
-        }
+        plan_id: "plan_xxx"
       }
     },
     {
       tool: "qf.query.export",
-      required: ["app_key", "select"],
+      required: ["plan_id"],
       limits: {
-        format: "json|csv",
-        limit_max: EXPORT_MAX_ROWS,
-        select_max: MAX_COLUMN_LIMIT,
-        input_contract: "strict JSON only; use canonical rows query fields plus format/file_name/export_dir"
-      },
-      aliases: {},
-      minimal_example: {
-        app_key: "21b3d559",
-        select: [0, "客户名称"],
-        format: "json",
-        limit: 100
-      }
-    },
-    {
-      tool: "qf_records_list",
-      required: ["app_key", "select_columns"],
-      limits: {
-        page_size_max: 200,
-        requested_pages_max: 500,
-        scan_max_pages_max: 500,
-        max_rows_max: 200,
-        max_items_max: 200,
-        max_columns_max: MAX_COLUMN_LIMIT,
-        select_columns_max: MAX_COLUMN_LIMIT,
-        output_profile: "compact|verbose (default compact)",
         input_contract:
-          "strict JSON only; numbers/arrays/objects/booleans must use native JSON types, and runtime aliases from/to/dateFrom/dateTo/searchKey/searchKeys are rejected"
+          "strict JSON only; execute with plan_id from qf.query.plan. Export returns resource links instead of large inline payloads."
       },
       aliases: {},
       minimal_example: {
-        app_key: "21b3d559",
-        mode: "all",
-        page_size: 50,
-        max_rows: 20,
-        select_columns: [0, "客户名称"],
-        output_profile: "compact"
-      }
-    },
-    {
-      tool: "qf_record_get",
-      required: ["apply_id", "select_columns"],
-      limits: {
-        max_columns_max: MAX_COLUMN_LIMIT,
-        select_columns_max: MAX_COLUMN_LIMIT,
-        output_profile: "compact|verbose (default compact)",
-        input_contract: "strict JSON only; select_columns must be a native array"
-      },
-      aliases: {},
-      minimal_example: {
-        apply_id: "497600278750478338",
-        select_columns: [0, "客户名称"],
-        max_columns: 2,
-        output_profile: "compact"
-      }
-    },
-    {
-      tool: "qf_records_batch_get",
-      required: ["app_key", "apply_ids", "select_columns"],
-      limits: {
-        apply_ids_max: 200,
-        max_columns_max: MAX_COLUMN_LIMIT,
-        select_columns_max: MAX_COLUMN_LIMIT,
-        input_contract: "strict JSON only; apply_ids/select_columns must be native arrays"
-      },
-      aliases: {},
-      minimal_example: {
-        app_key: "21b3d559",
-        apply_ids: ["497600278750478338", "497600278750478339"],
-        select_columns: [0, "客户名称"]
-      }
-    },
-    {
-      tool: "qf_export_csv",
-      required: ["app_key", "select_columns"],
-      limits: {
-        page_size_max: 200,
-        requested_pages_max: 500,
-        scan_max_pages_max: 500,
-        max_rows_max: EXPORT_MAX_ROWS,
-        max_columns_max: MAX_COLUMN_LIMIT,
-        select_columns_max: MAX_COLUMN_LIMIT,
-        input_contract:
-          "strict JSON only; select_columns/time_range must use native JSON types, and runtime aliases from/to/dateFrom/dateTo/searchKey/searchKeys are rejected"
-      },
-      aliases: {},
-      minimal_example: {
-        app_key: "21b3d559",
-        mode: "all",
-        page_size: 50,
-        requested_pages: 5,
-        select_columns: [0, "客户名称"],
-        file_name: "报价单导出.csv"
-      }
-    },
-    {
-      tool: "qf_export_json",
-      required: ["app_key", "select_columns"],
-      limits: {
-        page_size_max: 200,
-        requested_pages_max: 500,
-        scan_max_pages_max: 500,
-        max_rows_max: EXPORT_MAX_ROWS,
-        max_columns_max: MAX_COLUMN_LIMIT,
-        select_columns_max: MAX_COLUMN_LIMIT,
-        input_contract:
-          "strict JSON only; select_columns/time_range must use native JSON types, and runtime aliases from/to/dateFrom/dateTo/searchKey/searchKeys are rejected"
-      },
-      aliases: {},
-      minimal_example: {
-        app_key: "21b3d559",
-        mode: "all",
-        page_size: 50,
-        requested_pages: 5,
-        select_columns: [0, "客户名称"],
-        file_name: "报价单导出.json"
-      }
-    },
-    {
-      tool: "qf_query",
-      required: [
-        "record mode: apply_id + select_columns",
-        "list mode: app_key + select_columns",
-        "summary mode: app_key + select_columns"
-      ],
-      limits: {
-        query_mode: "auto|list|record|summary",
-        page_size_max: 200,
-        requested_pages_max: 500,
-        scan_max_pages_max: 500,
-        max_rows_max: 200,
-        max_items_max: 200,
-        max_columns_max: MAX_COLUMN_LIMIT,
-        select_columns_max: MAX_COLUMN_LIMIT,
-        output_profile: "compact|verbose (default compact)",
-        input_contract:
-          "strict JSON only; select_columns/time_range/stat_policy must use native JSON types, and runtime aliases from/to/dateFrom/dateTo/searchKey/searchKeys are rejected"
-      },
-      aliases: {},
-      minimal_example: {
-        query_mode: "list",
-        app_key: "21b3d559",
-        mode: "all",
-        page_size: 50,
-        max_rows: 20,
-        select_columns: [0, "客户名称"],
-        output_profile: "compact",
-        time_range: {
-          column: 6299264,
-          from: "2026-03-05",
-          to: "2026-03-05"
-        }
-      }
-    },
-    {
-      tool: "qf_records_aggregate",
-      required: ["app_key", "group_by"],
-      limits: {
-        page_size_max: 200,
-        requested_pages_max: 500,
-        scan_max_pages_max: 500,
-        max_groups_max: 2000,
-        group_by_max: 20,
-        metrics_supported: ["count", "sum", "avg", "min", "max"],
-        time_bucket_supported: ["day", "week", "month"],
-        output_profile: "compact|verbose (default compact)",
-        input_contract:
-          "strict JSON only; group_by/amount_columns/time_range must use native JSON types, and runtime aliases from/to/dateFrom/dateTo/searchKey/searchKeys are rejected"
-      },
-      aliases: {},
-      minimal_example: {
-        app_key: "21b3d559",
-        mode: "all",
-        group_by: [9500572],
-        amount_columns: [6299263],
-        metrics: ["count", "sum", "avg"],
-        time_bucket: "day",
-        output_profile: "compact",
-        time_range: {
-          column: 6299264,
-          from: "2026-03-05",
-          to: "2026-03-05"
-        },
-        requested_pages: 3,
-        scan_max_pages: 3,
-        strict_full: false
-      }
-    },
-    {
-      tool: "qf_record_create",
-      required: ["app_key", "answers or fields"],
-      limits: {
-        write_mode: "Provide either answers[] or fields{}",
-        input_contract: "strict JSON only; answers must be array and fields must be object"
-      },
-      aliases: {},
-      minimal_example: {
-        app_key: "21b3d559",
-        fields: {
-          客户名称: "测试客户",
-          报价总金额: 1000
-        }
-      }
-    },
-    {
-      tool: "qf_record_update",
-      required: ["apply_id", "answers or fields"],
-      limits: {
-        write_mode: "Provide either answers[] or fields{}",
-        input_contract: "strict JSON only; answers must be array and fields must be object"
-      },
-      aliases: {},
-      minimal_example: {
-        apply_id: "497600278750478338",
-        app_key: "21b3d559",
-        fields: {
-          报价总金额: 1200
-        }
-      }
-    },
-    {
-      tool: "qf_operation_get",
-      required: ["request_id"],
-      limits: {},
-      aliases: {},
-      minimal_example: {
-        request_id: "req-xxxxxxxx"
+        plan_id: "plan_xxx"
       }
     }
-  ]
+  ].filter((item) => PUBLIC_TOOL_NAMES.has(item.tool))
 }
 
 function collectAliasHints(
@@ -6035,7 +5988,7 @@ function assessPlanReadiness(params: {
   if (tool === "qf_records_aggregate" || (tool === "qf_query" && routedMode === "summary")) {
     if (!strictFull) {
       blockers.push("strict_full must be true for final conclusions")
-      actions.push("Set strict_full=true so incomplete raw scans fail with NEED_MORE_DATA.")
+      actions.push("Set strict_full=true so incomplete raw scans fail with INCOMPLETE_RESULT.")
     }
     if (requiredPagesFromProbe !== null && scanLimit < requiredPagesFromProbe) {
       blockers.push(
@@ -6970,7 +6923,7 @@ function translateCanonicalSortToLegacy(
 }
 
 async function buildCanonicalRowsExecution(
-  input: z.infer<typeof canonicalRowsInputSchema>
+  input: z.infer<typeof canonicalRowsQuerySchema>
 ): Promise<{
   normalizedQuery: Record<string, unknown>
   internalTool: string
@@ -7015,7 +6968,7 @@ async function buildCanonicalRowsExecution(
 }
 
 async function buildCanonicalRecordExecution(
-  input: z.infer<typeof canonicalRecordInputSchema>
+  input: z.infer<typeof canonicalRecordQuerySchema>
 ): Promise<{
   normalizedQuery: Record<string, unknown>
   internalTool: string
@@ -7038,7 +6991,7 @@ async function buildCanonicalRecordExecution(
 }
 
 async function buildCanonicalAggregateExecution(
-  input: z.infer<typeof canonicalAggregateInputSchema>
+  input: z.infer<typeof canonicalAggregateQuerySchema>
 ): Promise<{
   normalizedQuery: Record<string, unknown>
   internalTool: string
@@ -7097,7 +7050,7 @@ async function buildCanonicalAggregateExecution(
 }
 
 async function buildCanonicalExportExecution(
-  input: z.infer<typeof canonicalExportInputSchema>
+  input: z.infer<typeof canonicalExportQuerySchema>
 ): Promise<{
   normalizedQuery: Record<string, unknown>
   internalTool: "qf_export_csv" | "qf_export_json"
@@ -7148,7 +7101,7 @@ async function buildCanonicalExportExecution(
 }
 
 async function buildCanonicalMutateExecution(
-  input: z.infer<typeof canonicalMutateInputSchema>
+  input: z.infer<typeof canonicalMutateQuerySchema>
 ): Promise<{
   normalizedQuery: Record<string, unknown>
   internalTool: "qf_record_create" | "qf_record_update"
@@ -7215,6 +7168,280 @@ function canonicalExecutorToolForKind(
     return "qf.query.export"
   }
   return "qf.records.mutate"
+}
+
+function buildEmptyPlanEstimate(): Record<string, unknown> {
+  return {
+    page_size: null,
+    requested_pages: null,
+    scan_max_pages: null,
+    estimated_scan_pages: null,
+    estimated_items_upper_bound: null,
+    may_hit_limits: false,
+    reasons: [],
+    probe: null
+  }
+}
+
+function getRequiredPlanExecution(params: {
+  planId: string
+  expectedKind: z.infer<typeof canonicalPlanInputSchema>["kind"]
+  executorTool: ReturnType<typeof canonicalExecutorToolForKind>
+}): {
+  artifact: QueryArtifactEntry
+  normalizedQuery: Record<string, unknown>
+  internalTool: string
+  internalArguments: Record<string, unknown>
+} {
+  const artifact = getQueryArtifact(params.planId)
+  if (!artifact || artifact.kind !== "plan") {
+    throw new InputValidationError({
+      message: `${params.executorTool} requires a valid plan_id from qf.query.plan`,
+      errorCode: "PLAN_REQUIRED",
+      fixHint: `Call qf.query.plan first, then execute ${params.executorTool} with the returned plan_id.`,
+      details: {
+        plan_id: params.planId,
+        executor_tool: params.executorTool
+      }
+    })
+  }
+
+  const snapshot = asObject(artifact.snapshot) ?? {}
+  const executorKind = asNullableString(snapshot.executor_kind)
+  const executorTool = asNullableString(snapshot.executor_tool)
+  const ready = snapshot.ready === true
+  const blockers = asArray(snapshot.blockers).map((item) => String(item))
+
+  if (executorKind !== params.expectedKind || executorTool !== params.executorTool) {
+    throw new InputValidationError({
+      message: `plan_id ${params.planId} targets ${executorTool ?? "unknown"} (${executorKind ?? "unknown"})`,
+      errorCode: "PLAN_DRIFT",
+      fixHint: "Use the executor_tool returned by qf.query.plan, or rerun qf.query.plan after changing the query.",
+      details: {
+        plan_id: params.planId,
+        expected_kind: params.expectedKind,
+        expected_executor_tool: params.executorTool,
+        actual_kind: executorKind,
+        actual_executor_tool: executorTool
+      }
+    })
+  }
+
+  if (!ready) {
+    throw new InputValidationError({
+      message: `plan_id ${params.planId} is blocked and cannot be executed`,
+      errorCode: "PLAN_NOT_READY",
+      fixHint: "Inspect blockers from qf.query.plan, fix the query, and rerun planning before execution.",
+      details: {
+        plan_id: params.planId,
+        blockers
+      }
+    })
+  }
+
+  if (!artifact.internal_tool || !artifact.internal_arguments) {
+    throw new InputValidationError({
+      message: `plan_id ${params.planId} does not contain executable internal arguments`,
+      errorCode: "PLAN_NOT_READY",
+      fixHint: "Rerun qf.query.plan and execute the returned plan_id without modification.",
+      details: {
+        plan_id: params.planId
+      }
+    })
+  }
+
+  return {
+    artifact,
+    normalizedQuery: artifact.normalized_query,
+    internalTool: artifact.internal_tool,
+    internalArguments: artifact.internal_arguments
+  }
+}
+
+function assertCanonicalPlanDrift(params: {
+  planId: string
+  expected: Record<string, unknown>
+  provided: Record<string, unknown> | null
+  executorTool: ReturnType<typeof canonicalExecutorToolForKind>
+}): void {
+  if (!params.provided) {
+    return
+  }
+  if (stableJson(params.expected) === stableJson(params.provided)) {
+    return
+  }
+  throw new InputValidationError({
+    message: `${params.executorTool} received query arguments that drifted from plan_id ${params.planId}`,
+    errorCode: "PLAN_DRIFT",
+    fixHint:
+      "Do not rewrite executor arguments after planning. Reuse the returned plan_id as-is, or rerun qf.query.plan after changing the query.",
+    details: {
+      plan_id: params.planId,
+      executor_tool: params.executorTool,
+      expected: params.expected,
+      received: params.provided
+    }
+  })
+}
+
+function toCanonicalCompleteness(
+  completeness: z.infer<typeof anyCompletenessSchema> | null | undefined
+): z.infer<typeof canonicalCompletenessSchema> {
+  const raw = asObject(completeness) ?? {}
+  const omittedItems = toNonNegativeInt(raw.omitted_items) ?? 0
+  const omittedChars = toNonNegativeInt(raw.omitted_chars) ?? 0
+  const rawScanComplete =
+    typeof raw.raw_scan_complete === "boolean"
+      ? raw.raw_scan_complete
+      : raw.has_more !== true && omittedItems === 0
+  const outputPageComplete =
+    typeof raw.output_page_complete === "boolean"
+      ? raw.output_page_complete
+      : rawScanComplete
+        ? omittedItems === 0 && omittedChars === 0
+        : true
+  const outputTruncated =
+    typeof raw.output_page_complete === "boolean"
+      ? !raw.output_page_complete
+      : rawScanComplete
+        ? omittedItems > 0 || omittedChars > 0
+        : false
+  return {
+    is_complete: rawScanComplete && !outputTruncated,
+    raw_scan_complete: rawScanComplete,
+    scan_limit_hit: raw.scan_limit_hit === true,
+    fetched_pages: toNonNegativeInt(raw.fetched_pages) ?? 0,
+    requested_pages: toPositiveInt(raw.requested_pages) ?? 1,
+    actual_scanned_pages: toNonNegativeInt(raw.actual_scanned_pages) ?? 0,
+    scanned_pages:
+      toNonNegativeInt(raw.scanned_pages) ??
+      toNonNegativeInt(raw.actual_scanned_pages) ??
+      toNonNegativeInt(raw.fetched_pages) ??
+      0,
+    scan_limit: toPositiveInt(raw.scan_limit) ?? null,
+    has_more: raw.has_more === true,
+    next_page_token: asNullableString(raw.raw_next_page_token ?? raw.next_page_token),
+    stop_reason: asNullableString(raw.stop_reason),
+    output_truncated: outputTruncated,
+    omitted_items: omittedItems,
+    omitted_chars: omittedChars
+  }
+}
+
+async function buildCanonicalMatchEvidence(params: {
+  appKey: string | null
+  where: Array<z.infer<typeof canonicalWhereItemSchema>> | undefined
+}): Promise<NonNullable<z.infer<typeof evidenceSchema>["match_evidence"]>> {
+  if (!params.appKey || !params.where || params.where.length === 0) {
+    return []
+  }
+
+  const output: NonNullable<z.infer<typeof evidenceSchema>["match_evidence"]> = []
+  for (const clause of params.where) {
+    if (clause.op === "between" || clause.op === "gte" || clause.op === "lte" || clause.op === "exists" || clause.op === "not_exists") {
+      continue
+    }
+    const requestedValues =
+      clause.op === "in" || clause.op === "not_in"
+        ? (clause.values ?? []).slice(0, 5)
+        : clause.value !== undefined
+          ? [clause.value]
+          : []
+    const matchedValues: unknown[] = []
+    for (const value of requestedValues) {
+      try {
+        const probe = await collectFieldValueCandidatesDetailed({
+          appKey: params.appKey,
+          field: String(clause.field),
+          prefix: String(value ?? ""),
+          match: clause.match ?? (clause.op === "eq" ? "exact" : clause.op === "prefix" ? "prefix" : "contains"),
+          limit: 5,
+          scanMaxPages: 2,
+          pageSize: 50
+        })
+        matchedValues.push(...probe.candidates.map((item) => item.value))
+      } catch {
+        continue
+      }
+    }
+    output.push({
+      field: clause.field,
+      op: clause.op,
+      match: clause.match ?? (clause.op === "eq" ? "exact" : clause.op === "prefix" ? "prefix" : "contains"),
+      ...(clause.value !== undefined ? { requested_value: clause.value } : {}),
+      ...(clause.values !== undefined ? { requested_values: clause.values } : {}),
+      matched_values: dedupeUnknownValues(matchedValues)
+    })
+  }
+  return output
+}
+
+function dedupeUnknownValues(values: unknown[]): unknown[] {
+  const seen = new Set<string>()
+  const output: unknown[] = []
+  for (const value of values) {
+    const key = stableJson(value)
+    if (seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    output.push(value)
+  }
+  return output
+}
+
+function installCanonicalToolListHandler(): void {
+  const registry = (server as unknown as {
+    _registeredTools: Record<
+      string,
+      {
+        enabled?: boolean
+        title?: unknown
+        description?: unknown
+        inputSchema?: unknown
+        outputSchema?: unknown
+        annotations?: unknown
+        execution?: unknown
+        _meta?: unknown
+      }
+    >
+  })._registeredTools
+  const innerServer = (server as unknown as { server: { setRequestHandler: (schema: unknown, handler: () => unknown) => void } }).server
+  innerServer.setRequestHandler(ListToolsRequestSchema, () => ({
+    tools: Object.entries(registry)
+      .filter(([name, tool]) => PUBLIC_TOOL_NAMES.has(name) && tool.enabled !== false)
+      .map(([name, tool]) => {
+        const inputObject = normalizeObjectSchema(tool.inputSchema as Parameters<typeof normalizeObjectSchema>[0])
+        const outputObject = tool.outputSchema
+          ? normalizeObjectSchema(tool.outputSchema as Parameters<typeof normalizeObjectSchema>[0])
+          : null
+        return {
+          name,
+          title: typeof tool.title === "string" ? tool.title : undefined,
+          description: typeof tool.description === "string" ? tool.description : undefined,
+          inputSchema: inputObject
+            ? toJsonSchemaCompat(inputObject, {
+                strictUnions: true,
+                pipeStrategy: "input"
+              })
+            : {
+                type: "object",
+                properties: {}
+              },
+          ...(outputObject
+            ? {
+                outputSchema: toJsonSchemaCompat(outputObject, {
+                  strictUnions: true,
+                  pipeStrategy: "output"
+                })
+              }
+            : {}),
+          ...(tool.annotations ? { annotations: tool.annotations } : {}),
+          ...(tool.execution ? { execution: tool.execution } : {}),
+          ...(tool._meta ? { _meta: tool._meta } : {})
+        }
+      })
+  }))
 }
 
 async function executeFieldResolve(
@@ -7692,7 +7919,7 @@ async function executeRecordsExport(
     throw new NeedMoreDataError(
       `Export ${format} result is incomplete. Continue with next_page_token or increase requested_pages.`,
       {
-        code: "NEED_MORE_DATA",
+        code: "INCOMPLETE_RESULT",
         completeness,
         evidence
       }
@@ -7953,7 +8180,7 @@ async function executeRecordsList(
     throw new NeedMoreDataError(
       "List result is incomplete. Increase requested_pages/max_rows or continue with next_page_token.",
       {
-        code: "NEED_MORE_DATA",
+        code: "INCOMPLETE_RESULT",
         completeness,
         evidence
       }
@@ -8857,7 +9084,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     throw new NeedMoreDataError(
       "Aggregate result is incomplete. Continue with next_page_token or increase requested_pages/scan_max_pages.",
       {
-        code: "NEED_MORE_DATA",
+        code: "INCOMPLETE_RESULT",
         completeness,
         evidence
       }
@@ -9608,10 +9835,10 @@ async function collectFieldValueCandidates(params: {
   Array<{
     value: unknown
     display_value: string
-    count: number
-    match_strength: number
+    observed_count: number
+    score: number
     matched_texts: string[]
-    matched_as: string
+    match: string
   }>
 > {
   const details = await collectFieldValueCandidatesDetailed(params)
@@ -9638,10 +9865,10 @@ async function collectFieldValueCandidatesDetailed(params: {
   candidates: Array<{
     value: unknown
     display_value: string
-    count: number
-    match_strength: number
+    observed_count: number
+    score: number
     matched_texts: string[]
-    matched_as: string
+    match: string
   }>
 }> {
   const appKey = params.appKey.trim()
@@ -9666,10 +9893,10 @@ async function collectFieldValueCandidatesDetailed(params: {
     {
       value: unknown
       display_value: string
-      count: number
-      match_strength: number
+      observed_count: number
+      score: number
       matched_texts: string[]
-      matched_as: string
+      match: string
     }
   >()
   let currentPage = 1
@@ -9708,20 +9935,20 @@ async function collectFieldValueCandidatesDetailed(params: {
       const matchDetails = scoreProbeValueMatch(value, query, requestedMatchMode)
       const existing = counts.get(normalized.key)
       if (existing) {
-        existing.count += 1
-        if (matchDetails.match_strength > existing.match_strength) {
-          existing.match_strength = matchDetails.match_strength
+        existing.observed_count += 1
+        if (matchDetails.match_strength > existing.score) {
+          existing.score = matchDetails.match_strength
           existing.matched_texts = matchDetails.matched_texts
-          existing.matched_as = matchDetails.matched_as
+          existing.match = matchDetails.matched_as
         }
       } else {
         counts.set(normalized.key, {
           value: normalized.value,
           display_value: normalized.display_value,
-          count: 1,
-          match_strength: matchDetails.match_strength,
+          observed_count: 1,
+          score: matchDetails.match_strength,
           matched_texts: matchDetails.matched_texts,
-          matched_as: matchDetails.matched_as
+          match: matchDetails.matched_as
         })
       }
     }
@@ -9733,8 +9960,8 @@ async function collectFieldValueCandidatesDetailed(params: {
   }
 
   const candidates = Array.from(counts.values())
-    .filter((item) => item.match_strength > 0)
-    .sort((a, b) => b.match_strength - a.match_strength || b.count - a.count)
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || b.observed_count - a.observed_count)
     .slice(0, limit)
 
   return {
@@ -10689,7 +10916,7 @@ function buildErrorExampleCalls(params: {
   const selectColumns = resolveExampleSelectColumns(params.details)
   const errorCode = params.errorCode
 
-  if (errorCode === "NEED_MORE_DATA") {
+  if (errorCode === "INCOMPLETE_RESULT") {
     const inferred = inferNeedMoreDataTarget(params.message, params.details)
     const nextPageToken = params.nextPageToken ?? resolveNextPageToken(params.details)
     const continued = buildBaseExampleCall({
@@ -10801,7 +11028,12 @@ function buildErrorExampleCalls(params: {
     ]
   }
 
-  if (errorCode === "INVALID_ARGUMENTS" || errorCode === "QINGFLOW_API_ERROR") {
+  if (
+    errorCode === "VALIDATION_ERROR" ||
+    errorCode === "INVALID_ARGUMENTS" ||
+    errorCode === "UPSTREAM_API_ERROR" ||
+    errorCode === "QINGFLOW_API_ERROR"
+  ) {
     return [
       {
         tool: "qf_form_get",
@@ -11031,21 +11263,62 @@ function buildBaseExampleCall(params: {
   }
 }
 
+function isRetryableErrorCode(code: string): boolean {
+  return new Set([
+    "PLAN_REQUIRED",
+    "PLAN_NOT_READY",
+    "PLAN_DRIFT",
+    "INCOMPLETE_RESULT",
+    "UPSTREAM_TIMEOUT",
+    "UPSTREAM_API_ERROR",
+    "FORBIDDEN_RUNTIME_ALIAS",
+    "INVALID_FIELD_REF",
+    "UNKNOWN_FIELD_VALUE",
+    "UNSUPPORTED_MATCH_MODE"
+  ]).has(code)
+}
+
+function buildStructuredErrorPayload(params: {
+  code: string
+  message: string
+  fixHint: string
+  nextPageToken?: string | null
+  details?: Record<string, unknown> | unknown | null
+  extras?: Record<string, unknown>
+}): Record<string, unknown> {
+  const payload = {
+    ok: false,
+    error: {
+      code: params.code,
+      message: params.message,
+      fix_hint: params.fixHint,
+      retryable: isRetryableErrorCode(params.code)
+    },
+    error_code: params.code,
+    message: params.message,
+    fix_hint: params.fixHint,
+    next_page_token: params.nextPageToken ?? null,
+    ...(params.details !== undefined ? { details: params.details } : {}),
+    ...(params.extras ?? {})
+  }
+  return payload
+}
+
 function toErrorPayload(error: unknown): Record<string, unknown> {
   if (error instanceof NeedMoreDataError) {
     const details = asObject(error.details)
     const completeness = asObject(details?.completeness)
     return withExampleCalls(
-      {
-      ok: false,
-      code: error.code,
-      error_code: error.code,
-      status: "need_more_data",
-      message: error.message,
-      fix_hint: "Continue with next_page_token or increase requested_pages/scan_max_pages.",
-      next_page_token: asNullableString(completeness?.next_page_token),
-      details: error.details
-      },
+      buildStructuredErrorPayload({
+        code: error.code,
+        message: error.message,
+        fixHint: "Continue with next_page_token or increase requested_pages/scan_max_pages.",
+        nextPageToken: asNullableString(completeness?.next_page_token),
+        details: error.details,
+        extras: {
+          status: "need_more_data"
+        }
+      }),
       {
         errorCode: error.code,
         message: error.message,
@@ -11056,14 +11329,12 @@ function toErrorPayload(error: unknown): Record<string, unknown> {
   }
   if (error instanceof InputValidationError) {
     return withExampleCalls(
-      {
-      ok: false,
-      error_code: error.errorCode,
-      message: error.message,
-      fix_hint: error.fixHint,
-      next_page_token: null,
-      details: error.details
-      },
+      buildStructuredErrorPayload({
+        code: error.errorCode,
+        message: error.message,
+        fixHint: error.fixHint,
+        details: error.details
+      }),
       {
         errorCode: error.errorCode,
         message: error.message,
@@ -11074,21 +11345,21 @@ function toErrorPayload(error: unknown): Record<string, unknown> {
   if (error instanceof QingflowApiError) {
     const timeoutHint = /timeout/i.test(error.message) || /timeout/i.test(error.errMsg)
     return withExampleCalls(
+      buildStructuredErrorPayload({
+        code: timeoutHint ? "UPSTREAM_TIMEOUT" : "UPSTREAM_API_ERROR",
+        message: error.message,
+        fixHint: timeoutHint
+          ? "Upstream request timed out. Reduce page_size/requested_pages, narrow filters, or continue with next_page_token."
+          : "Check app_key/accessToken and request body against qf_form_get field definitions.",
+        details: error.details ?? null,
+        extras: {
+          err_code: error.errCode,
+          err_msg: error.errMsg || null,
+          http_status: error.httpStatus
+        }
+      }),
       {
-      ok: false,
-      error_code: timeoutHint ? "UPSTREAM_TIMEOUT" : "QINGFLOW_API_ERROR",
-      message: error.message,
-      err_code: error.errCode,
-      err_msg: error.errMsg || null,
-      http_status: error.httpStatus,
-      fix_hint: timeoutHint
-        ? "Upstream request timed out. Reduce page_size/requested_pages, narrow filters, or continue with next_page_token."
-        : "Check app_key/accessToken and request body against qf_form_get field definitions.",
-      next_page_token: null,
-      details: error.details ?? null
-      },
-      {
-        errorCode: timeoutHint ? "UPSTREAM_TIMEOUT" : "QINGFLOW_API_ERROR",
+        errorCode: timeoutHint ? "UPSTREAM_TIMEOUT" : "UPSTREAM_API_ERROR",
         message: error.message,
         details: asObject(error.details),
         timeoutHint
@@ -11098,30 +11369,38 @@ function toErrorPayload(error: unknown): Record<string, unknown> {
   if (error instanceof z.ZodError) {
     const firstIssue = error.issues[0]
     const firstPath = firstIssue?.path?.join(".") || "arguments"
+    const isPlanRequired = error.issues.some(
+      (issue) =>
+        issue.path.join(".") === "plan_id" &&
+        (issue.code === "invalid_type" || issue.code === "too_small")
+    )
     return withExampleCalls(
+      buildStructuredErrorPayload({
+        code: isPlanRequired ? "PLAN_REQUIRED" : "VALIDATION_ERROR",
+        message: isPlanRequired ? "plan_id is required" : "Invalid arguments",
+        fixHint: isPlanRequired
+          ? "Call qf.query.plan first, then execute the returned plan_id without rewriting executor arguments."
+          : `Fix field "${firstPath}" and retry with schema-compliant values.`,
+        details: {
+          issues: error.issues
+        },
+        extras: {
+          issues: error.issues
+        }
+      }),
       {
-      ok: false,
-      error_code: "INVALID_ARGUMENTS",
-      message: "Invalid arguments",
-      fix_hint: `Fix field "${firstPath}" and retry with schema-compliant values.`,
-      next_page_token: null,
-      issues: error.issues
-      },
-      {
-        errorCode: "INVALID_ARGUMENTS",
-        message: "Invalid arguments"
+        errorCode: isPlanRequired ? "PLAN_REQUIRED" : "VALIDATION_ERROR",
+        message: isPlanRequired ? "plan_id is required" : "Invalid arguments"
       }
     )
   }
   if (error instanceof Error) {
     return withExampleCalls(
-      {
-      ok: false,
-      error_code: "INTERNAL_ERROR",
-      message: error.message,
-      fix_hint: "Retry the request. If it persists, report query_id and input payload.",
-      next_page_token: null
-      },
+      buildStructuredErrorPayload({
+        code: "INTERNAL_ERROR",
+        message: error.message,
+        fixHint: "Retry the request. If it persists, report query_id and input payload."
+      }),
       {
         errorCode: "INTERNAL_ERROR",
         message: error.message
@@ -11129,14 +11408,12 @@ function toErrorPayload(error: unknown): Record<string, unknown> {
     )
   }
   return withExampleCalls(
-    {
-    ok: false,
-    error_code: "UNKNOWN_ERROR",
-    message: "Unknown error",
-    fix_hint: "Retry the request with explicit app_key/select_columns and deterministic page parameters.",
-    next_page_token: null,
-    details: error
-    },
+    buildStructuredErrorPayload({
+      code: "UNKNOWN_ERROR",
+      message: "Unknown error",
+      fixHint: "Retry the request with explicit app_key/select_columns and deterministic page parameters.",
+      details: error
+    }),
     {
       errorCode: "UNKNOWN_ERROR",
       message: "Unknown error"

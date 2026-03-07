@@ -1,22 +1,19 @@
 # Qingflow MCP (CRUD)
 
-This MCP server wraps Qingflow OpenAPI for:
+This MCP server exposes a canonical, agent-native public surface:
 
-- `qf_apps_list`
+- `qf_tool_spec_get`
 - `qf_form_get`
 - `qf_field_resolve`
 - `qf_value_probe`
-- `qf_query_plan`
-- `qf_records_list`
-- `qf_record_get`
-- `qf_records_batch_get`
-- `qf_export_csv`
-- `qf_export_json`
-- `qf_query` (unified read entry: list / record / summary)
-- `qf_records_aggregate` (deterministic grouped metrics)
-- `qf_record_create`
-- `qf_record_update`
-- `qf_operation_get`
+- `qf.query.plan`
+- `qf.query.rows`
+- `qf.query.record`
+- `qf.query.aggregate`
+- `qf.query.export`
+- `qf.records.mutate`
+
+Legacy tools still exist internally for compatibility logic, but they are no longer advertised via `listTools()`.
 
 It intentionally excludes delete for now.
 
@@ -90,12 +87,19 @@ qingflow-mcp cli tools
 # machine-readable tool list
 qingflow-mcp cli tools --json
 
-# call one tool with JSON args
-qingflow-mcp cli call qf_apps_list --args '{"limit":5}'
+# canonical plan -> execute
+qingflow-mcp cli call qf.query.plan --args '{
+  "kind":"rows",
+  "query":{
+    "app_key":"your_app_key",
+    "select":[1001,1002],
+    "where":[{"field":1003,"op":"between","from":"2026-01-01","to":"2026-01-31"}],
+    "limit":20
+  }
+}'
 
-# call from stdin
-echo '{"app_key":"your_app_key","mode":"all","select_columns":[1001]}' \
-  | qingflow-mcp cli call qf_query
+# then execute with returned plan_id
+qingflow-mcp cli call qf.query.rows --args '{"plan_id":"plan_xxx"}'
 ```
 
 ## CLI Install
@@ -109,7 +113,7 @@ npm i -g git+https://github.com/853046310/qingflow-mcp.git
 Install from npm (pinned version):
 
 ```bash
-npm i -g qingflow-mcp@0.6.0
+npm i -g qingflow-mcp@0.7.0
 ```
 
 Or one-click installer:
@@ -156,197 +160,122 @@ Full calling contract (Chinese):
 - [MCP 调用规范](./docs/MCP_CALLING_SPEC.md)
 - [vNext Agent-Native 设计稿](./docs/VNEXT_AGENT_NATIVE_DESIGN.md)
 
-## Unified Query (`qf_query`)
+## Canonical Usage
 
-`qf_query` is the recommended read entry for agents.
+Public agent flow is now:
 
-1. `query_mode=auto`:
-   - if `apply_id` is set, route to single-record query.
-   - if summary params are set (`amount_column` / `time_range` / `stat_policy` / `scan_max_pages`), route to aggregate-backed summary query.
-   - otherwise route to list query.
-2. `query_mode=list|record|summary` forces explicit behavior.
-3. In `list` mode, `time_range` is translated to list filters when `from` or `to` is provided.
-4. In `list` mode, `select_columns` is required.
-5. In `list` mode, row cap defaults to 200 when `max_rows` and `max_items` are omitted.
-6. In `record` mode, `select_columns` is required.
-7. In `summary` mode, `select_columns` is required (`max_rows` defaults to 200 when omitted).
+1. `qf_form_get` / `qf_field_resolve` when field mapping is unclear
+2. `qf_value_probe` when field value candidates are unclear
+3. `qf.query.plan`
+4. Execute the returned `plan_id` with:
+   - `qf.query.rows`
+   - `qf.query.record`
+   - `qf.query.aggregate`
+   - `qf.query.export`
+   - `qf.records.mutate`
 
-Summary mode output:
-
-1. `qf_query(summary)` is a compatibility wrapper over the aggregate core.
-2. `summary`: aggregated stats (`counts.source_record_count`, `counts.group_assignment_count`, `counts.metric_nonnull_record_count`, `primary_metric_total`, `primary_metric_missing_count`, `by_day`).
-3. `rows`: strict sample rows (only requested `select_columns`).
-4. `meta`: field mapping, filter scope, stat policy, execution limits (`output_profile=verbose` only).
-
-Return shape:
-
-1. success: structured payload `{ "ok": true, "data": ... }` (`meta` only in `output_profile=verbose`)
-2. failure: MCP `isError=true`, and text content is JSON payload like `{ "ok": false, "message": ..., ... }`
-3. incomplete strict queries fail with `{ "code": "NEED_MORE_DATA", "status": "need_more_data", ... }`
-
-Deterministic read protocol (list/summary/aggregate):
-
-1. output profile:
-   - default `output_profile=compact`: return core data only (`rows/row/groups/summary` + `next_page_token`)
-   - `output_profile=verbose`: include full contract (`completeness` + `evidence` + `meta`)
-   - exception: aggregate-style outputs (`qf_query(summary)` compatibility wrapper and `qf_records_aggregate`) always return `completeness`, even in `compact`, so agents can block on incomplete statistics
-2. when `output_profile=verbose`, list/record-style `completeness` fields are:
-   - `result_amount`
-   - `returned_items`
-   - `fetched_pages`
-   - `requested_pages`
-   - `actual_scanned_pages`
-   - `has_more`
-   - `next_page_token`
-   - `is_complete`
-   - `partial`
-   - `omitted_items`
-   - `omitted_chars`
-3. aggregate-style `completeness` focuses on scan state, not business totals:
-   - `fetched_pages`
-   - `requested_pages`
-   - `actual_scanned_pages`
-   - `has_more`
-   - `next_page_token`
-   - `is_complete`
-   - `partial`
-   - `omitted_items`
-   - `omitted_chars`
-   - `raw_scan_complete`
-   - `scan_limit_hit`
-   - `scanned_pages`
-   - `scan_limit`
-   - `output_page_complete`
-   - `raw_next_page_token`
-   - `output_next_page_token`
-   - `stop_reason`
-   - `returned_group_count`
-   - `total_group_count`
-4. when `output_profile=verbose`, `evidence` fields are:
-   - `query_id`
-   - `app_key`
-   - `filters`
-   - `selected_columns`
-   - `time_range`
-   - `source_pages`
-5. aggregate business totals now use one canonical summary contract:
-   - `summary.counts.source_record_count`: default answer for “how many records”
-   - `summary.counts.group_assignment_count`: expanded group-assignment count; only populated after `raw_scan_complete=true`
-   - `summary.counts.metric_nonnull_record_count`: primary metric non-null coverage count; only populated after `raw_scan_complete=true`
-   - `summary.primary_metric_total`: aggregate total for the primary metric column
-   - `summary.primary_metric_missing_count`: number of records missing the primary metric value
-6. `strict_full=true` makes incomplete results fail fast with `NEED_MORE_DATA`.
-   - for `qf_query(summary)`, `strict_full` enforces raw source scan completeness; sample-row truncation does not change aggregate completeness
-7. Error payloads expose `error_code` and `fix_hint` for actionable retries.
-8. Public MCP `inputSchema` is strict:
-   - numbers must be native JSON numbers
-   - arrays must be native JSON arrays
-   - objects must be native JSON objects
-   - booleans must be native JSON booleans
-   - unknown fields are rejected by the MCP boundary
-9. Use `qf_query_plan` as the only preflight tool when the agent is unsure about arguments. It can normalize loose/model-shaped inputs before a real query is issued, but runtime aliases like `from`/`to`/`dateFrom`/`dateTo`/`searchKey`/`searchKeys` are rejected.
-
-For `qf_query(summary)` and `qf_records_aggregate`, read `data.summary.completeness` / `data.completeness` before concluding:
-
-1. `raw_scan_complete=false`: source data is not fully scanned, do not produce a final conclusion.
-2. `scan_limit_hit=true`: query stopped because scan budget was hit.
-3. `output_page_complete=false`: source may be complete, but aggregate output itself was truncated by output limits such as `max_groups`.
-4. `raw_next_page_token`: use this token to continue raw scan pagination (`next_page_token` remains as a backward-compatible alias). For `qf_query(summary)` / `qf_records_aggregate`, the token carries cumulative state, so keep query arguments unchanged when resuming.
-
-## List Query Tips
-
-Strict mode (`qf_records_list`):
-
-1. `select_columns` is required.
-2. `include_answers=false` is not allowed.
-3. Output is flat `rows[]` (no raw `answers` payload).
-
-1. For `qf_records_list.sort[].que_id`, use a real field `que_id` (numeric) or exact field title from `qf_form_get`.
-2. Avoid aliases like `create_time`; Qingflow often rejects them.
-3. Use `max_rows` (or `max_items`) to cap returned rows. Default row cap is 200.
-4. Use `max_columns` to cap returned columns per row.
-5. Use `select_columns` to return only specific columns (supports `que_id` or exact field title).
-6. The server may still trim by response-size guardrail (`QINGFLOW_LIST_MAX_ITEMS_BYTES`) when payload is too large.
-7. Use `requested_pages` and `scan_max_pages` for deterministic page scan.
-8. Continue with `page_token` from previous `next_page_token`.
-9. Column limits: `select_columns <= 2`, `max_columns <= 2`.
-
-Example:
+### Planner Example
 
 ```json
 {
-  "app_key": "your_app_key",
-  "mode": "all",
-  "page_size": 50,
-  "requested_pages": 1,
-  "scan_max_pages": 1,
-  "include_answers": true,
-  "max_rows": 10,
-  "max_columns": 2,
-  "select_columns": [1, "客户名称"],
-  "output_profile": "compact",
-  "strict_full": false
+  "kind": "aggregate",
+  "query": {
+    "app_key": "your_app_key",
+    "where": [
+      { "field": 1003, "op": "between", "from": "2026-01-01", "to": "2026-01-31" }
+    ],
+    "group_by": [1003],
+    "metrics": [
+      { "op": "count" },
+      { "column": 1002, "op": "sum" }
+    ],
+    "strict_full": true
+  }
 }
 ```
 
-For single record details (`qf_record_get`), the same column controls are supported:
+### Execute Example
 
 ```json
 {
-  "apply_id": "497600278750478338",
-  "max_columns": 2,
-  "select_columns": [1, "客户名称"],
-  "output_profile": "compact"
+  "plan_id": "plan_xxx"
 }
 ```
 
-`qf_record_get` requires `select_columns`.
+Rules:
 
-Aggregate example (`qf_records_aggregate`):
+1. Public execute tools require `plan_id`.
+2. Optional `query` / `action` echo is only used for drift checking.
+3. If execute input drifts from the planned canonical query, the server returns `PLAN_DRIFT`.
+4. Public filtering uses canonical `where[]`; legacy `filters` are no longer part of the public contract.
+
+### Aggregate Business Counts
+
+Aggregate business summaries use one canonical count contract:
 
 ```json
 {
-  "app_key": "your_app_key",
-  "group_by": ["归属部门", "归属销售"],
-  "amount_columns": ["报价总金额"],
-  "metrics": ["count", "sum", "avg", "min", "max"],
-  "time_bucket": "day",
-  "requested_pages": 10,
-  "scan_max_pages": 10,
-  "strict_full": true
+  "summary": {
+    "counts": {
+      "source_record_count": 370,
+      "group_assignment_count": 405,
+      "metric_nonnull_record_count": 395
+    },
+    "primary_metric_total": 12272931.75,
+    "primary_metric_missing_count": 10
+  }
 }
 ```
 
-Batch detail example (`qf_records_batch_get`):
+Default answer for “多少单/多少条” must read `summary.counts.source_record_count`.
+
+### Completeness
+
+Canonical `completeness` is technical-only:
+
+- `is_complete`
+- `raw_scan_complete`
+- `scan_limit_hit`
+- `fetched_pages`
+- `requested_pages`
+- `actual_scanned_pages`
+- `scanned_pages`
+- `scan_limit`
+- `has_more`
+- `next_page_token`
+- `stop_reason`
+- `output_truncated`
+- `omitted_items`
+- `omitted_chars`
+
+When `strict_full=true`, any incomplete result fails with `INCOMPLETE_RESULT`.
+
+### Error Protocol
+
+Failures return structured JSON with a machine-readable `error.code`, for example:
 
 ```json
 {
-  "app_key": "your_app_key",
-  "apply_ids": ["497600278750478338", "497600278750478339"],
-  "select_columns": [1, "客户名称"],
-  "max_columns": 2
+  "ok": false,
+  "error": {
+    "code": "PLAN_REQUIRED",
+    "message": "...",
+    "fix_hint": "...",
+    "retryable": true
+  }
 }
 ```
 
-Export example (`qf_export_json`):
+Common codes:
 
-```json
-{
-  "app_key": "your_app_key",
-  "mode": "all",
-  "page_size": 50,
-  "requested_pages": 5,
-  "max_rows": 500,
-  "select_columns": [1, "客户名称"],
-  "file_name": "报价单导出.json"
-}
-```
-
-Optional env vars:
-
-```bash
-export QINGFLOW_LIST_MAX_ITEMS_BYTES=400000
-```
+- `PLAN_REQUIRED`
+- `PLAN_NOT_READY`
+- `PLAN_DRIFT`
+- `FORBIDDEN_RUNTIME_ALIAS`
+- `VALIDATION_ERROR`
+- `INCOMPLETE_RESULT`
+- `UPSTREAM_TIMEOUT`
+- `UPSTREAM_API_ERROR`
 
 ## Troubleshooting
 

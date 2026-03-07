@@ -1,310 +1,297 @@
-# Qingflow MCP 调用规范（v0.6.0）
-
-本规范用于智能体、前端编排层、后端服务统一接入 `qingflow-mcp`。
-
-## 1. 总体约定
-
-1. 所有工具返回可解析 JSON（成功时在 `structuredContent`，失败时在 `content[0].text` 的 JSON 字符串）。
-2. 读工具以“可证明”为目标，支持两种输出模式：
-   - `output_profile=compact`（默认）：仅返回核心数据与 `next_page_token`
-   - `output_profile=verbose`：额外返回 `evidence`、`meta` 等可审计字段
-   - 例外：聚合型输出即使在 `compact` 模式也会返回 `completeness`，包括 `qf_query(summary)`（兼容包装层）与 `qf_records_aggregate`
-   - `error_code` / `fix_hint`：在 `verbose` 成功响应中为 `null`，失败时给出结构化错误与修复建议
-3. 统计结论必须看 `is_complete`（`verbose` 模式）：
-   - `is_complete=true` 才能直接用于最终统计结论
-   - `is_complete=false` 只能视为样本/部分结果
-4. 默认硬限制：
-   - 行上限默认 `200`（可由 `max_rows` 或 `max_items` 下调，最大仍是 `200`）
-   - `select_columns` 最大 `2`
-   - `max_columns` 最大 `2`
-   - 导出工具 `max_rows` 最大 `10000`（`QINGFLOW_EXPORT_MAX_ROWS`）
-5. 参数契约（P1）：
-   - 正式执行工具遵循严格 JSON 契约：number 就是 number，array 就是 array，object 就是 object，boolean 就是 boolean
-   - `additionalProperties=false` 的工具会拒绝未知字段
-   - 不要把数组、对象、数字、布尔写成字符串
-   - runtime alias 已收紧：不要再传顶层 `from` / `to` / `dateFrom` / `dateTo`，也不要在 `filters` 里传 `searchKey` / `searchKeys` / `from` / `to` / `dateFrom` / `dateTo`
-   - 若模型暂时拿不准参数形状，先调用 `qf_query_plan` 做预检，再执行正式工具
-6. 超时保护（P0）：
-   - 默认单次上游请求超时：`QINGFLOW_REQUEST_TIMEOUT_MS=18000`
-   - 默认工具执行预算：`QINGFLOW_EXECUTION_BUDGET_MS=20000`
-   - 默认 `scan_max_pages=10`，避免在 25s tool timeout 场景下超时。
-
-## 2. 完整性协议（completeness）
-
-列表/明细类读工具返回的 `completeness` 至少包含以下基础字段：
-
-- `result_amount`: 服务端已知总条数
-- `returned_items`: 本次返回条数
-- `fetched_pages`: 本次实际拉取页数
-- `requested_pages`: 本次请求期望拉取页数
-- `actual_scanned_pages`: 本次实际扫描页数
-- `has_more`: 是否还有下一页
-- `next_page_token`: 下一页 token（无则 `null`）
-- `is_complete`: 是否完整
-- `partial`: 是否部分结果（`!is_complete`）
-- `omitted_items`: 由于限流/截断未返回的条数
-- `omitted_chars`: 由于大小保护省略的字符量估算
-
-其中 `qf_query(summary)` / `qf_records_aggregate` 的 `completeness` 改为聚合专用语义，用于区分“源数据没扫全”和“聚合输出被裁剪”：
-
-- `raw_scan_complete`: 底层源数据是否已扫全
-- `scan_limit_hit`: 是否因为扫描预算/执行预算命中上限而提前停止
-- `scanned_pages`: 实际扫描页数
-- `scan_limit`: 本次扫描页上限
-- `output_page_complete`: 当前聚合输出层是否完整
-- `raw_next_page_token`: 底层源扫描续拉 token；对 `qf_query(summary)` / `qf_records_aggregate` 来说，它会携带累计状态，续拉时必须保持查询参数不变
-- `output_next_page_token`: 输出层分页 token（当前一般为 `null`）
-- `stop_reason`: 停止原因（如 `source_exhausted` / `execution_budget` / `adaptive_budget`）
-
-判定规则：
-
-- `raw_scan_complete=false`：不能把统计结果当全量结论
-- `output_page_complete=false`：说明聚合输出被裁剪（例如 `max_groups`），但不一定代表底层源数据没扫全
-- `is_complete = raw_scan_complete && output_page_complete`
-- 业务总量不要再从 `completeness` 读取；统一读 `summary.counts.source_record_count`
-
-## 3. 证据链协议（evidence，`output_profile=verbose`）
-
-读工具在 `verbose` 模式返回：
-
-- `query_id`: 本次查询唯一 ID
-- `app_key`: 查询应用
-- `filters`: 生效过滤条件
-- `selected_columns`: 生效列集合
-- `time_range`: 生效时间范围（可能为 `null`）
-- `source_pages`: 本次读取到的原始页码列表
-
-## 4. 严格完整模式（strict_full）
-
-1. 当 `strict_full=true` 且底层源数据未扫全时，工具不返回成功结果，而返回错误：
-   - `code = "NEED_MORE_DATA"`
-   - `status = "need_more_data"`
-   - `details.completeness`
-   - `details.evidence`
-2. 当 `strict_full=false`（或未开启）时，可返回部分结果，并由上层根据 `completeness` 决策。
-3. 对 `qf_query(summary)` 来说，`strict_full` 只约束“源数据必须扫全”；兼容输出里的样例 `rows` 受 `max_rows` 裁剪不会触发 `NEED_MORE_DATA`，也不会改变聚合 `completeness`。
-
-## 5. 分页规范（确定性）
-
-1. `page_num` 与 `page_token` 互斥。
-2. 首次调用建议只传 `page_num`（或不传，默认 1）。
-3. 后续翻页优先使用上次返回的 `next_page_token`。
-4. 建议显式传：
-   - `requested_pages`
-   - `scan_max_pages`
-
-## 6. 工具清单与调用规则
-
-## 6.1 `qf_apps_list`
-
-用途：列出工作区应用。
-
-关键入参：
-- 可选：`keyword`, `limit`, `offset`, `favourite`, `user_id`
+# Qingflow MCP 调用规范（v0.7.0）
 
-## 6.2 `qf_form_get`
+本规范描述 `qingflow-mcp` 的公开 canonical 协议。面向智能体时，只使用 `listTools()` 暴露出来的 10 个工具；不要再让模型直接走 legacy 工具。
 
-用途：读取应用表单字段元数据（用于字段映射）。
+## 1. 公开工具面
 
-关键入参：
-- 必填：`app_key`
-- 可选：`include_raw`, `force_refresh`, `user_id`
+仅暴露以下工具：
 
-## 6.3 `qf_field_resolve`
+- `qf_tool_spec_get`
+- `qf_form_get`
+- `qf_field_resolve`
+- `qf_value_probe`
+- `qf.query.plan`
+- `qf.query.rows`
+- `qf.query.record`
+- `qf.query.aggregate`
+- `qf.query.export`
+- `qf.records.mutate`
 
-用途：把自然语言字段名/别名映射到稳定 `que_id`。
+原则：
 
-关键入参：
-- 必填：`app_key` + (`query` 或 `queries`)
-- 可选：`top_k`, `fuzzy`
+1. `qf.query.plan` 是唯一公开 planner。
+2. `qf.query.rows / record / aggregate / export / qf.records.mutate` 是 execute-only 工具。
+3. execute 工具必须吃 `plan_id`，不再让模型自己重新拼执行参数。
 
-## 6.3.1 `qf_value_probe`
+## 2. 标准链路：Plan -> Execute
 
-用途：探测某个字段的常见值/候选值，并显式返回匹配模式与命中证据。
+标准调用链路：
 
-关键入参：
-- 必填：`app_key`, `field`
-- 可选：`query`, `match_mode(exact|normalized|contains|prefix|fuzzy)`, `limit`, `scan_max_pages`, `page_size`
+1. 先调用 `qf.query.plan`
+2. 读取返回中的：
+   - `data.plan_id`
+   - `data.plan.executor_tool`
+   - `data.plan.executor_args`
+   - `data.ready`
+   - `data.blockers`
+3. `data.ready=true` 时，直接执行 `data.plan.executor_tool`，参数原样使用 `data.plan.executor_args`
+4. 不要在 execute 阶段改写 query
 
-注意：
-- 只用 `query`，不要传 `searchKey` / `searchKeys`
+planner 返回结构核心字段：
 
-返回核心：
-- `field`: 已解析字段元数据（`que_id` / `que_title` / `que_type`）
-- `requested_match_mode` / `effective_match_mode`
-- `provider_translation`
-- `candidates[]`: `value` / `display_value` / `count` / `match_strength` / `matched_texts` / `matched_as`
-- `matched_values`
+```json
+{
+  "ok": true,
+  "data": {
+    "kind": "aggregate",
+    "plan_id": "plan_xxx",
+    "normalized_query": { "app_key": "21b3d559" },
+    "plan": {
+      "plan_id": "plan_xxx",
+      "kind": "aggregate",
+      "executor_tool": "qf.query.aggregate",
+      "executor_args": { "plan_id": "plan_xxx" },
+      "ready": true,
+      "blockers": []
+    },
+    "estimate": { "page_size": 50 },
+    "ready": true,
+    "blockers": []
+  }
+}
+```
 
-适用场景：
-- 智能体不确定“北斗/麒麟/追高”是不是某个字段的真实取值
-- 执行正式查询前，需要先确认字段值候选和匹配模式
+## 3. Execute 输入契约
 
-## 6.4 `qf_query_plan`
+### 3.1 `qf.query.rows`
 
-用途：预检查询参数、字段映射、页数预算与完整性风险；这是唯一允许“先纠偏再执行”的工具。
+必填：
 
-调用要求：
-- 当你不确定字段 id、参数类型、扫描预算是否够用时，先调用 `qf_query_plan`
-- 正式工具不要依赖字符串化参数容错；如果参数不是原生 JSON，MCP 边界会直接拒绝
-- `qf_query_plan` 仍会做 loose normalization，但不会再吞并危险 alias；`from` / `to` / `dateFrom` / `dateTo` / `searchKey` / `searchKeys` 会直接失败
+- `plan_id`
 
-用途：执行前预检（参数归一化、必填检查、字段映射、扫描规模估算）。
+可选：
 
-关键入参：
-- 必填：`tool`
-- 可选：`arguments`, `resolve_fields`, `probe`
+- `query`
 
-返回核心：
-- `normalized_arguments`
-- `validation`（`valid`/`missing_required`/`warnings`）
-- `field_mapping`
-- `estimate`（页规模和命中上限风险）
-- `ready_for_final_conclusion`（当前计划是否适合直接产出最终结论）
-- `final_conclusion_blockers` / `recommended_next_actions`
+规则：
 
-## 6.5 `qf_records_list`
+- `query` 仅用于 drift 校验
+- 如果传了 `query`，它必须与 planner 产出的 `normalized_query` 完全一致
+- 不一致返回 `PLAN_DRIFT`
 
-用途：多条记录列表查询（推荐用于数据拉取）。
+### 3.2 `qf.query.record`
 
-关键入参：
-- 必填：`app_key`, `select_columns`
-- 可选：
-  - 过滤排序：`filters`, `sort`, `mode`, `type`, `keyword`, `query_logic`
-  - 时间过滤：`time_range`
-  - 行列限制：`max_rows` / `max_items`（默认 200）、`max_columns`
-  - 分页：`page_num` / `page_token`, `page_size`, `requested_pages`, `scan_max_pages`
-  - 完整性策略：`strict_full`
-  - 输出模式：`output_profile`（`compact`|`verbose`，默认 `compact`）
+必填：
 
-约束：
-- `include_answers=false` 不允许
-- `select_columns <= 2`
-- `max_columns <= 2`
-- `max_rows/max_items <= 200`
-- 顶层 `from` / `to` / `dateFrom` / `dateTo` 会被拒绝；请改用 `time_range`
-- `filters` 里不要传 `searchKey` / `searchKeys` / `from` / `to` / `dateFrom` / `dateTo`
+- `plan_id`
 
-## 6.6 `qf_record_get`
+可选：
 
-用途：单条记录详情查询。
+- `query`
 
-关键入参：
-- 必填：`apply_id`, `select_columns`
-- 可选：`max_columns`, `output_profile`（默认 `compact`）
+### 3.3 `qf.query.aggregate`
 
-约束：
-- `select_columns <= 2`
-- `max_columns <= 2`
+必填：
 
-## 6.7 `qf_records_batch_get`
+- `plan_id`
 
-用途：按 `apply_ids` 批量拉详情，输出扁平 `rows`。
+可选：
 
-关键入参：
-- 必填：`app_key`, `apply_ids`, `select_columns`
-- 可选：`max_columns`, `output_profile`
+- `query`
 
-## 6.8 `qf_export_csv` / `qf_export_json`
+### 3.4 `qf.query.export`
+
+必填：
 
-用途：把查询结果写文件，避免大结果直接回传导致上下文爆炸。
-
-关键入参：
-- 必填：`app_key`, `select_columns`
-- 可选：
-  - 查询参数同 `qf_records_list`
-  - 导出参数：`file_name`, `export_dir`
-  - `max_rows`（最大 `10000`）
-
-返回核心：
-- `file_path`, `file_size_bytes`, `row_count`, `columns`, `preview`
-
-## 6.9 `qf_query`
-
-用途：统一读入口，按 `query_mode` 路由到 list/record/summary。
-
-路由规则：
-- `query_mode=auto` 时：
-  - 有 `apply_id` -> `record`
-  - 有汇总参数（如 `amount_column`/`time_range`/`scan_max_pages`）-> `summary`
-  - 否则 -> `list`
-
-各模式关键要求：
-- `list`：必填 `app_key`, `select_columns`
-- `record`：必填 `apply_id`, `select_columns`
-- `summary`：必填 `app_key`, `select_columns`
-
-说明：
-- `list` 模式中 `time_range` 会自动下推为筛选条件。
-- `summary` 默认 `strict_full=true`。
-- `summary` 是兼容包装层，内部走与 `qf_records_aggregate` 相同的聚合核心。
-- `output_profile` 默认 `compact`，但 `summary` 模式下仍会返回 `completeness`，避免把部分统计当成全量。
-- `summary.counts.source_record_count` 是默认业务口径，用于回答“有多少单/多少条”
-- `summary.counts.group_assignment_count` 是分组展开口径；只有在 `raw_scan_complete=true` 时才有值
-- `summary.counts.metric_nonnull_record_count` 是主指标非空覆盖口径；只有在 `raw_scan_complete=true` 时才有值
-- `summary.primary_metric_total` 是主指标汇总值
-- `summary.primary_metric_missing_count` 是主指标缺失条数
-- 顶层 `from` / `to` / `dateFrom` / `dateTo` 会被拒绝；请统一放进 `time_range`
-- `filters` 里不要传 `searchKey` / `searchKeys` / `from` / `to` / `dateFrom` / `dateTo`
-
-## 6.10 `qf_records_aggregate`
-
-用途：通用聚合工具（把统计计算下沉到 MCP）。
-
-关键入参：
-- 必填：`app_key`, `group_by`
-- 可选：
-  - 指标：`amount_column` / `amount_columns`, `metrics(count|sum|avg|min|max)`, `time_bucket(day|week|month)`, `stat_policy`
-  - 过滤：`filters`, `time_range`
-  - 分页扫描：`page_num` / `page_token`, `page_size`, `requested_pages`, `scan_max_pages`
-  - 结果规模：`max_groups`
-  - 完整性：`strict_full`
-
-返回核心：
-- `summary`: `counts.source_record_count` / `counts.group_assignment_count` / `counts.metric_nonnull_record_count` / `primary_metric_total` / `primary_metric_missing_count`
-- `groups`: 分组统计（count、amount、占比 + 可选 metrics）
-- `completeness`: 无论 `compact/verbose` 都返回，用于判断统计是否可直接下结论
-- `evidence`: `output_profile=verbose` 时返回
-
-约束补充：
-- 顶层 `from` / `to` / `dateFrom` / `dateTo` 会被拒绝；请统一放进 `time_range`
-- `filters` 里不要传 `searchKey` / `searchKeys` / `from` / `to` / `dateFrom` / `dateTo`
-
-## 6.11 `qf_record_create` / `qf_record_update` / `qf_operation_get`
-
-用途：写入与异步结果查询。
-
-简要规则：
-- create/update 支持 `answers` 与 `fields` 两种写法
-- 若返回 `request_id`，通过 `qf_operation_get` 查询最终状态
-
-## 7. 错误协议
-
-失败统一为 JSON（在 MCP `isError=true` 文本里）：
-
-- 通用：
-  - `ok=false`
-  - `error_code`
-  - `message`
-  - `fix_hint`
-  - 可选 `err_code`, `err_msg`, `http_status`, `details`, `next_page_token`
-- 不完整失败（严格模式）：
-  - `code="NEED_MORE_DATA"`
-  - `status="need_more_data"`
-  - `error_code="NEED_MORE_DATA"`
-  - `fix_hint` 提示续拉方式
-  - `details.completeness`
-  - `details.evidence`
-
-## 8. 推荐调用流程
-
-1. 用 `qf_form_get` 获取字段映射。
-2. 用 `qf_records_list` 或 `qf_query(list)` 拉列表（带 `select_columns`）。
-3. 若需要跨页全量统计：
-   - 首选 `qf_records_aggregate` 或 `qf_query(summary)`
-   - 开启 `strict_full=true`
-4. 若返回 `NEED_MORE_DATA`：按 `raw_next_page_token`（兼容旧字段 `next_page_token`）继续调用直到 `raw_scan_complete=true`。
-5. 只要出现以下任一条件，就禁止输出“完整分析”：
-   - `is_complete=false`
-   - `raw_scan_complete=false`
-   - `scan_limit_hit=true`
+- `plan_id`
+
+可选：
+
+- `query`
+
+### 3.5 `qf.records.mutate`
+
+必填：
+
+- `plan_id`
+
+可选：
+
+- `action`
+
+## 4. Canonical 查询 DSL
+
+planner 输入使用 canonical DSL：
+
+```json
+{
+  "kind": "aggregate",
+  "query": {
+    "app_key": "21b3d559",
+    "where": [
+      { "field": 6564644, "op": "contains", "value": "北斗", "match": "normalized" },
+      { "field": 6299264, "op": "between", "from": "2025-01-01", "to": "2025-12-31" }
+    ],
+    "group_by": [9500572],
+    "metrics": [
+      { "op": "count" },
+      { "column": 6302833, "op": "sum" }
+    ],
+    "strict_full": true
+  }
+}
+```
+
+规则：
+
+1. 公开读工具只接受 `where`，不接受 legacy `filters`
+2. runtime alias 被禁止：
+   - 顶层：`from` / `to` / `dateFrom` / `dateTo`
+   - `filters[]` 内：`searchKey` / `searchKeys` / `from` / `to` / `dateFrom` / `dateTo`
+3. planner 可以做 loose normalization，但不会吞并危险 alias
+4. execute 阶段不做纠偏
+
+## 5. 匹配语义
+
+支持显式 `match` / `match_mode`：
+
+- `exact`
+- `normalized`
+- `contains`
+- `prefix`
+- `fuzzy`
+
+`qf_value_probe` 返回：
+
+```json
+{
+  "candidates": [
+    {
+      "value": "北斗",
+      "display_value": "北斗",
+      "observed_count": 337,
+      "score": 0.98,
+      "match": "exact",
+      "matched_texts": ["北斗"]
+    }
+  ],
+  "matched_values": ["北斗"]
+}
+```
+
+canonical execute 工具在 `evidence.match_evidence` 中回显最终候选值，用于解释“到底匹配到了什么”。
+
+## 6. Aggregate 业务口径
+
+业务摘要层只保留 3 个 canonical count：
+
+```json
+{
+  "summary": {
+    "counts": {
+      "source_record_count": 370,
+      "group_assignment_count": 405,
+      "metric_nonnull_record_count": 395
+    },
+    "primary_metric_total": 12272931.75,
+    "primary_metric_missing_count": 10
+  }
+}
+```
+
+含义：
+
+- `source_record_count`：过滤后唯一记录数；默认回答“多少单/多少条”时只读它
+- `group_assignment_count`：分组展开后的 assignment 数
+- `metric_nonnull_record_count`：主指标列非空记录数
+- `primary_metric_missing_count`：主指标缺失记录数
+
+不要再把以下字段当业务总量：
+
+- `completeness.*`
+- `metrics_by_column.*.nonnull_record_count`
+- 任意 group-level count
+
+## 7. Completeness 仅表达技术状态
+
+公开 canonical execute 工具的 `completeness` 只表达“是否可以下最终结论”：
+
+```json
+{
+  "is_complete": true,
+  "raw_scan_complete": true,
+  "scan_limit_hit": false,
+  "fetched_pages": 19,
+  "requested_pages": 50,
+  "actual_scanned_pages": 19,
+  "scanned_pages": 19,
+  "scan_limit": 50,
+  "has_more": false,
+  "next_page_token": null,
+  "stop_reason": "source_exhausted",
+  "output_truncated": false,
+  "omitted_items": 0,
+  "omitted_chars": 0
+}
+```
+
+规则：
+
+1. `completeness` 不再承载业务总量。
+2. `strict_full=true` 时，只要：
+   - `raw_scan_complete=false`，或
+   - `output_truncated=true`
+   就直接返回 `INCOMPLETE_RESULT`。
+3. `is_complete=false` 的结果不能被智能体当成最终分析结论。
+
+## 8. 错误协议
+
+所有失败统一返回：
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "PLAN_DRIFT",
+    "message": "...",
+    "fix_hint": "...",
+    "retryable": true
+  },
+  "error_code": "PLAN_DRIFT",
+  "message": "...",
+  "fix_hint": "...",
+  "details": {}
+}
+```
+
+当前重点错误码：
+
+- `FORBIDDEN_RUNTIME_ALIAS`
+- `VALIDATION_ERROR`
+- `PLAN_REQUIRED`
+- `PLAN_NOT_READY`
+- `PLAN_DRIFT`
+- `INCOMPLETE_RESULT`
+- `INVALID_FIELD_REF`
+- `UNKNOWN_FIELD_VALUE`
+- `UNSUPPORTED_MATCH_MODE`
+- `UPSTREAM_TIMEOUT`
+- `UPSTREAM_API_ERROR`
+- `INTERNAL_ERROR`
+
+编排建议：
+
+1. `PLAN_REQUIRED` / `PLAN_NOT_READY`：回到 `qf.query.plan`
+2. `PLAN_DRIFT`：不要改写 execute 参数，直接复用 planner 返回的 `plan_id`
+3. `INCOMPLETE_RESULT`：继续翻页或扩大扫描预算
+4. `FORBIDDEN_RUNTIME_ALIAS` / `VALIDATION_ERROR`：修参数
+5. `UPSTREAM_TIMEOUT` / `UPSTREAM_API_ERROR`：缩小查询规模或停止并告知用户
+
+## 9. 对智能体的硬规则
+
+1. 新会话先看 `listTools()` 或 `qf_tool_spec_get`
+2. 字段不确定时先 `qf_form_get` / `qf_field_resolve`
+3. 字段值不确定时先 `qf_value_probe`
+4. 正式执行前先 `qf.query.plan`
+5. execute 时只传 planner 返回的 `plan_id`
+6. 如果 `is_complete=false`，禁止输出“完整分析”
