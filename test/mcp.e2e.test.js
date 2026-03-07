@@ -903,7 +903,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.deepEqual(item.aliases, {})
     assert.equal(
       item.limits.input_contract,
-      "strict JSON only; numbers/arrays/objects/booleans must use native JSON types"
+      "strict JSON only; numbers/arrays/objects/booleans must use native JSON types, and runtime aliases from/to/dateFrom/dateTo/searchKey/searchKeys are rejected"
     )
     assert.equal(item.limits.output_profile, "compact|verbose (default compact)")
     assert.equal(item.minimal_example.app_key, "21b3d559")
@@ -950,6 +950,17 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(probed.data.matched_values[0], "客户B")
   })
 
+  await t.test("qf_value_probe rejects searchKey runtime alias at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_value_probe", {
+      app_key: APP_KEY,
+      field: "客户名称",
+      searchKey: "客户B"
+    })
+
+    assert.match(errorText, /searchKey/)
+    assert.match(errorText, /FORBIDDEN_RUNTIME_ALIAS|Unrecognized key/)
+  })
+
   await t.test("qf_query_plan normalizes stringified args and estimates pages", async () => {
     const planned = await callTool(mcp.client, "qf_query_plan", {
       tool: "qf_records_list",
@@ -981,6 +992,21 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
         "list mode is not a safe final-analysis endpoint"
       )
     )
+  })
+
+  await t.test("qf_query_plan rejects runtime aliases instead of silently normalizing them", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_query_plan", {
+      tool: "qf_query",
+      arguments: {
+        query_mode: "list",
+        app_key: APP_KEY,
+        select_columns: [1001],
+        from: "2026-01-01"
+      }
+    })
+
+    assert.match(errorText, /FORBIDDEN_RUNTIME_ALIAS/)
+    assert.match(errorText, /time_range\.from|from/)
   })
 
   await t.test("qf_query_plan reports missing required fields", async () => {
@@ -1082,6 +1108,25 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.deepEqual(planned.data.normalized_query.select, [1001, 1002])
     assert.equal(planned.data.validation.valid, true)
     assert.ok(Array.isArray(planned.data.field_mapping))
+  })
+
+  await t.test("qf.query.plan rejects runtime filter aliases instead of translating them", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf.query.plan", {
+      kind: "rows",
+      query: {
+        app_key: APP_KEY,
+        select: [1001],
+        filters: [
+          {
+            que_id: 1001,
+            searchKey: "客户A"
+          }
+        ]
+      }
+    })
+
+    assert.match(errorText, /FORBIDDEN_RUNTIME_ALIAS/)
+    assert.match(errorText, /searchKey|search_key/)
   })
 
   await t.test("qf.query.rows rejects legacy filters at MCP boundary", async () => {
@@ -1349,6 +1394,26 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
 
     assert.match(errorText, /Input validation error/)
     assert.match(errorText, /qf_records_list/)
+  })
+
+  await t.test("qf_records_list rejects runtime filter/time aliases at MCP boundary", async () => {
+    const errorText = await callToolProtocolError(mcp.client, "qf_records_list", {
+      app_key: APP_KEY,
+      mode: "all",
+      page_size: 20,
+      max_rows: 2,
+      select_columns: [1001],
+      from: "2026-01-01",
+      filters: [
+        {
+          que_id: 1003,
+          searchKey: "2026-01-02"
+        }
+      ]
+    })
+
+    assert.match(errorText, /from|searchKey/)
+    assert.match(errorText, /FORBIDDEN_RUNTIME_ALIAS|Unrecognized key/)
   })
 
   await t.test("qf_query list mode rejects double-stringified params at MCP boundary", async () => {

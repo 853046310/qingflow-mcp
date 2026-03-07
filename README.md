@@ -109,7 +109,7 @@ npm i -g git+https://github.com/853046310/qingflow-mcp.git
 Install from npm (pinned version):
 
 ```bash
-npm i -g qingflow-mcp@0.4.1
+npm i -g qingflow-mcp@0.4.2
 ```
 
 Or one-click installer:
@@ -217,7 +217,7 @@ Deterministic read protocol (list/summary/aggregate):
    - objects must be native JSON objects
    - booleans must be native JSON booleans
    - unknown fields are rejected by the MCP boundary
-7. Use `qf_query_plan` as the only preflight tool when the agent is unsure about arguments. It can normalize loose/model-shaped inputs before a real query is issued.
+7. Use `qf_query_plan` as the only preflight tool when the agent is unsure about arguments. It can normalize loose/model-shaped inputs before a real query is issued, but runtime aliases like `from`/`to`/`dateFrom`/`dateTo`/`searchKey`/`searchKeys` are rejected.
 
 For `qf_query(summary)` and `qf_records_aggregate`, read `data.summary.completeness` / `data.completeness` before concluding:
 

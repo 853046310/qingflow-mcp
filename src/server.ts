@@ -192,7 +192,7 @@ const ADAPTIVE_TARGET_PAGE_MS = toPositiveInt(process.env.QINGFLOW_ADAPTIVE_TARG
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
-const SERVER_VERSION = "0.4.1"
+const SERVER_VERSION = "0.4.2"
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -396,7 +396,7 @@ const publicFieldSelectorSchema = z.union([publicStringSchema, z.number().int()]
 const publicSortItemSchema = z.object({
   que_id: publicFieldSelectorSchema,
   ascend: z.boolean().optional()
-})
+}).strict()
 
 const publicFilterItemSchema = z.object({
   que_id: publicFieldSelectorSchema.optional(),
@@ -407,19 +407,19 @@ const publicFilterItemSchema = z.object({
   scope: z.number().int().optional(),
   search_options: z.array(publicFieldSelectorSchema).optional(),
   search_user_ids: z.array(publicStringSchema).optional()
-})
+}).strict()
 
 const publicTimeRangeSchema = z.object({
   column: publicFieldSelectorSchema,
   from: publicStringSchema.optional(),
   to: publicStringSchema.optional(),
   timezone: publicStringSchema.optional()
-})
+}).strict()
 
 const publicStatPolicySchema = z.object({
   include_negative: z.boolean().optional(),
   include_null: z.boolean().optional()
-})
+}).strict()
 
 const publicAnswerInputSchema = z.object({
   que_id: publicFieldSelectorSchema.optional(),
@@ -515,6 +515,7 @@ const listInputPublicSchema = z
     strict_full: z.boolean().optional(),
     output_profile: outputProfileSchema.optional()
   })
+  .strict()
 
 const listInputSchema = z
   .preprocess(
@@ -800,6 +801,7 @@ const queryInputPublicSchema = z
     strict_full: z.boolean().optional(),
     output_profile: outputProfileSchema.optional()
   })
+  .strict()
 
 const queryInputSchema = z
   .preprocess(
@@ -997,6 +999,7 @@ const aggregateInputPublicSchema = z
     strict_full: z.boolean().optional(),
     output_profile: outputProfileSchema.optional()
   })
+  .strict()
 
 const aggregateInputSchema = z
   .preprocess(
@@ -1384,6 +1387,7 @@ const exportInputPublicSchema = z
     export_dir: publicStringSchema.optional(),
     file_name: publicStringSchema.optional()
   })
+  .strict()
 
 const exportInputSchema = z.preprocess(
   normalizeExportInput,
@@ -3779,6 +3783,115 @@ function applyAliases(
   return out
 }
 
+const FORBIDDEN_FILTER_RUNTIME_ALIASES = {
+  from: "min_value",
+  to: "max_value",
+  dateFrom: "min_value",
+  dateTo: "max_value",
+  searchKey: "search_key",
+  searchKeys: "search_keys"
+} as const
+
+const FORBIDDEN_TOP_LEVEL_TIME_ALIASES = {
+  from: "time_range.from",
+  to: "time_range.to",
+  dateFrom: "time_range.from",
+  dateTo: "time_range.to"
+} as const
+
+function throwForbiddenRuntimeAliasError(params: {
+  tool: string
+  path: string
+  alias: string
+  replacement: string
+  fixHint: string
+}): never {
+  throw new InputValidationError({
+    message: `${params.tool} no longer accepts runtime alias "${params.alias}" at ${params.path}`,
+    errorCode: "FORBIDDEN_RUNTIME_ALIAS",
+    fixHint: params.fixHint,
+    details: {
+      tool: params.tool,
+      path: params.path,
+      alias: params.alias,
+      replacement: params.replacement
+    }
+  })
+}
+
+function assertNoForbiddenAliases(
+  obj: Record<string, unknown>,
+  aliasMap: Record<string, string>,
+  params: {
+    tool: string
+    pathPrefix: string
+    fixHint: string
+  }
+): void {
+  for (const [alias, replacement] of Object.entries(aliasMap)) {
+    if (obj[alias] !== undefined) {
+      throwForbiddenRuntimeAliasError({
+        tool: params.tool,
+        path: `${params.pathPrefix}.${alias}`,
+        alias,
+        replacement,
+        fixHint: params.fixHint
+      })
+    }
+  }
+}
+
+function assertNoLegacyFilterAliases(value: unknown, tool: string): void {
+  const parsed = parseJsonLikeDeep(value)
+  const list = Array.isArray(parsed) ? parsed : parsed === undefined || parsed === null ? [] : [parsed]
+  for (let index = 0; index < list.length; index += 1) {
+    const item = list[index]
+    const obj = asObject(item)
+    if (!obj) {
+      continue
+    }
+    assertNoForbiddenAliases(obj, FORBIDDEN_FILTER_RUNTIME_ALIASES, {
+      tool,
+      pathPrefix: `filters[${index}]`,
+      fixHint:
+        'Use legacy filter keys "min_value"/"max_value"/"search_key"/"search_keys", or switch to canonical qf.query.* where clauses.'
+    })
+    const valueObject = asObject(parseJsonLikeDeep(obj.value))
+    if (!valueObject) {
+      continue
+    }
+    assertNoForbiddenAliases(valueObject, FORBIDDEN_FILTER_RUNTIME_ALIASES, {
+      tool,
+      pathPrefix: `filters[${index}].value`,
+      fixHint:
+        'Use legacy filter keys "min_value"/"max_value"/"search_key"/"search_keys", or switch to canonical qf.query.* where clauses.'
+    })
+  }
+}
+
+function assertNoTopLevelTimeAliases(obj: Record<string, unknown>, tool: string): void {
+  assertNoForbiddenAliases(obj, FORBIDDEN_TOP_LEVEL_TIME_ALIASES, {
+    tool,
+    pathPrefix: "arguments",
+    fixHint: 'Use time_range: {"column": ..., "from": "...", "to": "..."} instead of top-level date aliases.'
+  })
+}
+
+function assertNoValueProbeAliases(obj: Record<string, unknown>, tool: string): void {
+  assertNoForbiddenAliases(
+    obj,
+    {
+      searchKey: "query",
+      searchKeys: "query"
+    },
+    {
+      tool,
+      pathPrefix: "arguments",
+      fixHint: 'Use "query" instead of "searchKey"/"searchKeys".'
+    }
+  )
+}
+
 interface ToolSpecDoc {
   tool: string
   required: string[]
@@ -3868,7 +3981,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         scan_max_pages_max: 20,
         page_size_max: 200,
         match_mode: Array.from(matchModeValues),
-        input_contract: "strict JSON only; use field plus optional query and match_mode"
+        input_contract:
+          'strict JSON only; use field plus optional query and match_mode. "searchKey"/"searchKeys" are rejected.'
       },
       aliases: {},
       minimal_example: {
@@ -3885,7 +3999,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       limits: {
         tool:
           "qf_records_list|qf_record_get|qf_query|qf_records_aggregate|qf_records_batch_get|qf_export_csv|qf_export_json",
-        input_contract: "strict JSON only; arguments must be a native JSON object"
+        input_contract:
+          'strict JSON only; arguments must be a native JSON object. Target tools reject runtime aliases like from/to/dateFrom/dateTo/searchKey/searchKeys.'
       },
       aliases: {},
       minimal_example: {
@@ -3903,7 +4018,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       required: ["kind"],
       limits: {
         kind: "rows|record|aggregate|export|mutate",
-        input_contract: "plan accepts loose model-shaped query objects and normalizes them before execution"
+        input_contract:
+          "plan accepts loose model-shaped query objects, but rejects runtime aliases like from/to/dateFrom/dateTo/searchKey/searchKeys before execution"
       },
       aliases: {},
       minimal_example: {
@@ -4012,7 +4128,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         max_columns_max: MAX_COLUMN_LIMIT,
         select_columns_max: MAX_COLUMN_LIMIT,
         output_profile: "compact|verbose (default compact)",
-        input_contract: "strict JSON only; numbers/arrays/objects/booleans must use native JSON types"
+        input_contract:
+          "strict JSON only; numbers/arrays/objects/booleans must use native JSON types, and runtime aliases from/to/dateFrom/dateTo/searchKey/searchKeys are rejected"
       },
       aliases: {},
       minimal_example: {
@@ -4067,7 +4184,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         max_rows_max: EXPORT_MAX_ROWS,
         max_columns_max: MAX_COLUMN_LIMIT,
         select_columns_max: MAX_COLUMN_LIMIT,
-        input_contract: "strict JSON only; select_columns/time_range must use native JSON types"
+        input_contract:
+          "strict JSON only; select_columns/time_range must use native JSON types, and runtime aliases from/to/dateFrom/dateTo/searchKey/searchKeys are rejected"
       },
       aliases: {},
       minimal_example: {
@@ -4089,7 +4207,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         max_rows_max: EXPORT_MAX_ROWS,
         max_columns_max: MAX_COLUMN_LIMIT,
         select_columns_max: MAX_COLUMN_LIMIT,
-        input_contract: "strict JSON only; select_columns/time_range must use native JSON types"
+        input_contract:
+          "strict JSON only; select_columns/time_range must use native JSON types, and runtime aliases from/to/dateFrom/dateTo/searchKey/searchKeys are rejected"
       },
       aliases: {},
       minimal_example: {
@@ -4118,7 +4237,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         max_columns_max: MAX_COLUMN_LIMIT,
         select_columns_max: MAX_COLUMN_LIMIT,
         output_profile: "compact|verbose (default compact)",
-        input_contract: "strict JSON only; select_columns/time_range/stat_policy must use native JSON types"
+        input_contract:
+          "strict JSON only; select_columns/time_range/stat_policy must use native JSON types, and runtime aliases from/to/dateFrom/dateTo/searchKey/searchKeys are rejected"
       },
       aliases: {},
       minimal_example: {
@@ -4148,7 +4268,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
         metrics_supported: ["count", "sum", "avg", "min", "max"],
         time_bucket_supported: ["day", "week", "month"],
         output_profile: "compact|verbose (default compact)",
-        input_contract: "strict JSON only; group_by/amount_columns/time_range must use native JSON types"
+        input_contract:
+          "strict JSON only; group_by/amount_columns/time_range must use native JSON types, and runtime aliases from/to/dateFrom/dateTo/searchKey/searchKeys are rejected"
       },
       aliases: {},
       minimal_example: {
@@ -4254,6 +4375,8 @@ function normalizeListInput(raw: unknown): unknown {
   if (!obj) {
     return parsedRoot
   }
+  assertNoTopLevelTimeAliases(obj, "qf_records_list")
+  assertNoLegacyFilterAliases(obj.filters, "qf_records_list")
   const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
   const selectColumns = normalizedObj.select_columns ?? normalizedObj.keep_columns
   const timeRange = buildFriendlyTimeRangeInput(normalizedObj)
@@ -4303,6 +4426,8 @@ function normalizeQueryInput(raw: unknown): unknown {
   if (!obj) {
     return parsedRoot
   }
+  assertNoTopLevelTimeAliases(obj, "qf_query")
+  assertNoLegacyFilterAliases(obj.filters, "qf_query")
   const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
   const selectColumns = normalizedObj.select_columns ?? normalizedObj.keep_columns
   const timeRange = buildFriendlyTimeRangeInput(normalizedObj)
@@ -4337,6 +4462,8 @@ function normalizeAggregateInput(raw: unknown): unknown {
   if (!obj) {
     return parsedRoot
   }
+  assertNoTopLevelTimeAliases(obj, "qf_records_aggregate")
+  assertNoLegacyFilterAliases(obj.filters, "qf_records_aggregate")
   const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
   const timeRange = buildFriendlyTimeRangeInput(normalizedObj)
   const amountColumns = normalizeAmountColumnsInput(
@@ -4395,6 +4522,7 @@ function normalizeValueProbeInput(raw: unknown): unknown {
   if (!obj) {
     return parsedRoot
   }
+  assertNoValueProbeAliases(obj, "qf_value_probe")
   const normalizedObj = applyAliases(obj, {
     appKey: "app_key",
     fieldId: "field",
@@ -4402,7 +4530,6 @@ function normalizeValueProbeInput(raw: unknown): unknown {
     name: "field",
     value: "query",
     search: "query",
-    searchKey: "query",
     prefix: "query",
     match: "match_mode",
     matchMode: "match_mode",
@@ -4467,6 +4594,8 @@ function normalizeExportInput(raw: unknown): unknown {
   if (!obj) {
     return parsedRoot
   }
+  assertNoTopLevelTimeAliases(obj, "qf_export")
+  assertNoLegacyFilterAliases(obj.filters, "qf_export")
   const normalizedObj = applyAliases(obj, COMMON_INPUT_ALIASES)
   const selectColumns = normalizedObj.select_columns ?? normalizedObj.keep_columns
   const timeRange = buildFriendlyTimeRangeInput(normalizedObj)
@@ -4655,8 +4784,6 @@ function normalizeFiltersInput(value: unknown): unknown {
       column: "que_id",
       columnId: "que_id",
       columnTitle: "que_title",
-      searchKey: "search_key",
-      searchKeys: "search_keys",
       minValue: "min_value",
       maxValue: "max_value",
       compareType: "compare_type",
@@ -4665,10 +4792,8 @@ function normalizeFiltersInput(value: unknown): unknown {
       users: "search_user_ids",
       options: "search_options",
       start: "min_value",
-      from: "min_value",
       min: "min_value",
       end: "max_value",
-      to: "max_value",
       max: "max_value"
     })
 
@@ -4695,17 +4820,11 @@ function normalizeFiltersInput(value: unknown): unknown {
     if (valueObject) {
       const valueAliases = applyAliases(valueObject, {
         start: "min_value",
-        from: "min_value",
         min: "min_value",
         date_from: "min_value",
-        dateFrom: "min_value",
         end: "max_value",
-        to: "max_value",
         max: "max_value",
         date_to: "max_value",
-        dateTo: "max_value",
-        searchKey: "search_key",
-        searchKeys: "search_keys",
         searchOptions: "search_options",
         searchUserIds: "search_user_ids"
       })
@@ -4901,24 +5020,20 @@ function buildFriendlyTimeRangeInput(obj: Record<string, unknown>): unknown {
   )
   const fromCandidate = firstPresent(
     obj.date_from,
-    obj.dateFrom,
     obj.time_from,
     obj.timeFrom,
     obj.start,
     obj.start_date,
     obj.startDate,
-    obj.from,
     normalizedTimeRange?.from
   )
   const toCandidate = firstPresent(
     obj.date_to,
-    obj.dateTo,
     obj.time_to,
     obj.timeTo,
     obj.end,
     obj.end_date,
     obj.endDate,
-    obj.to,
     normalizedTimeRange?.to
   )
   const timezoneCandidate = firstPresent(
@@ -6381,6 +6496,10 @@ function normalizeCanonicalLooseInput(
   raw: unknown
 ): Record<string, unknown> {
   const parsed = asObject(parseJsonLikeDeep(raw)) ?? {}
+  if (kind === "rows" || kind === "aggregate" || kind === "export") {
+    assertNoTopLevelTimeAliases(parsed, "qf.query.plan")
+    assertNoLegacyFilterAliases(parsed.filters, "qf.query.plan")
+  }
   const out: Record<string, unknown> = { ...parsed }
 
   const assignAlias = (target: string, aliases: string[]) => {

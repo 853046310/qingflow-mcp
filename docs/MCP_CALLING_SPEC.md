@@ -22,6 +22,7 @@
    - 正式执行工具遵循严格 JSON 契约：number 就是 number，array 就是 array，object 就是 object，boolean 就是 boolean
    - `additionalProperties=false` 的工具会拒绝未知字段
    - 不要把数组、对象、数字、布尔写成字符串
+   - runtime alias 已收紧：不要再传顶层 `from` / `to` / `dateFrom` / `dateTo`，也不要在 `filters` 里传 `searchKey` / `searchKeys` / `from` / `to` / `dateFrom` / `dateTo`
    - 若模型暂时拿不准参数形状，先调用 `qf_query_plan` 做预检，再执行正式工具
 6. 超时保护（P0）：
    - 默认单次上游请求超时：`QINGFLOW_REQUEST_TIMEOUT_MS=18000`
@@ -124,6 +125,9 @@
 - 必填：`app_key`, `field`
 - 可选：`query`, `match_mode(exact|normalized|contains|prefix|fuzzy)`, `limit`, `scan_max_pages`, `page_size`
 
+注意：
+- 只用 `query`，不要传 `searchKey` / `searchKeys`
+
 返回核心：
 - `field`: 已解析字段元数据（`que_id` / `que_title` / `que_type`）
 - `requested_match_mode` / `effective_match_mode`
@@ -139,13 +143,10 @@
 
 用途：预检查询参数、字段映射、页数预算与完整性风险；这是唯一允许“先纠偏再执行”的工具。
 
-关键入参：
-- 必填：`tool_name`
-- 可选：`args`
-
 调用要求：
 - 当你不确定字段 id、参数类型、扫描预算是否够用时，先调用 `qf_query_plan`
 - 正式工具不要依赖字符串化参数容错；如果参数不是原生 JSON，MCP 边界会直接拒绝
+- `qf_query_plan` 仍会做 loose normalization，但不会再吞并危险 alias；`from` / `to` / `dateFrom` / `dateTo` / `searchKey` / `searchKeys` 会直接失败
 
 用途：执行前预检（参数归一化、必填检查、字段映射、扫描规模估算）。
 
@@ -180,6 +181,8 @@
 - `select_columns <= 2`
 - `max_columns <= 2`
 - `max_rows/max_items <= 200`
+- 顶层 `from` / `to` / `dateFrom` / `dateTo` 会被拒绝；请改用 `time_range`
+- `filters` 里不要传 `searchKey` / `searchKeys` / `from` / `to` / `dateFrom` / `dateTo`
 
 ## 6.6 `qf_record_get`
 
@@ -234,6 +237,8 @@
 - `list` 模式中 `time_range` 会自动下推为筛选条件。
 - `summary` 默认 `strict_full=true`。
 - `output_profile` 默认 `compact`，但 `summary` 模式下仍会返回 `completeness`，避免把部分统计当成全量。
+- 顶层 `from` / `to` / `dateFrom` / `dateTo` 会被拒绝；请统一放进 `time_range`
+- `filters` 里不要传 `searchKey` / `searchKeys` / `from` / `to` / `dateFrom` / `dateTo`
 
 ## 6.10 `qf_records_aggregate`
 
@@ -253,6 +258,10 @@
 - `groups`: 分组统计（count、amount、占比 + 可选 metrics）
 - `completeness`: 无论 `compact/verbose` 都返回，用于判断统计是否可直接下结论
 - `evidence`: `output_profile=verbose` 时返回
+
+约束补充：
+- 顶层 `from` / `to` / `dateFrom` / `dateTo` 会被拒绝；请统一放进 `time_range`
+- `filters` 里不要传 `searchKey` / `searchKeys` / `from` / `to` / `dateFrom` / `dateTo`
 
 ## 6.11 `qf_record_create` / `qf_record_update` / `qf_operation_get`
 
