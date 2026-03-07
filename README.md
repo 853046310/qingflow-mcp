@@ -109,7 +109,7 @@ npm i -g git+https://github.com/853046310/qingflow-mcp.git
 Install from npm (pinned version):
 
 ```bash
-npm i -g qingflow-mcp@0.5.0
+npm i -g qingflow-mcp@0.6.0
 ```
 
 Or one-click installer:
@@ -174,7 +174,7 @@ Full calling contract (Chinese):
 Summary mode output:
 
 1. `qf_query(summary)` is a compatibility wrapper over the aggregate core.
-2. `summary`: aggregated stats (`counts.effective_record_count`, `counts.final_record_count`, `total_amount`, `by_day`, `missing_count`).
+2. `summary`: aggregated stats (`counts.source_record_count`, `counts.group_assignment_count`, `counts.metric_nonnull_record_count`, `primary_metric_total`, `primary_metric_missing_count`, `by_day`).
 3. `rows`: strict sample rows (only requested `select_columns`).
 4. `meta`: field mapping, filter scope, stat policy, execution limits (`output_profile=verbose` only).
 
@@ -190,7 +190,7 @@ Deterministic read protocol (list/summary/aggregate):
    - default `output_profile=compact`: return core data only (`rows/row/groups/summary` + `next_page_token`)
    - `output_profile=verbose`: include full contract (`completeness` + `evidence` + `meta`)
    - exception: aggregate-style outputs (`qf_query(summary)` compatibility wrapper and `qf_records_aggregate`) always return `completeness`, even in `compact`, so agents can block on incomplete statistics
-2. when `output_profile=verbose`, `completeness` fields are:
+2. when `output_profile=verbose`, list/record-style `completeness` fields are:
    - `result_amount`
    - `returned_items`
    - `fetched_pages`
@@ -202,23 +202,49 @@ Deterministic read protocol (list/summary/aggregate):
    - `partial`
    - `omitted_items`
    - `omitted_chars`
-3. when `output_profile=verbose`, `evidence` fields are:
+3. aggregate-style `completeness` focuses on scan state, not business totals:
+   - `fetched_pages`
+   - `requested_pages`
+   - `actual_scanned_pages`
+   - `has_more`
+   - `next_page_token`
+   - `is_complete`
+   - `partial`
+   - `omitted_items`
+   - `omitted_chars`
+   - `raw_scan_complete`
+   - `scan_limit_hit`
+   - `scanned_pages`
+   - `scan_limit`
+   - `output_page_complete`
+   - `raw_next_page_token`
+   - `output_next_page_token`
+   - `stop_reason`
+   - `returned_group_count`
+   - `total_group_count`
+4. when `output_profile=verbose`, `evidence` fields are:
    - `query_id`
    - `app_key`
    - `filters`
    - `selected_columns`
    - `time_range`
    - `source_pages`
-4. `strict_full=true` makes incomplete results fail fast with `NEED_MORE_DATA`.
+5. aggregate business totals now use one canonical summary contract:
+   - `summary.counts.source_record_count`: default answer for “how many records”
+   - `summary.counts.group_assignment_count`: expanded group-assignment count; only populated after `raw_scan_complete=true`
+   - `summary.counts.metric_nonnull_record_count`: primary metric non-null coverage count; only populated after `raw_scan_complete=true`
+   - `summary.primary_metric_total`: aggregate total for the primary metric column
+   - `summary.primary_metric_missing_count`: number of records missing the primary metric value
+6. `strict_full=true` makes incomplete results fail fast with `NEED_MORE_DATA`.
    - for `qf_query(summary)`, `strict_full` enforces raw source scan completeness; sample-row truncation does not change aggregate completeness
-5. Error payloads expose `error_code` and `fix_hint` for actionable retries.
-6. Public MCP `inputSchema` is strict:
+7. Error payloads expose `error_code` and `fix_hint` for actionable retries.
+8. Public MCP `inputSchema` is strict:
    - numbers must be native JSON numbers
    - arrays must be native JSON arrays
    - objects must be native JSON objects
    - booleans must be native JSON booleans
    - unknown fields are rejected by the MCP boundary
-7. Use `qf_query_plan` as the only preflight tool when the agent is unsure about arguments. It can normalize loose/model-shaped inputs before a real query is issued, but runtime aliases like `from`/`to`/`dateFrom`/`dateTo`/`searchKey`/`searchKeys` are rejected.
+9. Use `qf_query_plan` as the only preflight tool when the agent is unsure about arguments. It can normalize loose/model-shaped inputs before a real query is issued, but runtime aliases like `from`/`to`/`dateFrom`/`dateTo`/`searchKey`/`searchKeys` are rejected.
 
 For `qf_query(summary)` and `qf_records_aggregate`, read `data.summary.completeness` / `data.completeness` before concluding:
 

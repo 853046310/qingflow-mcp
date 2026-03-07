@@ -7,7 +7,7 @@ import type { Variables } from "@modelcontextprotocol/sdk/shared/uriTemplate.js"
 import { randomUUID } from "node:crypto"
 import os from "node:os"
 import path from "node:path"
-import { promises as fs } from "node:fs"
+import { promises as fs, readFileSync } from "node:fs"
 import { z } from "zod"
 
 import { QingflowApiError, QingflowClient, type QingflowResponse } from "./qingflow-client.js"
@@ -101,6 +101,15 @@ interface AggregateContinuationState {
 
 type QueryArtifactKind = "rows" | "record" | "aggregate" | "export" | "plan" | "mutate"
 
+function readPackageVersion(): string {
+  try {
+    const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
+    return typeof packageJson.version === "string" ? packageJson.version : "0.0.0"
+  } catch {
+    return "0.0.0"
+  }
+}
+
 interface QueryArtifactEntry {
   expiresAt: number
   query_id: string
@@ -193,7 +202,7 @@ const ADAPTIVE_TARGET_PAGE_MS = toPositiveInt(process.env.QINGFLOW_ADAPTIVE_TARG
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
-const SERVER_VERSION = "0.4.2"
+const SERVER_VERSION = readPackageVersion()
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -307,9 +316,19 @@ const completenessSchema = z.object({
   total_group_count: z.number().int().nonnegative().optional()
 })
 
-const summaryCountSchema = z.object({
-  effective_record_count: z.number().int().nonnegative(),
-  final_record_count: z.number().int().nonnegative().nullable()
+const aggregateCompletenessSchema = completenessSchema.omit({
+  result_amount: true,
+  returned_items: true,
+  scanned_record_count: true,
+  effective_record_count: true
+})
+
+const anyCompletenessSchema = z.union([completenessSchema, aggregateCompletenessSchema])
+
+const aggregateSummaryCountSchema = z.object({
+  source_record_count: z.number().int().nonnegative(),
+  group_assignment_count: z.number().int().nonnegative().nullable(),
+  metric_nonnull_record_count: z.number().int().nonnegative().nullable()
 })
 
 const evidenceSchema = z.object({
@@ -330,7 +349,7 @@ const evidenceSchema = z.object({
 
 const queryContractFields = {
   output_profile: outputProfileSchema.optional(),
-  completeness: completenessSchema.optional(),
+  completeness: anyCompletenessSchema.optional(),
   evidence: z.record(z.unknown()).optional(),
   error_code: z.null().optional(),
   fix_hint: z.null().optional(),
@@ -897,19 +916,19 @@ const queryInputSchema = z
 
 const querySummaryOutputSchema = z.object({
   summary: z.object({
-    counts: summaryCountSchema,
-    total_amount: z.number().nullable(),
+    counts: aggregateSummaryCountSchema,
+    primary_metric_total: z.number().nullable(),
     by_day: z.array(
       z.object({
         day: z.string(),
-        count: z.number().int().nonnegative(),
-        amount_total: z.number().nullable()
+        group_assignment_count: z.number().int().nonnegative().nullable(),
+        primary_metric_total: z.number().nullable()
       })
     ),
-    missing_count: z.number().int().nonnegative()
+    primary_metric_missing_count: z.number().int().nonnegative().nullable()
   }),
   rows: z.array(z.record(z.unknown())),
-  completeness: completenessSchema.optional(),
+  completeness: aggregateCompletenessSchema.optional(),
   evidence: evidenceSchema.optional(),
   meta: z.object({
     field_mapping: z.array(
@@ -937,6 +956,7 @@ const querySummaryOutputSchema = z.object({
       include_null: z.boolean()
     }),
     execution: z.object({
+      source_record_count: z.number().int().nonnegative(),
       scanned_records: z.number().int().nonnegative(),
       scanned_pages: z.number().int().nonnegative(),
       truncated: z.boolean(),
@@ -1096,10 +1116,10 @@ const aggregateOutputSchema = z.object({
   data: z.object({
     app_key: z.string(),
     summary: z.object({
-      counts: summaryCountSchema,
-      total_amount: z.number().nullable(),
-      missing_count: z.number().int().nonnegative(),
-      metrics: z.record(z.record(z.number().nullable())).optional()
+      counts: aggregateSummaryCountSchema,
+      primary_metric_total: z.number().nullable(),
+      primary_metric_missing_count: z.number().int().nonnegative().nullable(),
+      metrics_by_column: z.record(z.record(z.number().nullable())).optional()
     }),
     groups: z.array(
       z.object({
@@ -1108,10 +1128,10 @@ const aggregateOutputSchema = z.object({
         count_ratio: z.number().min(0).max(1),
         amount_total: z.number().nullable(),
         amount_ratio: z.number().nullable(),
-        metrics: z.record(z.record(z.number().nullable())).optional()
+        metrics_by_column: z.record(z.record(z.number().nullable())).optional()
       })
     ),
-    completeness: completenessSchema.optional(),
+    completeness: aggregateCompletenessSchema.optional(),
     evidence: evidenceSchema.optional(),
     meta: z.object({
       field_mapping: z.array(
@@ -1128,7 +1148,12 @@ const aggregateOutputSchema = z.object({
         include_null: z.boolean()
       }),
       metrics: z.array(z.string()).optional(),
-      time_bucket: z.enum(["day", "week", "month"]).nullable().optional()
+      time_bucket: z.enum(["day", "week", "month"]).nullable().optional(),
+      execution: z.object({
+        source_record_count: z.number().int().nonnegative(),
+        scanned_record_count: z.number().int().nonnegative(),
+        metric_nonnull_record_count: z.number().int().nonnegative().nullable()
+      }).optional()
     }).optional()
   }),
   ...queryContractFields,
@@ -1746,8 +1771,9 @@ const canonicalAggregateOutputSchema = z.object({
     normalized_query: z.record(z.unknown()),
     primary_metric_column: z.string().nullable(),
     summary: z.object({
-      counts: summaryCountSchema,
-      missing_count: z.number().int().nonnegative(),
+      counts: aggregateSummaryCountSchema,
+      primary_metric_total: z.number().nullable(),
+      primary_metric_missing_count: z.number().int().nonnegative().nullable(),
       returned_group_count: z.number().int().nonnegative(),
       total_group_count: z.number().int().nonnegative(),
       metrics_by_column: z.record(z.record(z.union([z.number(), z.null()])))
@@ -1756,7 +1782,7 @@ const canonicalAggregateOutputSchema = z.object({
     cursor: z.string().nullable(),
     snapshot_resource: canonicalResourceRefSchema,
     translation_warnings: z.array(z.string()),
-    completeness: completenessSchema,
+    completeness: aggregateCompletenessSchema,
     evidence: evidenceSchema.optional()
   }),
   meta: apiMetaSchema.optional()
@@ -2389,32 +2415,35 @@ server.registerTool(
         ? (data.evidence as z.infer<typeof evidenceSchema>)
         : null
       const queryId = evidence?.query_id ?? randomUUID()
+      const summaryPrimaryMetricTotalRaw = asObject(data.summary)?.primary_metric_total
+      const summaryPrimaryMetricTotal =
+        typeof summaryPrimaryMetricTotalRaw === "number" ? summaryPrimaryMetricTotalRaw : null
       const summaryMetrics =
-        (asObject(asObject(data.summary)?.metrics) as Record<string, Record<string, number | null>>) ?? {}
+        (asObject(asObject(data.summary)?.metrics_by_column) as Record<string, Record<string, number | null>>) ?? {}
       const groups = asArray(data.groups).map((groupRaw) => {
         const group = asObject(groupRaw) ?? {}
         return {
           group_key: asObject(group.group) ?? {},
-          record_count: toNonNegativeInt(group.count) ?? 0,
-          record_ratio: typeof group.count_ratio === "number" ? group.count_ratio : null,
+          group_assignment_count: toNonNegativeInt(group.count) ?? 0,
+          group_assignment_ratio: typeof group.count_ratio === "number" ? group.count_ratio : null,
           primary_metric_total:
             typeof group.amount_total === "number" ? group.amount_total : group.amount_total ?? null,
           primary_metric_ratio:
             typeof group.amount_ratio === "number" ? group.amount_ratio : group.amount_ratio ?? null,
           metrics_by_column:
-            (asObject(group.metrics) as Record<string, Record<string, number | null>>) ?? {}
+            (asObject(group.metrics_by_column) as Record<string, Record<string, number | null>>) ?? {}
         }
       })
       const returnedGroupCount =
         toNonNegativeInt(completeness.returned_group_count) ?? groups.length
       const totalGroupCount =
         toNonNegativeInt(completeness.total_group_count) ?? groups.length
-      const summaryCounts = asObject(asObject(data.summary)?.counts)
-      const effectiveRecordCount =
-        toNonNegativeInt(summaryCounts?.effective_record_count) ??
-        toNonNegativeInt(completeness.effective_record_count) ??
-        0
-      const rawScanComplete = completeness.raw_scan_complete === true
+      const summaryCounts =
+        (asObject(asObject(data.summary)?.counts) as z.infer<typeof aggregateSummaryCountSchema> | null) ?? {
+          source_record_count: 0,
+          group_assignment_count: null,
+          metric_nonnull_record_count: null
+        }
       const snapshotUri = buildQuerySnapshotResourceUri(queryId)
       const normalizedUri = buildQueryNormalizedResourceUri(queryId)
       const snapshot = {
@@ -2423,11 +2452,10 @@ server.registerTool(
         normalized_query: built.normalizedQuery,
         primary_metric_column: built.primaryMetricColumn,
         summary: {
-          counts: buildSummaryCounts({
-            effectiveRecordCount,
-            rawScanComplete
-          }),
-          missing_count: toNonNegativeInt(asObject(data.summary)?.missing_count) ?? 0,
+          counts: summaryCounts,
+          primary_metric_total: summaryPrimaryMetricTotal,
+          primary_metric_missing_count:
+            toNonNegativeInt(asObject(data.summary)?.primary_metric_missing_count) ?? null,
           returned_group_count: returnedGroupCount,
           total_group_count: totalGroupCount,
           metrics_by_column: summaryMetrics
@@ -2458,11 +2486,10 @@ server.registerTool(
           normalized_query: built.normalizedQuery,
           primary_metric_column: built.primaryMetricColumn,
           summary: {
-            counts: buildSummaryCounts({
-              effectiveRecordCount,
-              rawScanComplete
-            }),
-            missing_count: toNonNegativeInt(asObject(data.summary)?.missing_count) ?? 0,
+            counts: summaryCounts,
+            primary_metric_total: summaryPrimaryMetricTotal,
+            primary_metric_missing_count:
+              toNonNegativeInt(asObject(data.summary)?.primary_metric_missing_count) ?? null,
             returned_group_count: returnedGroupCount,
             total_group_count: totalGroupCount,
             metrics_by_column: summaryMetrics
@@ -5463,13 +5490,63 @@ function buildExtendedCompleteness(params: {
   }
 }
 
-function buildSummaryCounts(params: {
-  effectiveRecordCount: number
+function buildAggregateCompleteness(params: {
+  fetchedPages: number
+  requestedPages: number
+  hasMore: boolean
+  nextPageToken: string | null
+  omittedItems: number
+  omittedChars: number
   rawScanComplete: boolean
-}): z.infer<typeof summaryCountSchema> {
+  scanLimitHit: boolean
+  scannedPages: number
+  scanLimit?: number
+  outputPageComplete: boolean
+  rawNextPageToken?: string | null
+  outputNextPageToken?: string | null
+  stopReason?: string | null
+  returnedGroupCount?: number
+  totalGroupCount?: number
+}): z.infer<typeof aggregateCompletenessSchema> {
+  const isComplete = params.rawScanComplete && params.outputPageComplete
   return {
-    effective_record_count: params.effectiveRecordCount,
-    final_record_count: params.rawScanComplete ? params.effectiveRecordCount : null
+    fetched_pages: params.fetchedPages,
+    requested_pages: params.requestedPages,
+    actual_scanned_pages: params.fetchedPages,
+    has_more: params.hasMore,
+    next_page_token: params.nextPageToken,
+    is_complete: isComplete,
+    partial: !isComplete,
+    omitted_items: params.omittedItems,
+    omitted_chars: params.omittedChars,
+    raw_scan_complete: params.rawScanComplete,
+    scan_limit_hit: params.scanLimitHit,
+    scanned_pages: params.scannedPages,
+    scan_limit: params.scanLimit,
+    output_page_complete: params.outputPageComplete,
+    raw_next_page_token: params.rawNextPageToken ?? params.nextPageToken,
+    output_next_page_token: params.outputNextPageToken ?? null,
+    stop_reason: params.stopReason ?? null,
+    ...(params.returnedGroupCount !== undefined
+      ? { returned_group_count: params.returnedGroupCount }
+      : {}),
+    ...(params.totalGroupCount !== undefined ? { total_group_count: params.totalGroupCount } : {})
+  }
+}
+
+function buildAggregateSummaryCounts(params: {
+  sourceRecordCount: number
+  groupAssignmentCount: number
+  metricNonnullRecordCount: number | null
+  rawScanComplete: boolean
+}): z.infer<typeof aggregateSummaryCountSchema> {
+  return {
+    source_record_count: params.sourceRecordCount,
+    group_assignment_count: params.rawScanComplete ? params.groupAssignmentCount : null,
+    metric_nonnull_record_count:
+      params.rawScanComplete && params.metricNonnullRecordCount !== null
+        ? params.metricNonnullRecordCount
+        : null
   }
 }
 
@@ -8044,7 +8121,8 @@ interface SummaryColumn {
 type AggregateMetricName = "count" | "sum" | "avg" | "min" | "max"
 
 interface AggregateMetricAccumulator {
-  count: number
+  included_count: number
+  nonnull_count: number
   sum: number
   min: number | null
   max: number | null
@@ -8067,7 +8145,8 @@ function cloneByDayBuckets(
 
 function cloneMetricAccumulator(accumulator: AggregateMetricAccumulator): AggregateMetricAccumulator {
   return {
-    count: accumulator.count,
+    included_count: accumulator.included_count,
+    nonnull_count: accumulator.nonnull_count,
     sum: accumulator.sum,
     min: accumulator.min,
     max: accumulator.max
@@ -8084,15 +8163,19 @@ function restoreMetricAccumulatorMap(
   values: Array<[string, AggregateMetricAccumulator]>
 ): Map<string, AggregateMetricAccumulator> {
   return new Map(
-    values.map(([key, value]) => [
-      key,
-      {
-        count: value.count,
-        sum: value.sum,
-        min: value.min,
-        max: value.max
-      }
-    ])
+    values.map(([key, value]) => {
+      const legacyValue = value as AggregateMetricAccumulator & { count?: number }
+      return [
+        key,
+        {
+          included_count: legacyValue.included_count ?? legacyValue.count ?? 0,
+          nonnull_count: legacyValue.nonnull_count ?? legacyValue.count ?? 0,
+          sum: legacyValue.sum,
+          min: legacyValue.min,
+          max: legacyValue.max
+        }
+      ]
+    })
   )
 }
 
@@ -8246,7 +8329,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   data: z.infer<typeof querySummaryOutputSchema>
   meta: ReturnType<typeof buildMeta>
   message: string
-  completeness: z.infer<typeof completenessSchema>
+  completeness: z.infer<typeof aggregateCompletenessSchema>
   evidence: z.infer<typeof evidenceSchema>
   outputProfile: OutputProfile
 }> {
@@ -8314,6 +8397,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   if (!completeness) {
     throw new Error("Aggregate summary completeness is missing")
   }
+  const aggregateMeta = asObject(aggregateData.meta)
   const evidence = aggregateData.evidence
   if (!evidence) {
     throw new Error("Aggregate summary evidence is missing")
@@ -8354,16 +8438,17 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
             const group = asObject(bucket.group) ?? {}
             return {
               day: String(group.time_bucket_day ?? "all"),
-              count: toNonNegativeInt(bucket.count) ?? 0,
-              amount_total: amountColumn ? (typeof bucket.amount_total === "number" ? bucket.amount_total : null) : null
+              group_assignment_count: toNonNegativeInt(bucket.count) ?? 0,
+              primary_metric_total:
+                amountColumn ? (typeof bucket.amount_total === "number" ? bucket.amount_total : null) : null
             }
           })
           .sort((a, b) => a.day.localeCompare(b.day))
       : [
           {
             day: "all",
-            count: aggregateData.summary.counts.effective_record_count,
-            amount_total: amountColumn ? aggregateData.summary.total_amount : null
+            group_assignment_count: aggregateData.summary.counts.group_assignment_count,
+            primary_metric_total: amountColumn ? aggregateData.summary.primary_metric_total : null
           }
         ]
 
@@ -8400,17 +8485,17 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   ]
 
   const scannedRecords =
-    toNonNegativeInt(completeness.scanned_record_count) ??
-    toNonNegativeInt(completeness.effective_record_count) ??
-    aggregateData.summary.counts.effective_record_count
+    toNonNegativeInt(asObject(aggregateMeta?.execution)?.scanned_record_count) ??
+    aggregateData.summary.counts.group_assignment_count ??
+    0
 
   return {
     data: {
       summary: {
         counts: aggregateData.summary.counts,
-        total_amount: aggregateData.summary.total_amount,
+        primary_metric_total: aggregateData.summary.primary_metric_total,
         by_day: byDay,
-        missing_count: aggregateData.summary.missing_count
+        primary_metric_missing_count: aggregateData.summary.primary_metric_missing_count
       },
       rows,
       completeness,
@@ -8435,6 +8520,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
                 include_null: includeNull
               },
               execution: {
+                source_record_count: aggregateData.summary.counts.source_record_count,
                 scanned_records: scannedRecords,
                 scanned_pages:
                   toNonNegativeInt(completeness.scanned_pages) ??
@@ -8442,7 +8528,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
                   0,
                 truncated:
                   !completeness.is_complete ||
-                  rows.length < aggregateData.summary.counts.effective_record_count,
+                  rows.length < aggregateData.summary.counts.source_record_count,
                 row_cap: rowCap,
                 column_cap: sampleListArgs.max_columns ?? null,
                 scan_max_pages:
@@ -8458,9 +8544,9 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       throw new Error("Aggregate verbose meta is missing")
     })(),
     message:
-      aggregateData.summary.counts.final_record_count !== null
-        ? `Summarized ${aggregateData.summary.counts.final_record_count} records`
-        : `Summarized ${aggregateData.summary.counts.effective_record_count}/${completeness.result_amount} records (partial)`,
+      completeness.raw_scan_complete
+        ? `Summarized ${aggregateData.summary.counts.source_record_count} source records`
+        : `Summarized partial aggregate for ${aggregateData.summary.counts.source_record_count} source records`,
     completeness,
     evidence,
     outputProfile
@@ -8630,7 +8716,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       if (primaryAmountColumn) {
         const primaryAmountValue = extractSummaryColumnValue(answers, primaryAmountColumn)
         const primaryNumericAmount = toFiniteAmount(primaryAmountValue)
-        if (primaryNumericAmount === null && !includeNull) {
+        if (primaryNumericAmount === null) {
           missingCount += 1
         }
       }
@@ -8662,17 +8748,16 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
         const amountValue = extractSummaryColumnValue(answers, amountColumn)
         const numericAmount = toFiniteAmount(amountValue)
         if (numericAmount === null) {
-          if (includeNull) {
-            // Include in group count only.
-          }
-          continue
-        }
-        if (!includeNegative && numericAmount < 0) {
           continue
         }
         const groupAccumulator = getOrCreateMetricAccumulator(bucket.metrics, metricKey)
-        updateMetricAccumulator(groupAccumulator, numericAmount)
+        noteMetricAccumulatorNonnull(groupAccumulator)
         const summaryAccumulator = getOrCreateMetricAccumulator(summaryMetricStats, metricKey)
+        noteMetricAccumulatorNonnull(summaryAccumulator)
+        if (!includeNegative && numericAmount < 0) {
+          continue
+        }
+        updateMetricAccumulator(groupAccumulator, numericAmount)
         updateMetricAccumulator(summaryAccumulator, numericAmount)
 
         if (primaryAmountColumn && metricKey === primaryAmountColumn.requested) {
@@ -8745,9 +8830,10 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     (scannedPagesThisCall >= callScanLimit ||
       stopReason === "execution_budget" ||
       stopReason === "adaptive_budget")
-  const completeness = buildExtendedCompleteness({
-    resultAmount: knownResultAmount,
-    returnedItems: scannedRecords,
+  const primaryMetricNonnullCount = primaryAmountColumn
+    ? (summaryMetricStats.get(primaryAmountColumn.requested)?.nonnull_count ?? 0)
+    : null
+  const completeness = buildAggregateCompleteness({
     fetchedPages: scannedPagesTotal,
     requestedPages: totalScanLimit,
     hasMore,
@@ -8762,8 +8848,6 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     rawNextPageToken,
     outputNextPageToken: null,
     stopReason,
-    scannedRecordCount: scannedRecords,
-    effectiveRecordCount: scannedRecords,
     returnedGroupCount: Math.min(groupsTotal, maxGroups),
     totalGroupCount: groupsTotal
   })
@@ -8796,7 +8880,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
             : null,
       ...(metrics.length > 0
         ? {
-            metrics: buildAggregateMetricRecord({
+            metrics_by_column: buildAggregateMetricRecord({
               metrics,
               amountColumns,
               metricStats: bucket.metrics,
@@ -8840,15 +8924,17 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       data: {
         app_key: args.app_key,
         summary: {
-          counts: buildSummaryCounts({
-            effectiveRecordCount: scannedRecords,
+          counts: buildAggregateSummaryCounts({
+            sourceRecordCount: knownResultAmount,
+            groupAssignmentCount: scannedRecords,
+            metricNonnullRecordCount: primaryMetricNonnullCount,
             rawScanComplete
           }),
-          total_amount: primaryAmountColumn ? totalAmount : null,
-          missing_count: primaryAmountColumn ? missingCount : 0,
+          primary_metric_total: primaryAmountColumn ? totalAmount : null,
+          primary_metric_missing_count: primaryAmountColumn ? missingCount : null,
           ...(metrics.length > 0
             ? {
-                metrics: buildAggregateMetricRecord({
+                metrics_by_column: buildAggregateMetricRecord({
                   metrics,
                   amountColumns,
                   metricStats: summaryMetricStats,
@@ -8869,7 +8955,12 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
                   include_null: includeNull
                 },
                 metrics,
-                time_bucket: timeBucket
+                time_bucket: timeBucket,
+                execution: {
+                  source_record_count: knownResultAmount,
+                  scanned_record_count: scannedRecords,
+                  metric_nonnull_record_count: primaryMetricNonnullCount
+                }
               }
             }
           : {})
@@ -8891,8 +8982,8 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
         : {})
     },
     message: completeness.is_complete
-      ? `Aggregated ${scannedRecords} records`
-      : `Aggregated ${scannedRecords}/${knownResultAmount} records (partial)`
+      ? `Aggregated ${knownResultAmount} source records`
+      : `Aggregated partial result for ${knownResultAmount} source records`
   }
 }
 
@@ -9137,7 +9228,8 @@ function getOrCreateMetricAccumulator(
     return existing
   }
   const created: AggregateMetricAccumulator = {
-    count: 0,
+    included_count: 0,
+    nonnull_count: 0,
     sum: 0,
     min: null,
     max: null
@@ -9146,8 +9238,12 @@ function getOrCreateMetricAccumulator(
   return created
 }
 
+function noteMetricAccumulatorNonnull(accumulator: AggregateMetricAccumulator): void {
+  accumulator.nonnull_count += 1
+}
+
 function updateMetricAccumulator(accumulator: AggregateMetricAccumulator, value: number): void {
-  accumulator.count += 1
+  accumulator.included_count += 1
   accumulator.sum += value
   accumulator.min = accumulator.min === null ? value : Math.min(accumulator.min, value)
   accumulator.max = accumulator.max === null ? value : Math.max(accumulator.max, value)
@@ -9164,7 +9260,7 @@ function buildAggregateMetricRecord(params: {
     const rowMetrics: Record<string, number | null> = {}
     for (const metric of params.metrics) {
       if (metric === "count") {
-        rowMetrics.count = params.rowCount
+        rowMetrics.record_count = params.rowCount
       } else {
         rowMetrics[metric] = null
       }
@@ -9178,11 +9274,11 @@ function buildAggregateMetricRecord(params: {
     const record: Record<string, number | null> = {}
     for (const metric of params.metrics) {
       if (metric === "count") {
-        record.count = stats ? stats.count : 0
+        record.nonnull_record_count = stats ? stats.nonnull_count : 0
       } else if (metric === "sum") {
         record.sum = stats ? stats.sum : 0
       } else if (metric === "avg") {
-        record.avg = stats && stats.count > 0 ? stats.sum / stats.count : null
+        record.avg = stats && stats.included_count > 0 ? stats.sum / stats.included_count : null
       } else if (metric === "min") {
         record.min = stats ? stats.min : null
       } else if (metric === "max") {
