@@ -657,6 +657,13 @@ async function callToolRaw(client, name, args) {
   throw new Error(`Tool ${name} returned no structured JSON payload: ${debug}`)
 }
 
+async function callToolResult(client, name, args) {
+  return client.callTool({
+    name,
+    arguments: args
+  })
+}
+
 async function callToolProtocolError(client, name, args) {
   const result = await client.callTool({
     name,
@@ -669,6 +676,31 @@ async function callToolProtocolError(client, name, args) {
     : []
   assert.ok(textItems.length > 0, `${name} should return text error content`)
   return textItems.map((item) => item.text).join("\n")
+}
+
+async function readResourceJson(client, uri) {
+  const result = await client.readResource({ uri })
+  const item = Array.isArray(result.contents) ? result.contents[0] : null
+  assert.ok(item, `resource ${uri} should return contents`)
+  assert.equal(typeof item.text, "string")
+  return JSON.parse(item.text)
+}
+
+async function completeResource(client, uri, name, value, contextArguments = {}) {
+  const result = await client.complete({
+    ref: {
+      type: "ref/resource",
+      uri
+    },
+    argument: {
+      name,
+      value
+    },
+    context: {
+      arguments: contextArguments
+    }
+  })
+  return result.completion.values
 }
 
 function firstRowValue(row) {
@@ -720,6 +752,12 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.ok(names.includes("qf_export_json"))
     assert.ok(names.includes("qf_records_aggregate"))
     assert.ok(names.includes("qf_record_create"))
+    assert.ok(names.includes("qf.query.plan"))
+    assert.ok(names.includes("qf.query.rows"))
+    assert.ok(names.includes("qf.query.record"))
+    assert.ok(names.includes("qf.query.aggregate"))
+    assert.ok(names.includes("qf.query.export"))
+    assert.ok(names.includes("qf.records.mutate"))
 
     const byName = new Map(tools.tools.map((item) => [item.name, item]))
     const expectSchemaProps = (toolName, props) => {
@@ -742,6 +780,12 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     expectSchemaProps("qf_query", ["query_mode", "app_key", "select_columns", "amount_column"])
     expectSchemaProps("qf_records_aggregate", ["app_key", "group_by", "metrics", "time_range"])
     expectSchemaProps("qf_record_create", ["app_key", "fields", "answers"])
+    expectSchemaProps("qf.query.plan", ["kind", "query", "action"])
+    expectSchemaProps("qf.query.rows", ["app_key", "select", "where", "sort"])
+    expectSchemaProps("qf.query.record", ["apply_id", "select"])
+    expectSchemaProps("qf.query.aggregate", ["app_key", "group_by", "metrics"])
+    expectSchemaProps("qf.query.export", ["app_key", "select", "format"])
+    expectSchemaProps("qf.records.mutate", ["action", "app_key", "apply_id", "fields"])
 
     const listSchema = byName.get("qf_records_list").inputSchema
     assert.equal(listSchema.additionalProperties, false)
@@ -762,6 +806,48 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.ok(Array.isArray(aggregateSchema.required))
     assert.ok(aggregateSchema.required.includes("app_key"))
     assert.ok(aggregateSchema.required.includes("group_by"))
+
+    const canonicalRowsSchema = byName.get("qf.query.rows").inputSchema
+    assert.equal(canonicalRowsSchema.additionalProperties, false)
+    assert.equal(canonicalRowsSchema.properties.select.type, "array")
+    assert.equal(canonicalRowsSchema.properties.where.type, "array")
+    assert.ok(Array.isArray(canonicalRowsSchema.required))
+    assert.ok(canonicalRowsSchema.required.includes("app_key"))
+    assert.ok(canonicalRowsSchema.required.includes("select"))
+  })
+
+  await t.test("resources, prompts and completions are exposed", async () => {
+    const resourceTemplates = await mcp.client.listResourceTemplates()
+    const templateUris = resourceTemplates.resourceTemplates.map((item) => item.uriTemplate)
+    assert.ok(templateUris.includes("qingflow://apps/{app_key}/schema"))
+    assert.ok(templateUris.includes("qingflow://apps/{app_key}/fields"))
+    assert.ok(templateUris.includes("qingflow://apps/{app_key}/fields/{field}/values/{match}/{prefix}"))
+    assert.ok(templateUris.includes("qingflow://queries/{query_id}/normalized"))
+    assert.ok(templateUris.includes("qingflow://queries/{query_id}/snapshot"))
+    assert.ok(templateUris.includes("qingflow://exports/{export_id}"))
+
+    const prompts = await mcp.client.listPrompts()
+    const promptNames = prompts.prompts.map((item) => item.name)
+    assert.ok(promptNames.includes("analyze-period-comparison"))
+    assert.ok(promptNames.includes("build-query-from-question"))
+    assert.ok(promptNames.includes("prepare-record-write"))
+
+    const appKeys = await completeResource(
+      mcp.client,
+      "qingflow://apps/{app_key}/fields",
+      "app_key",
+      "app"
+    )
+    assert.ok(appKeys.includes(APP_KEY))
+
+    const fieldNames = await completeResource(
+      mcp.client,
+      "qingflow://apps/{app_key}/fields/{field}/values/{match}/{prefix}",
+      "field",
+      "客户",
+      { app_key: APP_KEY }
+    )
+    assert.ok(fieldNames.includes("客户名称"))
   })
 
   await t.test("cli mode can list tools and call one tool", async () => {
@@ -938,6 +1024,158 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(planned.ok, true)
     assert.equal(planned.data.ready_for_final_conclusion, true)
     assert.deepEqual(planned.data.final_conclusion_blockers, [])
+  })
+
+  await t.test("qf.query.plan normalizes canonical rows query and delegates to internal planning", async () => {
+    const planned = await callTool(mcp.client, "qf.query.plan", {
+      kind: "rows",
+      query: {
+        appKey: APP_KEY,
+        selectColumns: "[1001,1002]",
+        filters: [
+          {
+            que_id: 1003,
+            min_value: "2026-01-01",
+            max_value: "2026-01-31"
+          }
+        ],
+        max_rows: "20"
+      },
+      probe: true
+    })
+
+    assert.equal(planned.ok, true)
+    assert.equal(planned.data.kind, "rows")
+    assert.equal(planned.data.internal_tool, "qf_records_list")
+    assert.equal(planned.data.normalized_query.app_key, APP_KEY)
+    assert.deepEqual(planned.data.normalized_query.select, [1001, 1002])
+    assert.equal(planned.data.validation.valid, true)
+    assert.ok(Array.isArray(planned.data.field_mapping))
+  })
+
+  await t.test("canonical rows query returns resource links and readable query artifacts", async () => {
+    const result = await callToolResult(mcp.client, "qf.query.rows", {
+      app_key: APP_KEY,
+      select: [1001, 1002],
+      where: [
+        {
+          field: 1003,
+          op: "between",
+          from: "2026-01-01",
+          to: "2026-01-31"
+        }
+      ],
+      limit: 20
+    })
+
+    assert.equal(result.structuredContent.ok, true)
+    assert.equal(result.structuredContent.data.kind, "rows")
+    assert.equal(result.structuredContent.data.row_count, 5)
+    assert.equal(typeof result.structuredContent.data.query_id, "string")
+    const resourceLinks = result.content.filter((item) => item.type === "resource_link")
+    assert.equal(resourceLinks.length, 2)
+    const snapshotUri = result.structuredContent.data.snapshot_resource.uri
+    const snapshot = await readResourceJson(mcp.client, snapshotUri)
+    assert.equal(snapshot.snapshot.kind, "rows")
+    assert.equal(snapshot.snapshot.row_count, 5)
+
+    const normalized = await readResourceJson(
+      mcp.client,
+      `qingflow://queries/${result.structuredContent.data.query_id}/normalized`
+    )
+    assert.equal(normalized.normalized_query.app_key, APP_KEY)
+    assert.deepEqual(normalized.normalized_query.select, [1001, 1002])
+
+    const queryIds = await completeResource(
+      mcp.client,
+      "qingflow://queries/{query_id}/normalized",
+      "query_id",
+      result.structuredContent.data.query_id.slice(0, 8)
+    )
+    assert.ok(queryIds.includes(result.structuredContent.data.query_id))
+  })
+
+  await t.test("canonical record query returns row snapshot resource", async () => {
+    const record = await callTool(mcp.client, "qf.query.record", {
+      apply_id: "5002",
+      select: [1001, 1002]
+    })
+
+    assert.equal(record.ok, true)
+    assert.equal(record.data.kind, "record")
+    assert.equal(rowValueByCandidates(record.data.row, ["客户名称", "1001"]), "客户B")
+    const snapshot = await readResourceJson(mcp.client, record.data.snapshot_resource.uri)
+    assert.equal(snapshot.snapshot.kind, "record")
+    assert.equal(rowValueByCandidates(snapshot.snapshot.row, ["金额", "1002"]), 200)
+  })
+
+  await t.test("canonical aggregate query returns metrics_by_column and snapshot resource", async () => {
+    const aggregated = await callTool(mcp.client, "qf.query.aggregate", {
+      app_key: APP_KEY,
+      where: [
+        {
+          field: 1003,
+          op: "between",
+          from: "2026-01-01",
+          to: "2026-01-31"
+        }
+      ],
+      group_by: [1003],
+      metrics: [
+        { op: "count" },
+        { column: 1002, op: "sum" },
+        { column: 1002, op: "avg" }
+      ],
+      strict_full: true
+    })
+
+    assert.equal(aggregated.ok, true)
+    assert.equal(aggregated.data.kind, "aggregate")
+    assert.equal(aggregated.data.summary.record_count, 5)
+    assert.equal(aggregated.data.summary.metrics_by_column["1002"].sum, 280)
+    assert.ok(Array.isArray(aggregated.data.groups))
+    assert.ok(aggregated.data.groups[0].metrics_by_column["1002"])
+    const snapshot = await readResourceJson(mcp.client, aggregated.data.snapshot_resource.uri)
+    assert.equal(snapshot.snapshot.kind, "aggregate")
+    assert.equal(snapshot.snapshot.summary.metrics_by_column["1002"].avg, 70)
+  })
+
+  await t.test("canonical export query returns export resource", async () => {
+    const exported = await callTool(mcp.client, "qf.query.export", {
+      app_key: APP_KEY,
+      select: [1001, 1002],
+      format: "json",
+      where: [
+        {
+          field: 1003,
+          op: "between",
+          from: "2026-01-01",
+          to: "2026-01-31"
+        }
+      ],
+      limit: 20
+    })
+
+    assert.equal(exported.ok, true)
+    assert.equal(exported.data.kind, "export")
+    assert.equal(exported.data.row_count, 5)
+    const exportMeta = await readResourceJson(mcp.client, exported.data.export_resource.uri)
+    assert.equal(exportMeta.export_id, exported.data.export_id)
+    assert.equal(exportMeta.row_count, 5)
+  })
+
+  await t.test("prompt templates are readable", async () => {
+    const prompt = await mcp.client.getPrompt({
+      name: "build-query-from-question",
+      arguments: {
+        question: "查询 2026 年 1 月的客户名称和金额",
+        app_key: APP_KEY
+      }
+    })
+
+    assert.ok(Array.isArray(prompt.messages))
+    assert.equal(prompt.messages.length, 1)
+    assert.match(prompt.messages[0].content.text, /canonical Qingflow DSL/)
   })
 
   await t.test("qf_records_list defaults to compact output profile", async () => {
@@ -1733,5 +1971,37 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
     assert.equal(afterUpdate.ok, true)
     assert.equal(rowValueByCandidates(afterUpdate.data.row, ["金额", "1002"]), 456)
+  })
+
+  await t.test("canonical mutate tool creates and updates records", async () => {
+    const created = await callTool(mcp.client, "qf.records.mutate", {
+      action: "create",
+      app_key: APP_KEY,
+      fields: {
+        客户名称: "Canonical客户",
+        金额: 321,
+        下单日期: "2026-01-22"
+      }
+    })
+
+    assert.equal(created.ok, true)
+    assert.equal(created.data.kind, "mutate")
+    const applyId = String(created.data.apply_id)
+
+    const updated = await callTool(mcp.client, "qf.records.mutate", {
+      action: "update",
+      apply_id: applyId,
+      app_key: APP_KEY,
+      fields: {
+        金额: 654
+      }
+    })
+
+    assert.equal(updated.ok, true)
+    const afterUpdate = await callTool(mcp.client, "qf.query.record", {
+      apply_id: applyId,
+      select: [1002]
+    })
+    assert.equal(rowValueByCandidates(afterUpdate.data.row, ["金额", "1002"]), 654)
   })
 })

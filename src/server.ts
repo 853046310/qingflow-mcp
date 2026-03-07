@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
+import type { Variables } from "@modelcontextprotocol/sdk/shared/uriTemplate.js"
 import { randomUUID } from "node:crypto"
 import os from "node:os"
 import path from "node:path"
@@ -97,6 +98,34 @@ interface AggregateContinuationState {
   summary_metric_stats: Array<[string, AggregateMetricAccumulator]>
 }
 
+type QueryArtifactKind = "rows" | "record" | "aggregate" | "export" | "plan" | "mutate"
+
+interface QueryArtifactEntry {
+  expiresAt: number
+  query_id: string
+  kind: QueryArtifactKind
+  app_key: string | null
+  normalized_query: Record<string, unknown>
+  internal_tool: string | null
+  internal_arguments: Record<string, unknown> | null
+  snapshot: Record<string, unknown>
+  created_at: string
+}
+
+interface ExportArtifactEntry {
+  expiresAt: number
+  export_id: string
+  query_id: string | null
+  app_key: string | null
+  format: "csv" | "json"
+  file_path: string
+  file_size_bytes: number
+  row_count: number
+  columns: string[]
+  preview: Array<Record<string, unknown>>
+  created_at: string
+}
+
 type ContinuationCacheEntry =
   | {
       expiresAt: number
@@ -144,6 +173,9 @@ const formCache = new Map<string, FormCacheEntry>()
 const CONTINUATION_CACHE_TTL_MS =
   Number(process.env.QINGFLOW_CONTINUATION_CACHE_TTL_MS ?? "900000")
 const continuationCache = new Map<string, ContinuationCacheEntry>()
+const QUERY_ARTIFACT_TTL_MS = Number(process.env.QINGFLOW_QUERY_ARTIFACT_TTL_MS ?? "900000")
+const queryArtifactCache = new Map<string, QueryArtifactEntry>()
+const exportArtifactCache = new Map<string, ExportArtifactEntry>()
 const DEFAULT_PAGE_SIZE = 50
 const DEFAULT_SCAN_MAX_PAGES = 10
 const DEFAULT_ROW_LIMIT = 200
@@ -160,7 +192,7 @@ const ADAPTIVE_TARGET_PAGE_MS = toPositiveInt(process.env.QINGFLOW_ADAPTIVE_TARG
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
-const SERVER_VERSION = "0.3.14"
+const SERVER_VERSION = "0.4.0"
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -1363,6 +1395,7 @@ const exportInputSchema = z.preprocess(
 const exportOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
+    query_id: z.string(),
     export_id: z.string(),
     format: z.enum(["csv", "json"]),
     app_key: z.string(),
@@ -1383,6 +1416,281 @@ const exportOutputSchema = z.object({
       .optional()
   }),
   ...queryContractFields,
+  meta: apiMetaSchema.optional()
+})
+
+const canonicalFieldRefSchema = publicFieldSelectorSchema
+const canonicalMatchModeSchema = z.enum([
+  "exact",
+  "normalized",
+  "contains",
+  "prefix",
+  "fuzzy"
+])
+const canonicalWhereOpSchema = z.enum([
+  "eq",
+  "neq",
+  "in",
+  "not_in",
+  "contains",
+  "prefix",
+  "between",
+  "gte",
+  "lte",
+  "exists",
+  "not_exists"
+])
+const canonicalSortDirectionSchema = z.enum(["asc", "desc"])
+const canonicalWhereItemSchema = z
+  .object({
+    field: canonicalFieldRefSchema,
+    op: canonicalWhereOpSchema,
+    value: z.unknown().optional(),
+    values: z.array(z.unknown()).optional(),
+    from: z.union([z.string(), z.number()]).optional(),
+    to: z.union([z.string(), z.number()]).optional(),
+    match: canonicalMatchModeSchema.optional()
+  })
+  .superRefine((value, ctx) => {
+    if (value.op === "between") {
+      if (value.from === undefined && value.to === undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "between requires from or to"
+        })
+      }
+      return
+    }
+    if (value.op === "in" || value.op === "not_in") {
+      if (!value.values || value.values.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `${value.op} requires values`
+        })
+      }
+      return
+    }
+    if (value.op === "exists" || value.op === "not_exists") {
+      return
+    }
+    if (value.value === undefined && value.from === undefined && value.to === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `${value.op} requires value`
+      })
+    }
+  })
+
+const canonicalSortItemSchema = z.object({
+  field: canonicalFieldRefSchema,
+  direction: canonicalSortDirectionSchema.optional()
+})
+
+const canonicalSelectSchema = z.array(canonicalFieldRefSchema).min(1).max(MAX_COLUMN_LIMIT)
+const canonicalGroupBySchema = z.array(canonicalFieldRefSchema).min(1).max(20)
+
+const canonicalBaseQueryInputSchema = z.object({
+  app_key: z.string().min(1),
+  select: canonicalSelectSchema.optional(),
+  where: z.array(canonicalWhereItemSchema).optional(),
+  sort: z.array(canonicalSortItemSchema).optional(),
+  limit: z.number().int().positive().max(DEFAULT_ROW_LIMIT).optional(),
+  cursor: z.string().optional(),
+  page_size: z.number().int().positive().max(200).optional(),
+  requested_pages: z.number().int().positive().max(500).optional(),
+  scan_max_pages: z.number().int().positive().max(500).optional(),
+  strict_full: z.boolean().optional(),
+  output_profile: outputProfileSchema.optional(),
+  user_id: z.string().min(1).optional(),
+  mode: z
+    .enum([
+      "todo",
+      "done",
+      "mine_approved",
+      "mine_rejected",
+      "mine_draft",
+      "mine_need_improve",
+      "mine_processing",
+      "all",
+      "all_approved",
+      "all_rejected",
+      "all_processing",
+      "cc"
+    ])
+    .optional()
+})
+
+const canonicalPlanInputSchema = z.object({
+  kind: z.enum(["rows", "record", "aggregate", "export", "mutate"]),
+  query: z.record(z.unknown()).optional(),
+  action: z.record(z.unknown()).optional(),
+  probe: z.boolean().optional(),
+  resolve_fields: z.boolean().optional()
+})
+
+const canonicalRowsInputSchema = canonicalBaseQueryInputSchema.extend({
+  select: canonicalSelectSchema
+})
+
+const canonicalRecordInputSchema = z.object({
+  apply_id: canonicalFieldRefSchema,
+  select: canonicalSelectSchema,
+  output_profile: outputProfileSchema.optional()
+})
+
+const canonicalAggregateMetricInputSchema = z
+  .object({
+    column: canonicalFieldRefSchema.optional(),
+    op: z.enum(["count", "sum", "avg", "min", "max"])
+  })
+  .superRefine((value, ctx) => {
+    if (value.op !== "count" && value.column === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `${value.op} requires column`
+      })
+    }
+  })
+
+const canonicalAggregateInputSchema = canonicalBaseQueryInputSchema.extend({
+  group_by: canonicalGroupBySchema,
+  metrics: z.array(canonicalAggregateMetricInputSchema).min(1).max(10),
+  time_bucket: z.enum(["day", "week", "month"]).optional(),
+  top_n: z.number().int().positive().max(2000).optional()
+})
+
+const canonicalMutateInputSchema = z.object({
+  action: z.enum(["create", "update"]),
+  app_key: z.string().min(1).optional(),
+  apply_id: canonicalFieldRefSchema.optional(),
+  user_id: z.string().min(1).optional(),
+  fields: z.record(z.unknown()).optional(),
+  answers: z.array(publicAnswerInputSchema).optional(),
+  force_refresh_form: z.boolean().optional()
+})
+
+const canonicalExportInputSchema = canonicalBaseQueryInputSchema.extend({
+  select: canonicalSelectSchema,
+  format: z.enum(["csv", "json"]).optional(),
+  file_name: z.string().min(1).optional(),
+  export_dir: z.string().min(1).optional()
+})
+
+const canonicalResourceRefSchema = z.object({
+  uri: z.string(),
+  name: z.string(),
+  mime_type: z.string(),
+  description: z.string().nullable().optional()
+})
+
+const canonicalPlanOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    kind: z.string(),
+    normalized_query: z.record(z.unknown()),
+    internal_tool: z.string().nullable(),
+    internal_arguments: z.record(z.unknown()).nullable(),
+    field_mapping: z.array(z.record(z.unknown())),
+    validation: z.record(z.unknown()),
+    estimate: z.record(z.unknown()),
+    ready_for_final_conclusion: z.boolean(),
+    final_conclusion_blockers: z.array(z.string()),
+    recommended_next_actions: z.array(z.string()),
+    translation_warnings: z.array(z.string())
+  }),
+  meta: z
+    .object({
+      version: z.string(),
+      generated_at: z.string()
+    })
+    .optional()
+})
+
+const canonicalRowsOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    kind: z.literal("rows"),
+    query_id: z.string(),
+    app_key: z.string(),
+    normalized_query: z.record(z.unknown()),
+    row_count: z.number().int().nonnegative(),
+    rows: z.array(z.record(z.unknown())),
+    cursor: z.string().nullable(),
+    snapshot_resource: canonicalResourceRefSchema,
+    translation_warnings: z.array(z.string()),
+    completeness: completenessSchema,
+    evidence: evidenceSchema.optional()
+  }),
+  meta: apiMetaSchema.optional()
+})
+
+const canonicalRecordOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    kind: z.literal("record"),
+    query_id: z.string(),
+    apply_id: z.union([z.string(), z.number(), z.null()]),
+    normalized_query: z.record(z.unknown()),
+    row: z.record(z.unknown()),
+    snapshot_resource: canonicalResourceRefSchema,
+    completeness: completenessSchema,
+    evidence: z.record(z.unknown()).optional()
+  }),
+  meta: apiMetaSchema.optional()
+})
+
+const canonicalAggregateOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    kind: z.literal("aggregate"),
+    query_id: z.string(),
+    app_key: z.string(),
+    normalized_query: z.record(z.unknown()),
+    primary_metric_column: z.string().nullable(),
+    summary: z.object({
+      record_count: z.number().int().nonnegative(),
+      metrics_by_column: z.record(z.record(z.union([z.number(), z.null()])))
+    }),
+    groups: z.array(z.record(z.unknown())),
+    cursor: z.string().nullable(),
+    snapshot_resource: canonicalResourceRefSchema,
+    translation_warnings: z.array(z.string()),
+    completeness: completenessSchema,
+    evidence: evidenceSchema.optional()
+  }),
+  meta: apiMetaSchema.optional()
+})
+
+const canonicalMutateOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    kind: z.literal("mutate"),
+    action: z.enum(["create", "update"]),
+    query_id: z.string(),
+    request_id: z.string().nullable(),
+    apply_id: z.union([z.string(), z.number(), z.null()]).optional(),
+    snapshot_resource: canonicalResourceRefSchema
+  }),
+  meta: apiMetaSchema.optional()
+})
+
+const canonicalExportOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    kind: z.literal("export"),
+    query_id: z.string(),
+    export_id: z.string(),
+    app_key: z.string(),
+    format: z.enum(["csv", "json"]),
+    file_path: z.string(),
+    file_size_bytes: z.number().int().nonnegative(),
+    row_count: z.number().int().nonnegative(),
+    columns: z.array(z.string()),
+    preview: z.array(z.record(z.unknown())),
+    export_resource: canonicalResourceRefSchema,
+    snapshot_resource: canonicalResourceRefSchema.optional(),
+    completeness: completenessSchema.optional()
+  }),
   meta: apiMetaSchema.optional()
 })
 
@@ -1587,6 +1895,928 @@ server.registerTool(
       return errorResult(error)
     }
   }
+)
+
+server.registerTool(
+  "qf.query.plan",
+  {
+    title: "Qingflow Canonical Query Plan",
+    description:
+      "Preflight canonical query DSL, normalize loose inputs, translate into internal tools and estimate whether the query is ready for a final conclusion.",
+    inputSchema: canonicalPlanInputSchema,
+    outputSchema: canonicalPlanOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = canonicalPlanInputSchema.parse(args)
+      const normalizedLoose = normalizeCanonicalLooseInput(
+        parsedArgs.kind,
+        parsedArgs.kind === "mutate" ? parsedArgs.action : parsedArgs.query
+      )
+
+      let normalizedQuery = normalizedLoose
+      let internalTool: string | null =
+        parsedArgs.kind === "rows"
+          ? "qf_records_list"
+          : parsedArgs.kind === "record"
+            ? "qf_record_get"
+            : parsedArgs.kind === "aggregate"
+              ? "qf_records_aggregate"
+              : parsedArgs.kind === "export"
+                ? String(normalizedLoose.format ?? "json").toLowerCase() === "csv"
+                  ? "qf_export_csv"
+                  : "qf_export_json"
+                : null
+      let internalArguments: Record<string, unknown> | null = null
+      let translationWarnings: string[] = []
+      let plannedPayload: z.infer<typeof queryPlanOutputSchema> | null = null
+
+      try {
+        if (parsedArgs.kind === "rows") {
+          const built = await buildCanonicalRowsExecution(canonicalRowsInputSchema.parse(normalizedLoose))
+          normalizedQuery = built.normalizedQuery
+          internalTool = built.internalTool
+          internalArguments = built.internalArguments
+          translationWarnings = built.translationWarnings
+        } else if (parsedArgs.kind === "record") {
+          const built = await buildCanonicalRecordExecution(canonicalRecordInputSchema.parse(normalizedLoose))
+          normalizedQuery = built.normalizedQuery
+          internalTool = built.internalTool
+          internalArguments = built.internalArguments
+        } else if (parsedArgs.kind === "aggregate") {
+          const built = await buildCanonicalAggregateExecution(
+            canonicalAggregateInputSchema.parse(normalizedLoose)
+          )
+          normalizedQuery = built.normalizedQuery
+          internalTool = built.internalTool
+          internalArguments = built.internalArguments
+          translationWarnings = built.translationWarnings
+        } else if (parsedArgs.kind === "export") {
+          const built = await buildCanonicalExportExecution(canonicalExportInputSchema.parse(normalizedLoose))
+          normalizedQuery = built.normalizedQuery
+          internalTool = built.internalTool
+          internalArguments = built.internalArguments
+          translationWarnings = built.translationWarnings
+        } else {
+          const built = await buildCanonicalMutateExecution(canonicalMutateInputSchema.parse(normalizedLoose))
+          normalizedQuery = built.normalizedQuery
+          internalTool = built.internalTool
+          internalArguments = built.internalArguments as Record<string, unknown>
+        }
+
+        if (internalTool && internalArguments && parsedArgs.kind !== "mutate") {
+          plannedPayload = await executeQueryPlan(
+            queryPlanInputSchema.parse({
+              tool: internalTool,
+              arguments: internalArguments,
+              probe: parsedArgs.probe,
+              resolve_fields: parsedArgs.resolve_fields
+            })
+          )
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return okResult(
+          {
+            ok: true,
+            data: {
+              kind: parsedArgs.kind,
+              normalized_query: normalizedQuery,
+              internal_tool: internalTool,
+              internal_arguments: internalArguments,
+              field_mapping: [],
+              validation: {
+                valid: false,
+                missing_required: [],
+                warnings: [message]
+              },
+              estimate: {
+                page_size: null,
+                requested_pages: null,
+                scan_max_pages: null,
+                estimated_scan_pages: null,
+                estimated_items_upper_bound: null,
+                may_hit_limits: false,
+                reasons: [],
+                probe: null
+              },
+              ready_for_final_conclusion: false,
+              final_conclusion_blockers: [message],
+              recommended_next_actions: [
+                "Fix the canonical query shape, then rerun qf.query.plan before execution."
+              ],
+              translation_warnings: translationWarnings
+            },
+            meta: {
+              version: SERVER_VERSION,
+              generated_at: new Date().toISOString()
+            }
+          },
+          `Planned ${parsedArgs.kind} query (invalid)`
+        )
+      }
+
+      return okResult(
+        {
+          ok: true,
+          data: {
+            kind: parsedArgs.kind,
+            normalized_query: normalizedQuery,
+            internal_tool: internalTool,
+            internal_arguments: internalArguments,
+            field_mapping: plannedPayload?.data.field_mapping ?? [],
+            validation: plannedPayload?.data.validation ?? {
+              valid: true,
+              missing_required: [],
+              warnings: []
+            },
+            estimate: plannedPayload?.data.estimate ?? {
+              page_size: null,
+              requested_pages: null,
+              scan_max_pages: null,
+              estimated_scan_pages: null,
+              estimated_items_upper_bound: null,
+              may_hit_limits: false,
+              reasons: [],
+              probe: null
+            },
+            ready_for_final_conclusion:
+              plannedPayload?.data.ready_for_final_conclusion ?? parsedArgs.kind === "mutate",
+            final_conclusion_blockers:
+              plannedPayload?.data.final_conclusion_blockers ?? [],
+            recommended_next_actions:
+              plannedPayload?.data.recommended_next_actions ?? [],
+            translation_warnings: translationWarnings
+          },
+          meta: {
+            version: SERVER_VERSION,
+            generated_at: new Date().toISOString()
+          }
+        },
+        `Planned canonical ${parsedArgs.kind} query`
+      )
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf.query.rows",
+  {
+    title: "Qingflow Canonical Query Rows",
+    description: "Query rows through the canonical DSL and return query handles plus resource links.",
+    inputSchema: canonicalRowsInputSchema,
+    outputSchema: canonicalRowsOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = canonicalRowsInputSchema.parse(args)
+      const built = await buildCanonicalRowsExecution(parsedArgs)
+      const executed = await executeRecordsList(built.internalArguments)
+      const queryId = executed.evidence?.query_id ?? randomUUID()
+      const snapshotUri = buildQuerySnapshotResourceUri(queryId)
+      const normalizedUri = buildQueryNormalizedResourceUri(queryId)
+      const snapshot = {
+        kind: "rows",
+        query_id: queryId,
+        normalized_query: built.normalizedQuery,
+        rows: executed.payload.data.rows,
+        row_count: executed.payload.data.rows.length,
+        cursor: executed.completeness.next_page_token,
+        completeness: executed.completeness,
+        evidence: executed.evidence,
+        translation_warnings: built.translationWarnings
+      }
+
+      storeQueryArtifact({
+        queryId,
+        kind: "rows",
+        appKey: parsedArgs.app_key,
+        normalizedQuery: built.normalizedQuery,
+        internalTool: built.internalTool,
+        internalArguments: built.internalArguments,
+        snapshot
+      })
+
+      const payload: z.infer<typeof canonicalRowsOutputSchema> = {
+        ok: true,
+        data: {
+          kind: "rows",
+          query_id: queryId,
+          app_key: parsedArgs.app_key,
+          normalized_query: built.normalizedQuery,
+          row_count: executed.payload.data.rows.length,
+          rows: executed.payload.data.rows,
+          cursor: executed.completeness.next_page_token,
+          snapshot_resource: buildResourceReference({
+            uri: snapshotUri,
+            name: "Qingflow Query Snapshot",
+            description: "Read this resource to inspect the canonical row result snapshot."
+          }),
+          translation_warnings: built.translationWarnings,
+          completeness: executed.completeness,
+          evidence: executed.evidence
+        },
+        ...(executed.payload.meta ? { meta: executed.payload.meta } : {})
+      }
+
+      return okResultWithLinks(payload, executed.message, [
+        {
+          uri: snapshotUri,
+          name: "Qingflow Query Snapshot",
+          description: "Canonical row result snapshot"
+        },
+        {
+          uri: normalizedUri,
+          name: "Qingflow Normalized Query",
+          description: "Canonical normalized query artifact"
+        }
+      ])
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf.query.record",
+  {
+    title: "Qingflow Canonical Query Record",
+    description: "Fetch one record through the canonical DSL and return a query handle.",
+    inputSchema: canonicalRecordInputSchema,
+    outputSchema: canonicalRecordOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = canonicalRecordInputSchema.parse(args)
+      const built = await buildCanonicalRecordExecution(parsedArgs)
+      const executed = await executeRecordGet(built.internalArguments)
+      const queryId = executed.evidence?.query_id ?? randomUUID()
+      const snapshotUri = buildQuerySnapshotResourceUri(queryId)
+      const normalizedUri = buildQueryNormalizedResourceUri(queryId)
+      const snapshot = {
+        kind: "record",
+        query_id: queryId,
+        normalized_query: built.normalizedQuery,
+        row: executed.payload.data.row,
+        completeness: executed.completeness,
+        evidence: executed.evidence
+      }
+
+      storeQueryArtifact({
+        queryId,
+        kind: "record",
+        appKey: null,
+        normalizedQuery: built.normalizedQuery,
+        internalTool: built.internalTool,
+        internalArguments: built.internalArguments,
+        snapshot
+      })
+
+      const payload: z.infer<typeof canonicalRecordOutputSchema> = {
+        ok: true,
+        data: {
+          kind: "record",
+          query_id: queryId,
+          apply_id: executed.payload.data.apply_id,
+          normalized_query: built.normalizedQuery,
+          row: executed.payload.data.row,
+          snapshot_resource: buildResourceReference({
+            uri: snapshotUri,
+            name: "Qingflow Record Snapshot",
+            description: "Read this resource to inspect the canonical record snapshot."
+          }),
+          completeness: executed.completeness,
+          evidence: executed.evidence
+        },
+        ...(executed.payload.meta ? { meta: executed.payload.meta } : {})
+      }
+
+      return okResultWithLinks(payload, executed.message, [
+        {
+          uri: snapshotUri,
+          name: "Qingflow Record Snapshot",
+          description: "Canonical record snapshot"
+        },
+        {
+          uri: normalizedUri,
+          name: "Qingflow Normalized Query",
+          description: "Canonical normalized query artifact"
+        }
+      ])
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf.query.aggregate",
+  {
+    title: "Qingflow Canonical Query Aggregate",
+    description:
+      "Aggregate records through the canonical DSL and return metrics_by_column plus query handle resources.",
+    inputSchema: canonicalAggregateInputSchema,
+    outputSchema: canonicalAggregateOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = canonicalAggregateInputSchema.parse(args)
+      const built = await buildCanonicalAggregateExecution(parsedArgs)
+      const executed = await executeRecordsAggregate(built.internalArguments)
+      const data = executed.payload.data
+      const completeness = data.completeness ?? executed.payload.completeness
+      if (!completeness) {
+        throw new Error("Aggregate completeness is missing")
+      }
+      const evidence = isVerboseProfile(executed.payload.output_profile ?? "verbose")
+        ? (data.evidence as z.infer<typeof evidenceSchema>)
+        : null
+      const queryId = evidence?.query_id ?? randomUUID()
+      const summaryMetrics =
+        (asObject(asObject(data.summary)?.metrics) as Record<string, Record<string, number | null>>) ?? {}
+      const groups = asArray(data.groups).map((groupRaw) => {
+        const group = asObject(groupRaw) ?? {}
+        return {
+          group_key: asObject(group.group) ?? {},
+          record_count: toNonNegativeInt(group.count) ?? 0,
+          record_ratio: typeof group.count_ratio === "number" ? group.count_ratio : null,
+          primary_metric_total:
+            typeof group.amount_total === "number" ? group.amount_total : group.amount_total ?? null,
+          primary_metric_ratio:
+            typeof group.amount_ratio === "number" ? group.amount_ratio : group.amount_ratio ?? null,
+          metrics_by_column:
+            (asObject(group.metrics) as Record<string, Record<string, number | null>>) ?? {}
+        }
+      })
+      const snapshotUri = buildQuerySnapshotResourceUri(queryId)
+      const normalizedUri = buildQueryNormalizedResourceUri(queryId)
+      const snapshot = {
+        kind: "aggregate",
+        query_id: queryId,
+        normalized_query: built.normalizedQuery,
+        primary_metric_column: built.primaryMetricColumn,
+        summary: {
+          record_count: toNonNegativeInt(data.summary.total_count) ?? 0,
+          metrics_by_column: summaryMetrics
+        },
+        groups,
+        cursor: completeness.next_page_token,
+        completeness,
+        evidence,
+        translation_warnings: built.translationWarnings
+      }
+
+      storeQueryArtifact({
+        queryId,
+        kind: "aggregate",
+        appKey: parsedArgs.app_key,
+        normalizedQuery: built.normalizedQuery,
+        internalTool: built.internalTool,
+        internalArguments: built.internalArguments,
+        snapshot
+      })
+
+      const payload: z.infer<typeof canonicalAggregateOutputSchema> = {
+        ok: true,
+        data: {
+          kind: "aggregate",
+          query_id: queryId,
+          app_key: parsedArgs.app_key,
+          normalized_query: built.normalizedQuery,
+          primary_metric_column: built.primaryMetricColumn,
+          summary: {
+            record_count: toNonNegativeInt(data.summary.total_count) ?? 0,
+            metrics_by_column: summaryMetrics
+          },
+          groups,
+          cursor: completeness.next_page_token,
+          snapshot_resource: buildResourceReference({
+            uri: snapshotUri,
+            name: "Qingflow Aggregate Snapshot",
+            description: "Read this resource to inspect the canonical aggregate snapshot."
+          }),
+          translation_warnings: built.translationWarnings,
+          completeness,
+          ...(evidence ? { evidence } : {})
+        },
+        ...(executed.payload.meta ? { meta: executed.payload.meta } : {})
+      }
+
+      return okResultWithLinks(payload, executed.message, [
+        {
+          uri: snapshotUri,
+          name: "Qingflow Aggregate Snapshot",
+          description: "Canonical aggregate snapshot"
+        },
+        {
+          uri: normalizedUri,
+          name: "Qingflow Normalized Query",
+          description: "Canonical normalized query artifact"
+        }
+      ])
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf.records.mutate",
+  {
+    title: "Qingflow Canonical Records Mutate",
+    description: "Canonical write entry for create/update operations.",
+    inputSchema: canonicalMutateInputSchema,
+    outputSchema: canonicalMutateOutputSchema,
+    annotations: {
+      readOnlyHint: false,
+      idempotentHint: false
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = canonicalMutateInputSchema.parse(args)
+      const built = await buildCanonicalMutateExecution(parsedArgs)
+      let payload: z.infer<typeof createOutputSchema> | z.infer<typeof updateOutputSchema>
+      let meta: z.infer<typeof apiMetaSchema> | undefined
+
+      if (built.internalTool === "qf_record_create") {
+        const createArgs = built.internalArguments as z.infer<typeof createInputSchema>
+        const form =
+          needsFormResolution(createArgs.fields) || Boolean(createArgs.force_refresh_form)
+            ? await getFormCached(
+                createArgs.app_key,
+                createArgs.user_id,
+                Boolean(createArgs.force_refresh_form)
+              )
+            : null
+        const normalizedAnswers = resolveAnswers({
+          explicitAnswers: createArgs.answers,
+          fields: createArgs.fields,
+          form: form?.result
+        })
+        const requestPayload: Record<string, unknown> = {
+          answers: normalizedAnswers
+        }
+        if (createArgs.apply_user) {
+          requestPayload.applyUser = createArgs.apply_user
+        }
+        const response = await client.createRecord(createArgs.app_key, requestPayload, {
+          userId: createArgs.user_id
+        })
+        const result = asObject(response.result)
+        meta = buildMeta(response)
+        payload = {
+          ok: true,
+          data: {
+            request_id: asNullableString(result?.requestId),
+            apply_id: (result?.applyId as string | number | null | undefined) ?? null,
+            async_hint: "Use qf_operation_get with request_id when apply_id is null."
+          },
+          meta
+        }
+      } else {
+        const updateArgs = built.internalArguments as z.infer<typeof updateInputSchema>
+        const requiresForm = needsFormResolution(updateArgs.fields)
+        if (requiresForm && !updateArgs.app_key) {
+          throw new Error("app_key is required when fields uses title-based keys")
+        }
+        const form =
+          requiresForm && updateArgs.app_key
+            ? await getFormCached(
+                updateArgs.app_key,
+                updateArgs.user_id,
+                Boolean(updateArgs.force_refresh_form)
+              )
+            : null
+        const normalizedAnswers = resolveAnswers({
+          explicitAnswers: updateArgs.answers,
+          fields: updateArgs.fields,
+          form: form?.result
+        })
+        const response = await client.updateRecord(
+          String(updateArgs.apply_id),
+          { answers: normalizedAnswers },
+          { userId: updateArgs.user_id }
+        )
+        const result = asObject(response.result)
+        meta = buildMeta(response)
+        payload = {
+          ok: true,
+          data: {
+            request_id: asNullableString(result?.requestId),
+            async_hint: "Use qf_operation_get with request_id to fetch update result when needed."
+          },
+          meta
+        }
+      }
+
+      const queryId = randomUUID()
+      const snapshotUri = buildQuerySnapshotResourceUri(queryId)
+      const normalizedUri = buildQueryNormalizedResourceUri(queryId)
+      const snapshot = {
+        kind: "mutate",
+        query_id: queryId,
+        action: parsedArgs.action,
+        normalized_query: built.normalizedQuery,
+        result: payload.data
+      }
+      storeQueryArtifact({
+        queryId,
+        kind: "mutate",
+        appKey: asNullableString(parsedArgs.app_key),
+        normalizedQuery: built.normalizedQuery,
+        internalTool: built.internalTool,
+        internalArguments: built.internalArguments as Record<string, unknown>,
+        snapshot
+      })
+
+      const mutatePayload: z.infer<typeof canonicalMutateOutputSchema> = {
+        ok: true,
+        data: {
+          kind: "mutate",
+          action: parsedArgs.action,
+          query_id: queryId,
+          request_id: asNullableString(payload.data.request_id),
+          ...("apply_id" in payload.data && payload.data.apply_id !== undefined
+            ? { apply_id: payload.data.apply_id }
+            : {}),
+          snapshot_resource: buildResourceReference({
+            uri: snapshotUri,
+            name: "Qingflow Mutation Snapshot",
+            description: "Read this resource to inspect the canonical mutation result."
+          })
+        },
+        ...(meta ? { meta } : {})
+      }
+
+      return okResultWithLinks(mutatePayload, `${parsedArgs.action} request sent`, [
+        {
+          uri: snapshotUri,
+          name: "Qingflow Mutation Snapshot",
+          description: "Canonical mutation snapshot"
+        },
+        {
+          uri: normalizedUri,
+          name: "Qingflow Normalized Query",
+          description: "Canonical normalized mutation payload"
+        }
+      ])
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf.query.export",
+  {
+    title: "Qingflow Canonical Query Export",
+    description: "Export canonical row queries and return resource links instead of large inline payloads.",
+    inputSchema: canonicalExportInputSchema,
+    outputSchema: canonicalExportOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = canonicalExportInputSchema.parse(args)
+      const built = await buildCanonicalExportExecution(parsedArgs)
+      const format = built.internalTool === "qf_export_csv" ? "csv" : "json"
+      const executed = await executeRecordsExport(format, built.internalArguments)
+      const queryId = executed.payload.data.query_id
+      const exportId = executed.payload.data.export_id
+      const snapshotUri = buildQuerySnapshotResourceUri(queryId)
+      const normalizedUri = buildQueryNormalizedResourceUri(queryId)
+      const exportUri = buildExportResourceUri(exportId)
+      const snapshot = {
+        kind: "export",
+        query_id: queryId,
+        normalized_query: built.normalizedQuery,
+        export_id: exportId,
+        format,
+        file_path: executed.payload.data.file_path,
+        file_size_bytes: executed.payload.data.file_size_bytes,
+        row_count: executed.payload.data.row_count,
+        columns: executed.payload.data.columns,
+        preview: executed.payload.data.preview,
+        completeness: executed.payload.data.completeness ?? null,
+        translation_warnings: built.translationWarnings
+      }
+
+      storeQueryArtifact({
+        queryId,
+        kind: "export",
+        appKey: parsedArgs.app_key,
+        normalizedQuery: built.normalizedQuery,
+        internalTool: built.internalTool,
+        internalArguments: built.internalArguments,
+        snapshot
+      })
+      storeExportArtifact({
+        exportId,
+        queryId,
+        appKey: parsedArgs.app_key,
+        format,
+        filePath: executed.payload.data.file_path,
+        fileSizeBytes: executed.payload.data.file_size_bytes,
+        rowCount: executed.payload.data.row_count,
+        columns: executed.payload.data.columns,
+        preview: executed.payload.data.preview
+      })
+
+      const payload: z.infer<typeof canonicalExportOutputSchema> = {
+        ok: true,
+        data: {
+          kind: "export",
+          query_id: queryId,
+          export_id: exportId,
+          app_key: parsedArgs.app_key,
+          format,
+          file_path: executed.payload.data.file_path,
+          file_size_bytes: executed.payload.data.file_size_bytes,
+          row_count: executed.payload.data.row_count,
+          columns: executed.payload.data.columns,
+          preview: executed.payload.data.preview,
+          export_resource: buildResourceReference({
+            uri: exportUri,
+            name: "Qingflow Export Artifact",
+            description: "Read this resource to inspect export metadata and file location."
+          }),
+          snapshot_resource: buildResourceReference({
+            uri: snapshotUri,
+            name: "Qingflow Export Snapshot",
+            description: "Read this resource to inspect the canonical export snapshot."
+          }),
+          ...(executed.payload.data.completeness
+            ? {
+                completeness: executed.payload.data.completeness
+              }
+            : {})
+        },
+        ...(executed.payload.meta ? { meta: executed.payload.meta } : {})
+      }
+
+      return okResultWithLinks(payload, executed.message, [
+        {
+          uri: exportUri,
+          name: "Qingflow Export Artifact",
+          description: "Canonical export artifact"
+        },
+        {
+          uri: snapshotUri,
+          name: "Qingflow Export Snapshot",
+          description: "Canonical export snapshot"
+        },
+        {
+          uri: normalizedUri,
+          name: "Qingflow Normalized Query",
+          description: "Canonical normalized query artifact"
+        }
+      ])
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+const appSchemaResourceTemplate = new ResourceTemplate("qingflow://apps/{app_key}/schema", {
+  list: undefined,
+  complete: {
+    app_key: async (value) => completeAppKeyCandidates(value)
+  }
+})
+
+server.registerResource(
+  "qf-app-schema-resource",
+  appSchemaResourceTemplate,
+  {
+    title: "Qingflow App Schema",
+    description: "Canonical app schema snapshot for one Qingflow app.",
+    mimeType: "application/json"
+  },
+  async (uri, variables) => readAppSchemaResource(String(uri), variables)
+)
+
+const appFieldsResourceTemplate = new ResourceTemplate("qingflow://apps/{app_key}/fields", {
+  list: undefined,
+  complete: {
+    app_key: async (value) => completeAppKeyCandidates(value)
+  }
+})
+
+server.registerResource(
+  "qf-app-fields-resource",
+  appFieldsResourceTemplate,
+  {
+    title: "Qingflow App Fields",
+    description: "Canonical field dictionary for one Qingflow app.",
+    mimeType: "application/json"
+  },
+  async (uri, variables) => readAppFieldsResource(String(uri), variables)
+)
+
+const fieldValuesResourceTemplate = new ResourceTemplate(
+  "qingflow://apps/{app_key}/fields/{field}/values/{match}/{prefix}",
+  {
+    list: undefined,
+    complete: {
+      app_key: async (value) => completeAppKeyCandidates(value),
+      field: async (value, context) =>
+        completeFieldCandidates(context?.arguments?.app_key ?? "", value),
+      match: async (value) =>
+        ["exact", "normalized", "contains", "prefix", "fuzzy"].filter((item) =>
+          item.startsWith(value.trim().toLowerCase())
+        ),
+      prefix: async (value, context) =>
+        completeFieldValueCandidates(
+          context?.arguments?.app_key ?? "",
+          context?.arguments?.field ?? "",
+          value,
+          context?.arguments?.match ?? "contains"
+        )
+    }
+  }
+)
+
+server.registerResource(
+  "qf-field-values-resource",
+  fieldValuesResourceTemplate,
+  {
+    title: "Qingflow Field Values",
+    description: "Candidate field values and match previews for one app field.",
+    mimeType: "application/json"
+  },
+  async (uri, variables) => readFieldValuesResource(String(uri), variables)
+)
+
+const queryNormalizedResourceTemplate = new ResourceTemplate(
+  "qingflow://queries/{query_id}/normalized",
+  {
+    list: undefined,
+    complete: {
+      query_id: async (value) => completeQueryIdCandidates(value)
+    }
+  }
+)
+
+server.registerResource(
+  "qf-query-normalized-resource",
+  queryNormalizedResourceTemplate,
+  {
+    title: "Qingflow Normalized Query",
+    description: "Normalized canonical query artifact.",
+    mimeType: "application/json"
+  },
+  async (uri, variables) => readQueryNormalizedResource(String(uri), variables)
+)
+
+const querySnapshotResourceTemplate = new ResourceTemplate(
+  "qingflow://queries/{query_id}/snapshot",
+  {
+    list: undefined,
+    complete: {
+      query_id: async (value) => completeQueryIdCandidates(value)
+    }
+  }
+)
+
+server.registerResource(
+  "qf-query-snapshot-resource",
+  querySnapshotResourceTemplate,
+  {
+    title: "Qingflow Query Snapshot",
+    description: "Snapshot of a canonical query result.",
+    mimeType: "application/json"
+  },
+  async (uri, variables) => readQuerySnapshotResource(String(uri), variables)
+)
+
+const exportResourceTemplate = new ResourceTemplate("qingflow://exports/{export_id}", {
+  list: undefined,
+  complete: {
+    export_id: async (value) => completeExportIdCandidates(value)
+  }
+})
+
+server.registerResource(
+  "qf-export-resource",
+  exportResourceTemplate,
+  {
+    title: "Qingflow Export Artifact",
+    description: "Metadata for one canonical export artifact.",
+    mimeType: "application/json"
+  },
+  async (uri, variables) => readExportResource(String(uri), variables)
+)
+
+server.registerPrompt(
+  "analyze-period-comparison",
+  {
+    title: "Analyze Period Comparison",
+    description:
+      "Build a structured comparison workflow for two time ranges using qf.query.plan and qf.query.aggregate.",
+    argsSchema: {
+      app_key: z.string().min(1),
+      metric_field: z.string().min(1),
+      group_field: z.string().min(1),
+      start_a: z.string().min(1),
+      end_a: z.string().min(1),
+      start_b: z.string().min(1),
+      end_b: z.string().min(1)
+    }
+  },
+  async ({ app_key, metric_field, group_field, start_a, end_a, start_b, end_b }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text:
+            `Compare two Qingflow periods for app ${app_key}. ` +
+            `First call qf.query.plan, then use qf.query.aggregate with strict_full=true. ` +
+            `Use ${group_field} as group_by and ${metric_field} as the metric column. ` +
+            `Period A: ${start_a} to ${end_a}. Period B: ${start_b} to ${end_b}. ` +
+            `Do not conclude unless completeness.raw_scan_complete=true for both runs.`
+        }
+      }
+    ]
+  })
+)
+
+server.registerPrompt(
+  "build-query-from-question",
+  {
+    title: "Build Query From Question",
+    description:
+      "Turn a natural language request into canonical Qingflow query DSL, then verify it with qf.query.plan.",
+    argsSchema: {
+      question: z.string().min(1),
+      app_key: z.string().min(1).optional()
+    }
+  },
+  async ({ question, app_key }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text:
+            `Convert the following request into canonical Qingflow DSL and verify it with qf.query.plan before execution: ` +
+            `${question}${app_key ? ` (app_key=${app_key})` : ""}. ` +
+            `Prefer qf.query.rows for row retrieval and qf.query.aggregate for statistics.`
+        }
+      }
+    ]
+  })
+)
+
+server.registerPrompt(
+  "prepare-record-write",
+  {
+    title: "Prepare Record Write",
+    description:
+      "Prepare a canonical qf.records.mutate payload from human field descriptions, then write only after validation.",
+    argsSchema: {
+      app_key: z.string().min(1),
+      action: z.enum(["create", "update"]),
+      apply_id: z.string().optional(),
+      request: z.string().min(1)
+    }
+  },
+  async ({ app_key, action, apply_id, request }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text:
+            `Prepare a canonical qf.records.mutate payload for app ${app_key}. ` +
+            `Action=${action}${apply_id ? `, apply_id=${apply_id}` : ""}. ` +
+            `Resolve fields against qingflow://apps/${app_key}/fields first, then build fields/answers from this request: ${request}.`
+        }
+      }
+    ]
+  })
 )
 
 server.registerTool(
@@ -2507,6 +3737,108 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
           select_columns: [0, "客户名称"]
         },
         resolve_fields: true
+      }
+    },
+    {
+      tool: "qf.query.plan",
+      required: ["kind"],
+      limits: {
+        kind: "rows|record|aggregate|export|mutate",
+        input_contract: "plan accepts loose model-shaped query objects and normalizes them before execution"
+      },
+      aliases: {},
+      minimal_example: {
+        kind: "rows",
+        query: {
+          app_key: "21b3d559",
+          select: [0, "客户名称"],
+          where: [{ field: "下单日期", op: "between", from: "2026-01-01", to: "2026-01-31" }]
+        }
+      }
+    },
+    {
+      tool: "qf.query.rows",
+      required: ["app_key", "select"],
+      limits: {
+        limit_max: DEFAULT_ROW_LIMIT,
+        select_max: MAX_COLUMN_LIMIT,
+        page_size_max: 200,
+        requested_pages_max: 500,
+        scan_max_pages_max: 500,
+        input_contract: "strict JSON only; use select/where/sort/limit/cursor"
+      },
+      aliases: {},
+      minimal_example: {
+        app_key: "21b3d559",
+        select: [0, "客户名称"],
+        where: [{ field: "下单日期", op: "between", from: "2026-01-01", to: "2026-01-31" }],
+        limit: 20
+      }
+    },
+    {
+      tool: "qf.query.record",
+      required: ["apply_id", "select"],
+      limits: {
+        select_max: MAX_COLUMN_LIMIT,
+        input_contract: "strict JSON only; use apply_id + select"
+      },
+      aliases: {},
+      minimal_example: {
+        apply_id: "497600278750478338",
+        select: [0, "客户名称"]
+      }
+    },
+    {
+      tool: "qf.query.aggregate",
+      required: ["app_key", "group_by", "metrics"],
+      limits: {
+        group_by_max: 20,
+        top_n_max: 2000,
+        page_size_max: 200,
+        requested_pages_max: 500,
+        scan_max_pages_max: 500,
+        input_contract: "strict JSON only; use where/group_by/metrics/time_bucket"
+      },
+      aliases: {},
+      minimal_example: {
+        app_key: "21b3d559",
+        where: [{ field: "下单日期", op: "between", from: "2026-01-01", to: "2026-01-31" }],
+        group_by: ["报价类型"],
+        metrics: [{ op: "count" }, { column: "报价总金额", op: "sum" }],
+        strict_full: true
+      }
+    },
+    {
+      tool: "qf.records.mutate",
+      required: ["action", "create: app_key", "update: apply_id"],
+      limits: {
+        action: "create|update",
+        input_contract: "strict JSON only; use fields or answers"
+      },
+      aliases: {},
+      minimal_example: {
+        action: "create",
+        app_key: "21b3d559",
+        fields: {
+          客户名称: "测试客户"
+        }
+      }
+    },
+    {
+      tool: "qf.query.export",
+      required: ["app_key", "select"],
+      limits: {
+        format: "json|csv",
+        limit_max: EXPORT_MAX_ROWS,
+        select_max: MAX_COLUMN_LIMIT,
+        input_contract: "strict JSON only; use canonical rows query fields plus format/file_name/export_dir"
+      },
+      aliases: {},
+      minimal_example: {
+        app_key: "21b3d559",
+        select: [0, "客户名称"],
+        format: "json",
+        limit: 100
       }
     },
     {
@@ -4839,6 +6171,560 @@ function buildRecordGetArgsFromQuery(
   })
 }
 
+function normalizeCanonicalLooseInput(
+  kind: z.infer<typeof canonicalPlanInputSchema>["kind"],
+  raw: unknown
+): Record<string, unknown> {
+  const parsed = asObject(parseJsonLikeDeep(raw)) ?? {}
+  const out: Record<string, unknown> = { ...parsed }
+
+  const assignAlias = (target: string, aliases: string[]) => {
+    if (out[target] !== undefined) {
+      return
+    }
+    for (const alias of aliases) {
+      if (out[alias] !== undefined) {
+        out[target] = parseJsonLikeDeep(out[alias])
+        break
+      }
+    }
+  }
+
+  assignAlias("app_key", ["appKey"])
+  assignAlias("user_id", ["userId"])
+  assignAlias("select", ["select_columns", "selectColumns"])
+  assignAlias("sort", ["sorts"])
+  assignAlias("limit", ["max_rows", "max_items", "row_cap"])
+  assignAlias("cursor", ["page_token", "raw_next_page_token", "next_page_token"])
+  assignAlias("page_size", ["pageSize"])
+  assignAlias("requested_pages", ["requestedPages"])
+  assignAlias("scan_max_pages", ["scanMaxPages"])
+  assignAlias("strict_full", ["strictFull"])
+  assignAlias("output_profile", ["outputProfile"])
+  assignAlias("group_by", ["groupBy"])
+  assignAlias("time_bucket", ["timeBucket"])
+  assignAlias("top_n", ["topN"])
+  assignAlias("file_name", ["fileName"])
+  assignAlias("export_dir", ["exportDir"])
+  assignAlias("apply_id", ["applyId"])
+
+  if (!out.where && out.filters) {
+    out.where = legacyFiltersToCanonicalWhere(
+      asArray(parseJsonLikeDeep(out.filters)),
+      asObject(parseJsonLikeDeep(out.time_range))
+    )
+  }
+
+  if (!out.where) {
+    const timeRange = asObject(parseJsonLikeDeep(out.time_range))
+    if (timeRange?.column !== undefined) {
+      out.where = legacyFiltersToCanonicalWhere([], timeRange)
+    }
+  }
+
+  if (kind === "aggregate" && !out.metrics) {
+    const rawMetrics = asArray(parseJsonLikeDeep(out.metrics))
+    const rawAmountColumns = asArray(parseJsonLikeDeep(out.amount_columns ?? out.amountColumns))
+    const rawAmountColumn = out.amount_column ?? out.amountColumn
+    const metricNames =
+      rawMetrics.length > 0
+        ? rawMetrics.map((item) => String(item))
+        : rawAmountColumn !== undefined || rawAmountColumns.length > 0
+          ? ["count", "sum"]
+          : ["count"]
+    const amountColumns =
+      rawAmountColumns.length > 0
+        ? rawAmountColumns
+        : rawAmountColumn !== undefined
+          ? [rawAmountColumn]
+          : []
+    out.metrics = metricNames.map((metric) => {
+      if (metric === "count") {
+        return { op: "count" }
+      }
+      return {
+        op: metric,
+        column: amountColumns[0]
+      }
+    })
+  }
+
+  if (out.select !== undefined) {
+    out.select = normalizeSelectorListInput(out.select)
+  }
+  if (out.group_by !== undefined) {
+    out.group_by = normalizeSelectorListInput(out.group_by)
+  }
+  if (out.apply_id !== undefined) {
+    out.apply_id = coerceNumberLike(normalizeSelectorInputValue(out.apply_id))
+  }
+  if (out.limit !== undefined) {
+    out.limit = coerceNumberLike(out.limit)
+  }
+  if (out.page_size !== undefined) {
+    out.page_size = coerceNumberLike(out.page_size)
+  }
+  if (out.requested_pages !== undefined) {
+    out.requested_pages = coerceNumberLike(out.requested_pages)
+  }
+  if (out.scan_max_pages !== undefined) {
+    out.scan_max_pages = coerceNumberLike(out.scan_max_pages)
+  }
+  if (out.top_n !== undefined) {
+    out.top_n = coerceNumberLike(out.top_n)
+  }
+  if (out.strict_full !== undefined) {
+    out.strict_full = coerceBooleanLike(out.strict_full)
+  }
+  if (out.output_profile !== undefined) {
+    out.output_profile = normalizeOutputProfileInput(out.output_profile)
+  }
+
+  if (Array.isArray(out.sort)) {
+    out.sort = out.sort.map((item) => {
+      const obj = asObject(item)
+      if (!obj) {
+        return item
+      }
+      return {
+        field: normalizeSelectorInputValue(obj.field),
+        direction:
+          typeof obj.direction === "string" && obj.direction.trim()
+            ? obj.direction.trim().toLowerCase()
+            : undefined
+      }
+    })
+  }
+
+  if (Array.isArray(out.where)) {
+    out.where = out.where.map((item) => {
+      const obj = asObject(item)
+      if (!obj) {
+        return item
+      }
+      return {
+        ...obj,
+        field: normalizeSelectorInputValue(obj.field),
+        value: parseJsonLikeDeep(obj.value),
+        values: Array.isArray(parseJsonLikeDeep(obj.values))
+          ? parseJsonLikeDeep(obj.values)
+          : obj.values,
+        from:
+          obj.from !== undefined
+            ? typeof obj.from === "number"
+              ? obj.from
+              : coerceStringLike(obj.from)
+            : undefined,
+        to:
+          obj.to !== undefined
+            ? typeof obj.to === "number"
+              ? obj.to
+              : coerceStringLike(obj.to)
+            : undefined,
+        match:
+          typeof obj.match === "string" && obj.match.trim()
+            ? obj.match.trim().toLowerCase()
+            : undefined,
+        op:
+          typeof obj.op === "string" && obj.op.trim()
+            ? obj.op.trim().toLowerCase()
+            : undefined
+      }
+    })
+  }
+
+  return out
+}
+
+function legacyFiltersToCanonicalWhere(
+  filters: unknown[],
+  timeRange: Record<string, unknown> | null
+): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = []
+
+  for (const itemRaw of filters) {
+    const item = asObject(itemRaw)
+    if (!item || item.que_id === undefined) {
+      continue
+    }
+    if (item.scope === 2) {
+      out.push({ field: item.que_id, op: "exists" })
+      continue
+    }
+    if (item.scope === 3) {
+      out.push({ field: item.que_id, op: "not_exists" })
+      continue
+    }
+    if (item.search_keys !== undefined) {
+      out.push({
+        field: item.que_id,
+        op: "in",
+        values: asArray(item.search_keys)
+      })
+      continue
+    }
+    if (item.search_key !== undefined) {
+      out.push({
+        field: item.que_id,
+        op: "contains",
+        value: item.search_key
+      })
+      continue
+    }
+    if (item.min_value !== undefined || item.max_value !== undefined) {
+      out.push({
+        field: item.que_id,
+        op: "between",
+        ...(item.min_value !== undefined ? { from: item.min_value } : {}),
+        ...(item.max_value !== undefined ? { to: item.max_value } : {})
+      })
+    }
+  }
+
+  if (timeRange?.column !== undefined && (timeRange.from !== undefined || timeRange.to !== undefined)) {
+    out.push({
+      field: timeRange.column,
+      op: "between",
+      ...(timeRange.from !== undefined ? { from: timeRange.from } : {}),
+      ...(timeRange.to !== undefined ? { to: timeRange.to } : {})
+    })
+  }
+
+  return out
+}
+
+function translateCanonicalWhereToLegacy(
+  where: Array<z.infer<typeof canonicalWhereItemSchema>> | undefined,
+  tool: string
+): {
+  filters: z.infer<typeof listInputSchema>["filters"]
+  warnings: string[]
+} {
+  if (!where || where.length === 0) {
+    return { filters: undefined, warnings: [] }
+  }
+
+  const filters: NonNullable<z.infer<typeof listInputSchema>["filters"]> = []
+  const warnings: string[] = []
+
+  for (const clause of where) {
+    const match = clause.match ?? "exact"
+    const field = clause.field
+
+    if (clause.op === "neq" || clause.op === "not_in") {
+      throw new InputValidationError({
+        message: `${tool} does not yet support ${clause.op} in canonical DSL`,
+        errorCode: "UNSUPPORTED_CANONICAL_OPERATOR",
+        fixHint: `Use eq/in/between/gte/lte/exists/not_exists, or pre-resolve candidates with the values resource first.`,
+        details: {
+          field,
+          op: clause.op
+        }
+      })
+    }
+
+    if (clause.op === "exists") {
+      filters.push({
+        que_id: field,
+        scope: 2
+      })
+      continue
+    }
+
+    if (clause.op === "not_exists") {
+      filters.push({
+        que_id: field,
+        scope: 3
+      })
+      continue
+    }
+
+    if (clause.op === "between") {
+      filters.push({
+        que_id: field,
+        ...(clause.from !== undefined ? { min_value: String(clause.from) } : {}),
+        ...(clause.to !== undefined ? { max_value: String(clause.to) } : {})
+      })
+      continue
+    }
+
+    if (clause.op === "gte") {
+      filters.push({
+        que_id: field,
+        min_value: String(clause.value ?? clause.from ?? "")
+      })
+      continue
+    }
+
+    if (clause.op === "lte") {
+      filters.push({
+        que_id: field,
+        max_value: String(clause.value ?? clause.to ?? "")
+      })
+      continue
+    }
+
+    if (clause.op === "in") {
+      filters.push({
+        que_id: field,
+        search_keys: (clause.values ?? []).map((item) => String(item))
+      })
+      if (match !== "exact") {
+        warnings.push(
+          `${tool}: in uses provider search_keys; requested match=${match} may not be exact in Qingflow.`
+        )
+      }
+      continue
+    }
+
+    filters.push({
+      que_id: field,
+      search_key: String(clause.value ?? "")
+    })
+    if (match !== "contains") {
+      warnings.push(
+        `${tool}: ${clause.op} with match=${match} is translated to provider search_key and may behave like contains matching.`
+      )
+    }
+  }
+
+  return { filters, warnings: uniqueStringList(warnings) }
+}
+
+function translateCanonicalSortToLegacy(
+  sort: Array<z.infer<typeof canonicalSortItemSchema>> | undefined
+): z.infer<typeof listInputSchema>["sort"] {
+  if (!sort || sort.length === 0) {
+    return undefined
+  }
+  return sort.map((item) => ({
+    que_id: item.field,
+    ascend: item.direction !== "desc"
+  }))
+}
+
+async function buildCanonicalRowsExecution(
+  input: z.infer<typeof canonicalRowsInputSchema>
+): Promise<{
+  normalizedQuery: Record<string, unknown>
+  internalTool: string
+  internalArguments: z.infer<typeof listInputSchema>
+  translationWarnings: string[]
+}> {
+  const translation = translateCanonicalWhereToLegacy(input.where, "qf.query.rows")
+  const internalArguments = listInputSchema.parse({
+    app_key: input.app_key,
+    user_id: input.user_id,
+    page_token: input.cursor,
+    page_size: input.page_size,
+    requested_pages: input.requested_pages,
+    scan_max_pages: input.scan_max_pages,
+    mode: input.mode,
+    filters: translation.filters,
+    sort: translateCanonicalSortToLegacy(input.sort),
+    max_rows: input.limit,
+    select_columns: input.select,
+    strict_full: input.strict_full,
+    output_profile: "verbose"
+  })
+
+  return {
+    normalizedQuery: {
+      app_key: input.app_key,
+      select: input.select,
+      where: input.where ?? [],
+      sort: input.sort ?? [],
+      limit: input.limit ?? DEFAULT_ROW_LIMIT,
+      cursor: input.cursor ?? null,
+      page_size: input.page_size ?? DEFAULT_PAGE_SIZE,
+      requested_pages: input.requested_pages ?? 1,
+      scan_max_pages: input.scan_max_pages ?? (input.requested_pages ?? 1),
+      strict_full: input.strict_full ?? false,
+      mode: input.mode ?? "all"
+    },
+    internalTool: "qf_records_list",
+    internalArguments,
+    translationWarnings: translation.warnings
+  }
+}
+
+async function buildCanonicalRecordExecution(
+  input: z.infer<typeof canonicalRecordInputSchema>
+): Promise<{
+  normalizedQuery: Record<string, unknown>
+  internalTool: string
+  internalArguments: z.infer<typeof recordGetInputSchema>
+}> {
+  const internalArguments = recordGetInputSchema.parse({
+    apply_id: input.apply_id,
+    select_columns: input.select,
+    output_profile: "verbose"
+  })
+
+  return {
+    normalizedQuery: {
+      apply_id: input.apply_id,
+      select: input.select
+    },
+    internalTool: "qf_record_get",
+    internalArguments
+  }
+}
+
+async function buildCanonicalAggregateExecution(
+  input: z.infer<typeof canonicalAggregateInputSchema>
+): Promise<{
+  normalizedQuery: Record<string, unknown>
+  internalTool: string
+  internalArguments: z.infer<typeof aggregateInputSchema>
+  translationWarnings: string[]
+  primaryMetricColumn: string | null
+}> {
+  const translation = translateCanonicalWhereToLegacy(input.where, "qf.query.aggregate")
+  const amountColumns = uniqueStringList(
+    input.metrics
+      .map((item) => (item.column !== undefined ? String(item.column) : null))
+      .filter((item): item is string => Boolean(item))
+  )
+  const metricNames = uniqueStringList(input.metrics.map((item) => item.op)) as AggregateMetricName[]
+  const primaryMetricColumn = amountColumns[0] ?? null
+
+  const internalArguments = aggregateInputSchema.parse({
+    app_key: input.app_key,
+    user_id: input.user_id,
+    page_token: input.cursor,
+    page_size: input.page_size,
+    requested_pages: input.requested_pages,
+    scan_max_pages: input.scan_max_pages,
+    mode: input.mode,
+    filters: translation.filters,
+    sort: translateCanonicalSortToLegacy(input.sort),
+    group_by: input.group_by,
+    amount_columns: amountColumns,
+    metrics: metricNames,
+    time_bucket: input.time_bucket,
+    max_groups: input.top_n,
+    strict_full: input.strict_full ?? true,
+    output_profile: "verbose"
+  })
+
+  return {
+    normalizedQuery: {
+      app_key: input.app_key,
+      where: input.where ?? [],
+      group_by: input.group_by,
+      metrics: input.metrics,
+      time_bucket: input.time_bucket ?? null,
+      top_n: input.top_n ?? 2000,
+      cursor: input.cursor ?? null,
+      page_size: input.page_size ?? DEFAULT_PAGE_SIZE,
+      requested_pages: input.requested_pages ?? DEFAULT_SCAN_MAX_PAGES,
+      scan_max_pages: input.scan_max_pages ?? (input.requested_pages ?? DEFAULT_SCAN_MAX_PAGES),
+      strict_full: input.strict_full ?? true,
+      mode: input.mode ?? "all"
+    },
+    internalTool: "qf_records_aggregate",
+    internalArguments,
+    translationWarnings: translation.warnings,
+    primaryMetricColumn
+  }
+}
+
+async function buildCanonicalExportExecution(
+  input: z.infer<typeof canonicalExportInputSchema>
+): Promise<{
+  normalizedQuery: Record<string, unknown>
+  internalTool: "qf_export_csv" | "qf_export_json"
+  internalArguments: z.infer<typeof exportInputSchema>
+  translationWarnings: string[]
+}> {
+  const translation = translateCanonicalWhereToLegacy(input.where, "qf.query.export")
+  const format = input.format ?? "json"
+  const internalArguments = exportInputSchema.parse({
+    app_key: input.app_key,
+    user_id: input.user_id,
+    page_token: input.cursor,
+    page_size: input.page_size,
+    requested_pages: input.requested_pages,
+    scan_max_pages: input.scan_max_pages,
+    mode: input.mode,
+    filters: translation.filters,
+    sort: translateCanonicalSortToLegacy(input.sort),
+    max_rows: input.limit,
+    select_columns: input.select,
+    strict_full: input.strict_full,
+    output_profile: "verbose",
+    file_name: input.file_name,
+    export_dir: input.export_dir
+  })
+
+  return {
+    normalizedQuery: {
+      app_key: input.app_key,
+      select: input.select,
+      where: input.where ?? [],
+      sort: input.sort ?? [],
+      limit: input.limit ?? EXPORT_MAX_ROWS,
+      cursor: input.cursor ?? null,
+      page_size: input.page_size ?? DEFAULT_PAGE_SIZE,
+      requested_pages: input.requested_pages ?? EXPORT_DEFAULT_PAGES,
+      scan_max_pages: input.scan_max_pages ?? (input.requested_pages ?? EXPORT_DEFAULT_PAGES),
+      strict_full: input.strict_full ?? false,
+      mode: input.mode ?? "all",
+      format
+    },
+    internalTool: format === "csv" ? "qf_export_csv" : "qf_export_json",
+    internalArguments,
+    translationWarnings: translation.warnings
+  }
+}
+
+async function buildCanonicalMutateExecution(
+  input: z.infer<typeof canonicalMutateInputSchema>
+): Promise<{
+  normalizedQuery: Record<string, unknown>
+  internalTool: "qf_record_create" | "qf_record_update"
+  internalArguments: z.infer<typeof createInputSchema> | z.infer<typeof updateInputSchema>
+}> {
+  if (input.action === "create") {
+    const internalArguments = createInputSchema.parse({
+      app_key: input.app_key,
+      user_id: input.user_id,
+      fields: input.fields,
+      answers: input.answers,
+      force_refresh_form: input.force_refresh_form
+    })
+    return {
+      normalizedQuery: {
+        action: input.action,
+        app_key: input.app_key ?? null,
+        fields: input.fields ?? null
+      },
+      internalTool: "qf_record_create",
+      internalArguments
+    }
+  }
+
+  const internalArguments = updateInputSchema.parse({
+    apply_id: input.apply_id,
+    app_key: input.app_key,
+    user_id: input.user_id,
+    fields: input.fields,
+    answers: input.answers,
+    force_refresh_form: input.force_refresh_form
+  })
+  return {
+    normalizedQuery: {
+      action: input.action,
+      app_key: input.app_key ?? null,
+      apply_id: input.apply_id ?? null,
+      fields: input.fields ?? null
+    },
+    internalTool: "qf_record_update",
+    internalArguments
+  }
+}
+
 async function executeFieldResolve(
   args: z.infer<typeof fieldResolveInputSchema>
 ): Promise<z.infer<typeof fieldResolveOutputSchema>> {
@@ -5280,6 +7166,7 @@ async function executeRecordsExport(
   const payload: z.infer<typeof exportOutputSchema> = {
     ok: true,
     data: {
+      query_id: queryId,
       export_id: exportId,
       format,
       app_key: args.app_key,
@@ -7254,6 +9141,264 @@ function extractFieldSummaries(form: Record<string, unknown> | null) {
   })
 }
 
+function jsonResourceResponse(uri: string, payload: Record<string, unknown>) {
+  return {
+    contents: [
+      {
+        uri,
+        mimeType: "application/json",
+        text: JSON.stringify(payload, null, 2)
+      }
+    ]
+  }
+}
+
+async function completeAppKeyCandidates(prefix: string): Promise<string[]> {
+  const response = await client.listApps({})
+  const apps = asArray(asObject(response.result)?.appList)
+    .map((item) => asObject(item))
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+    .map((item) => String(item.appKey ?? "").trim())
+    .filter((item) => item.length > 0)
+  const normalizedPrefix = prefix.trim().toLowerCase()
+  return apps
+    .filter((item) => item.toLowerCase().startsWith(normalizedPrefix))
+    .slice(0, 20)
+}
+
+async function completeFieldCandidates(appKey: string, prefix: string): Promise<string[]> {
+  if (!appKey.trim()) {
+    return []
+  }
+  const response = await getFormCached(appKey.trim(), undefined, false)
+  const fields = extractFieldSummaries(asObject(response.result))
+  const normalizedPrefix = prefix.trim().toLowerCase()
+  return fields
+    .map((item) => item.que_title ?? String(item.que_id ?? ""))
+    .filter((item): item is string => Boolean(item))
+    .filter((item) => item.toLowerCase().includes(normalizedPrefix))
+    .slice(0, 20)
+}
+
+async function collectFieldValueCandidates(params: {
+  appKey: string
+  field: string
+  prefix?: string
+  match?: string
+  limit?: number
+}): Promise<Array<{ value: string; count: number; match_strength: number }>> {
+  const appKey = params.appKey.trim()
+  const fieldSelector = params.field.trim()
+  if (!appKey || !fieldSelector) {
+    return []
+  }
+
+  const form = await getFormCached(appKey, undefined, false)
+  const index = buildFieldIndex(form.result)
+  const column = resolveSummaryColumn(fieldSelector, index, "field")
+  const counts = new Map<string, number>()
+  let currentPage = 1
+
+  for (let fetched = 0; fetched < 5; fetched += 1) {
+    const payload = buildListPayload({
+      pageNum: currentPage,
+      pageSize: 50,
+      mode: "all"
+    })
+    const response = await client.listRecords(appKey, payload, {})
+    const result = asObject(response.result)
+    const rawItems = asArray(result?.result)
+    for (const rawItem of rawItems) {
+      const record = asObject(rawItem) ?? {}
+      const value = extractSummaryColumnValue(asArray(record.answers), column)
+      const candidates = Array.isArray(value) ? value : [value]
+      for (const candidate of candidates) {
+        if (candidate === null || candidate === undefined) {
+          continue
+        }
+        const normalized = String(candidate).trim()
+        if (!normalized) {
+          continue
+        }
+        counts.set(normalized, (counts.get(normalized) ?? 0) + 1)
+      }
+    }
+    const pageAmount = toPositiveInt(result?.pageAmount)
+    if (!pageAmount || currentPage >= pageAmount) {
+      break
+    }
+    currentPage += 1
+  }
+
+  const normalizedPrefix = (params.prefix ?? "").trim().toLowerCase()
+  const match = (params.match ?? "contains").trim().toLowerCase()
+  const limit = params.limit ?? 20
+
+  return Array.from(counts.entries())
+    .map(([value, count]) => ({
+      value,
+      count,
+      match_strength:
+        normalizedPrefix.length === 0
+          ? 1
+          : scoreTextMatch(value, normalizedPrefix, match)
+    }))
+    .filter((item) => item.match_strength > 0)
+    .sort((a, b) => b.match_strength - a.match_strength || b.count - a.count)
+    .slice(0, limit)
+}
+
+function scoreTextMatch(candidate: string, prefix: string, match: string): number {
+  const normalizedCandidate = candidate.trim().toLowerCase()
+  if (!prefix) {
+    return 1
+  }
+  if (match === "exact") {
+    return normalizedCandidate === prefix ? 1 : 0
+  }
+  if (match === "normalized") {
+    return normalizedCandidate.replace(/\s+/g, "") === prefix.replace(/\s+/g, "") ? 1 : 0
+  }
+  if (match === "prefix") {
+    return normalizedCandidate.startsWith(prefix) ? 0.95 : 0
+  }
+  if (match === "fuzzy") {
+    return normalizedTextSimilarity(prefix, normalizedCandidate)
+  }
+  return normalizedCandidate.includes(prefix) ? 0.9 : 0
+}
+
+async function completeFieldValueCandidates(
+  appKey: string,
+  field: string,
+  prefix: string,
+  match: string
+): Promise<string[]> {
+  const candidates = await collectFieldValueCandidates({
+    appKey,
+    field,
+    prefix,
+    match,
+    limit: 10
+  })
+  return candidates.map((item) => item.value)
+}
+
+function completeQueryIdCandidates(prefix: string): string[] {
+  cleanupArtifactCaches()
+  const normalizedPrefix = prefix.trim().toLowerCase()
+  return Array.from(queryArtifactCache.keys())
+    .filter((item) => item.toLowerCase().startsWith(normalizedPrefix))
+    .slice(0, 20)
+}
+
+function completeExportIdCandidates(prefix: string): string[] {
+  cleanupArtifactCaches()
+  const normalizedPrefix = prefix.trim().toLowerCase()
+  return Array.from(exportArtifactCache.keys())
+    .filter((item) => item.toLowerCase().startsWith(normalizedPrefix))
+    .slice(0, 20)
+}
+
+async function readAppSchemaResource(uri: string, variables: Variables) {
+  const appKey = String(variables.app_key ?? "").trim()
+  if (!appKey) {
+    throw new Error("app_key is required")
+  }
+  const response = await getFormCached(appKey, undefined, false)
+  return jsonResourceResponse(uri, {
+    app_key: appKey,
+    total_fields: extractFieldSummaries(asObject(response.result)).length,
+    form: asObject(response.result)
+  })
+}
+
+async function readAppFieldsResource(uri: string, variables: Variables) {
+  const appKey = String(variables.app_key ?? "").trim()
+  if (!appKey) {
+    throw new Error("app_key is required")
+  }
+  const response = await getFormCached(appKey, undefined, false)
+  return jsonResourceResponse(uri, {
+    app_key: appKey,
+    fields: extractFieldSummaries(asObject(response.result))
+  })
+}
+
+async function readFieldValuesResource(uri: string, variables: Variables) {
+  const appKey = String(variables.app_key ?? "").trim()
+  const field = String(variables.field ?? "").trim()
+  const match = String(variables.match ?? "contains").trim() || "contains"
+  const prefix = String(variables.prefix ?? "").trim()
+  if (!appKey || !field) {
+    throw new Error("app_key and field are required")
+  }
+  return jsonResourceResponse(uri, {
+    app_key: appKey,
+    field,
+    match,
+    prefix,
+    candidates: await collectFieldValueCandidates({
+      appKey,
+      field,
+      prefix,
+      match
+    })
+  })
+}
+
+async function readQueryNormalizedResource(uri: string, variables: Variables) {
+  const queryId = String(variables.query_id ?? "").trim()
+  const artifact = getQueryArtifact(queryId)
+  if (!artifact) {
+    throw new Error(`Unknown query_id: ${queryId}`)
+  }
+  return jsonResourceResponse(uri, {
+    query_id: artifact.query_id,
+    kind: artifact.kind,
+    app_key: artifact.app_key,
+    normalized_query: artifact.normalized_query,
+    internal_tool: artifact.internal_tool,
+    internal_arguments: artifact.internal_arguments,
+    created_at: artifact.created_at
+  })
+}
+
+async function readQuerySnapshotResource(uri: string, variables: Variables) {
+  const queryId = String(variables.query_id ?? "").trim()
+  const artifact = getQueryArtifact(queryId)
+  if (!artifact) {
+    throw new Error(`Unknown query_id: ${queryId}`)
+  }
+  return jsonResourceResponse(uri, {
+    query_id: artifact.query_id,
+    kind: artifact.kind,
+    app_key: artifact.app_key,
+    snapshot: artifact.snapshot,
+    created_at: artifact.created_at
+  })
+}
+
+async function readExportResource(uri: string, variables: Variables) {
+  const exportId = String(variables.export_id ?? "").trim()
+  const artifact = getExportArtifact(exportId)
+  if (!artifact) {
+    throw new Error(`Unknown export_id: ${exportId}`)
+  }
+  return jsonResourceResponse(uri, {
+    export_id: artifact.export_id,
+    query_id: artifact.query_id,
+    app_key: artifact.app_key,
+    format: artifact.format,
+    file_path: artifact.file_path,
+    file_size_bytes: artifact.file_size_bytes,
+    row_count: artifact.row_count,
+    columns: artifact.columns,
+    preview: artifact.preview,
+    created_at: artifact.created_at
+  })
+}
+
 function buildFieldIndex(form: unknown): FieldIndex {
   const byId = new Map<string, FormField>()
   const byTitle = new Map<string, FormField[]>()
@@ -7709,6 +9854,141 @@ function isNumericKey(value: string): boolean {
   return /^\d+$/.test(value.trim())
 }
 
+function cleanupArtifactCaches(): void {
+  const now = Date.now()
+  for (const [key, entry] of queryArtifactCache.entries()) {
+    if (entry.expiresAt <= now) {
+      queryArtifactCache.delete(key)
+    }
+  }
+  for (const [key, entry] of exportArtifactCache.entries()) {
+    if (entry.expiresAt <= now) {
+      exportArtifactCache.delete(key)
+    }
+  }
+}
+
+function buildQueryNormalizedResourceUri(queryId: string): string {
+  return `qingflow://queries/${queryId}/normalized`
+}
+
+function buildQuerySnapshotResourceUri(queryId: string): string {
+  return `qingflow://queries/${queryId}/snapshot`
+}
+
+function buildExportResourceUri(exportId: string): string {
+  return `qingflow://exports/${exportId}`
+}
+
+function buildResourceReference(params: {
+  uri: string
+  name: string
+  mimeType?: string
+  description?: string | null
+}): z.infer<typeof canonicalResourceRefSchema> {
+  return {
+    uri: params.uri,
+    name: params.name,
+    mime_type: params.mimeType ?? "application/json",
+    description: params.description ?? null
+  }
+}
+
+function buildResourceLinkContent(params: {
+  uri: string
+  name: string
+  mimeType?: string
+  description?: string | null
+}) {
+  return {
+    type: "resource_link" as const,
+    uri: params.uri,
+    name: params.name,
+    mimeType: params.mimeType ?? "application/json",
+    ...(params.description ? { description: params.description } : {})
+  }
+}
+
+function storeQueryArtifact(params: {
+  queryId: string
+  kind: QueryArtifactKind
+  appKey: string | null
+  normalizedQuery: Record<string, unknown>
+  internalTool?: string | null
+  internalArguments?: Record<string, unknown> | null
+  snapshot: Record<string, unknown>
+}): QueryArtifactEntry {
+  cleanupArtifactCaches()
+  const entry: QueryArtifactEntry = {
+    expiresAt: Date.now() + QUERY_ARTIFACT_TTL_MS,
+    query_id: params.queryId,
+    kind: params.kind,
+    app_key: params.appKey,
+    normalized_query: params.normalizedQuery,
+    internal_tool: params.internalTool ?? null,
+    internal_arguments: params.internalArguments ?? null,
+    snapshot: params.snapshot,
+    created_at: new Date().toISOString()
+  }
+  queryArtifactCache.set(params.queryId, entry)
+  return entry
+}
+
+function getQueryArtifact(queryId: string): QueryArtifactEntry | null {
+  cleanupArtifactCaches()
+  const hit = queryArtifactCache.get(queryId)
+  if (!hit) {
+    return null
+  }
+  if (hit.expiresAt <= Date.now()) {
+    queryArtifactCache.delete(queryId)
+    return null
+  }
+  return hit
+}
+
+function storeExportArtifact(params: {
+  exportId: string
+  queryId: string | null
+  appKey: string | null
+  format: "csv" | "json"
+  filePath: string
+  fileSizeBytes: number
+  rowCount: number
+  columns: string[]
+  preview: Array<Record<string, unknown>>
+}): ExportArtifactEntry {
+  cleanupArtifactCaches()
+  const entry: ExportArtifactEntry = {
+    expiresAt: Date.now() + QUERY_ARTIFACT_TTL_MS,
+    export_id: params.exportId,
+    query_id: params.queryId,
+    app_key: params.appKey,
+    format: params.format,
+    file_path: params.filePath,
+    file_size_bytes: params.fileSizeBytes,
+    row_count: params.rowCount,
+    columns: params.columns,
+    preview: params.preview,
+    created_at: new Date().toISOString()
+  }
+  exportArtifactCache.set(params.exportId, entry)
+  return entry
+}
+
+function getExportArtifact(exportId: string): ExportArtifactEntry | null {
+  cleanupArtifactCaches()
+  const hit = exportArtifactCache.get(exportId)
+  if (!hit) {
+    return null
+  }
+  if (hit.expiresAt <= Date.now()) {
+    exportArtifactCache.delete(exportId)
+    return null
+  }
+  return hit
+}
+
 function okResult<T extends Record<string, unknown>>(payload: T, message: string) {
   return {
     structuredContent: payload,
@@ -7717,6 +9997,28 @@ function okResult<T extends Record<string, unknown>>(payload: T, message: string
         type: "text" as const,
         text: message
       }
+    ]
+  }
+}
+
+function okResultWithLinks<T extends Record<string, unknown>>(
+  payload: T,
+  message: string,
+  links: Array<{
+    uri: string
+    name: string
+    mimeType?: string
+    description?: string | null
+  }>
+) {
+  return {
+    structuredContent: payload,
+    content: [
+      {
+        type: "text" as const,
+        text: message
+      },
+      ...links.map((item) => buildResourceLinkContent(item))
     ]
   }
 }

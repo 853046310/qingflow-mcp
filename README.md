@@ -108,7 +108,7 @@ npm i -g git+https://github.com/853046310/qingflow-mcp.git
 Install from npm (pinned version):
 
 ```bash
-npm i -g qingflow-mcp@0.3.14
+npm i -g qingflow-mcp@0.4.0
 ```
 
 Or one-click installer:
@@ -151,6 +151,7 @@ MCP client config example:
 Full calling contract (Chinese):
 
 - [MCP 调用规范](./docs/MCP_CALLING_SPEC.md)
+- [vNext Agent-Native 设计稿](./docs/VNEXT_AGENT_NATIVE_DESIGN.md)
 
 ## Unified Query (`qf_query`)
 
