@@ -86,6 +86,7 @@ interface AggregateContinuationState {
   query_fingerprint: string
   scanned_records: number
   total_amount: number
+  missing_count?: number
   source_pages: number[]
   scan_limit_total: number
   group_stats: Array<{
@@ -300,11 +301,15 @@ const completenessSchema = z.object({
   raw_next_page_token: z.string().nullable().optional(),
   output_next_page_token: z.string().nullable().optional(),
   stop_reason: z.string().nullable().optional(),
-  provider_result_amount: z.number().int().nonnegative().nullable().optional(),
-  source_record_count: z.number().int().nonnegative().optional(),
+  scanned_record_count: z.number().int().nonnegative().optional(),
   effective_record_count: z.number().int().nonnegative().optional(),
   returned_group_count: z.number().int().nonnegative().optional(),
   total_group_count: z.number().int().nonnegative().optional()
+})
+
+const summaryCountSchema = z.object({
+  effective_record_count: z.number().int().nonnegative(),
+  final_record_count: z.number().int().nonnegative().nullable()
 })
 
 const evidenceSchema = z.object({
@@ -892,7 +897,7 @@ const queryInputSchema = z
 
 const querySummaryOutputSchema = z.object({
   summary: z.object({
-    total_count: z.number().int().nonnegative(),
+    counts: summaryCountSchema,
     total_amount: z.number().nullable(),
     by_day: z.array(
       z.object({
@@ -946,7 +951,7 @@ const querySuccessOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
     mode: z.enum(["list", "record", "summary"]),
-    source_tool: z.enum(["qf_records_list", "qf_record_get", "qf_records_summary"]),
+    source_tool: z.enum(["qf_records_list", "qf_record_get", "qf_records_summary", "qf_records_aggregate"]),
     list: listSuccessOutputSchema.shape.data.optional(),
     record: recordGetSuccessOutputSchema.shape.data.optional(),
     summary: querySummaryOutputSchema.optional()
@@ -1091,8 +1096,9 @@ const aggregateOutputSchema = z.object({
   data: z.object({
     app_key: z.string(),
     summary: z.object({
-      total_count: z.number().int().nonnegative(),
+      counts: summaryCountSchema,
       total_amount: z.number().nullable(),
+      missing_count: z.number().int().nonnegative(),
       metrics: z.record(z.record(z.number().nullable())).optional()
     }),
     groups: z.array(
@@ -1740,8 +1746,8 @@ const canonicalAggregateOutputSchema = z.object({
     normalized_query: z.record(z.unknown()),
     primary_metric_column: z.string().nullable(),
     summary: z.object({
-      record_count: z.number().int().nonnegative(),
-      provider_result_amount: z.number().int().nonnegative().nullable(),
+      counts: summaryCountSchema,
+      missing_count: z.number().int().nonnegative(),
       returned_group_count: z.number().int().nonnegative(),
       total_group_count: z.number().int().nonnegative(),
       metrics_by_column: z.record(z.record(z.union([z.number(), z.null()])))
@@ -2399,11 +2405,16 @@ server.registerTool(
             (asObject(group.metrics) as Record<string, Record<string, number | null>>) ?? {}
         }
       })
-      const providerResultAmount = toNonNegativeInt(completeness.provider_result_amount ?? completeness.result_amount)
       const returnedGroupCount =
         toNonNegativeInt(completeness.returned_group_count) ?? groups.length
       const totalGroupCount =
         toNonNegativeInt(completeness.total_group_count) ?? groups.length
+      const summaryCounts = asObject(asObject(data.summary)?.counts)
+      const effectiveRecordCount =
+        toNonNegativeInt(summaryCounts?.effective_record_count) ??
+        toNonNegativeInt(completeness.effective_record_count) ??
+        0
+      const rawScanComplete = completeness.raw_scan_complete === true
       const snapshotUri = buildQuerySnapshotResourceUri(queryId)
       const normalizedUri = buildQueryNormalizedResourceUri(queryId)
       const snapshot = {
@@ -2412,8 +2423,11 @@ server.registerTool(
         normalized_query: built.normalizedQuery,
         primary_metric_column: built.primaryMetricColumn,
         summary: {
-          record_count: toNonNegativeInt(data.summary.total_count) ?? 0,
-          provider_result_amount: providerResultAmount,
+          counts: buildSummaryCounts({
+            effectiveRecordCount,
+            rawScanComplete
+          }),
+          missing_count: toNonNegativeInt(asObject(data.summary)?.missing_count) ?? 0,
           returned_group_count: returnedGroupCount,
           total_group_count: totalGroupCount,
           metrics_by_column: summaryMetrics
@@ -2444,8 +2458,11 @@ server.registerTool(
           normalized_query: built.normalizedQuery,
           primary_metric_column: built.primaryMetricColumn,
           summary: {
-            record_count: toNonNegativeInt(data.summary.total_count) ?? 0,
-            provider_result_amount: providerResultAmount,
+            counts: buildSummaryCounts({
+              effectiveRecordCount,
+              rawScanComplete
+            }),
+            missing_count: toNonNegativeInt(asObject(data.summary)?.missing_count) ?? 0,
             returned_group_count: returnedGroupCount,
             total_group_count: totalGroupCount,
             metrics_by_column: summaryMetrics
@@ -3140,7 +3157,7 @@ server.registerTool(
             ok: true,
             data: {
               mode: "summary",
-              source_tool: "qf_records_summary",
+              source_tool: "qf_records_aggregate",
               summary: executed.data
             },
             output_profile: executed.outputProfile,
@@ -5409,8 +5426,7 @@ function buildExtendedCompleteness(params: {
   rawNextPageToken?: string | null
   outputNextPageToken?: string | null
   stopReason?: string | null
-  providerResultAmount?: number | null
-  sourceRecordCount?: number
+  scannedRecordCount?: number
   effectiveRecordCount?: number
   returnedGroupCount?: number
   totalGroupCount?: number
@@ -5438,13 +5454,22 @@ function buildExtendedCompleteness(params: {
     raw_next_page_token: params.rawNextPageToken ?? params.nextPageToken,
     output_next_page_token: params.outputNextPageToken ?? null,
     stop_reason: params.stopReason ?? null,
-    provider_result_amount: params.providerResultAmount ?? params.resultAmount,
-    source_record_count: params.sourceRecordCount ?? params.returnedItems,
+    scanned_record_count: params.scannedRecordCount ?? params.returnedItems,
     effective_record_count: params.effectiveRecordCount ?? params.returnedItems,
     ...(params.returnedGroupCount !== undefined
       ? { returned_group_count: params.returnedGroupCount }
       : {}),
     ...(params.totalGroupCount !== undefined ? { total_group_count: params.totalGroupCount } : {})
+  }
+}
+
+function buildSummaryCounts(params: {
+  effectiveRecordCount: number
+  rawScanComplete: boolean
+}): z.infer<typeof summaryCountSchema> {
+  return {
+    effective_record_count: params.effectiveRecordCount,
+    final_record_count: params.rawScanComplete ? params.effectiveRecordCount : null
   }
 }
 
@@ -7315,8 +7340,7 @@ async function executeRecordsBatchGet(
     partial: missingApplyIds.length > 0,
     omitted_items: missingApplyIds.length,
     omitted_chars: 0,
-    provider_result_amount: requestedApplyIds.length,
-    source_record_count: rows.length,
+    scanned_record_count: rows.length,
     effective_record_count: rows.length
   }
   const evidence = buildEvidencePayload(
@@ -7566,8 +7590,7 @@ async function executeRecordsExport(
     partial: hasMore || omittedItems > 0,
     omitted_items: omittedItems,
     omitted_chars: 0,
-    provider_result_amount: knownResultAmount,
-    source_record_count: rows.length,
+    scanned_record_count: rows.length,
     effective_record_count: rows.length
   }
   const evidence = buildEvidencePayload(
@@ -7830,8 +7853,7 @@ async function executeRecordsList(
     partial: !isComplete,
     omitted_items: omittedItems,
     omitted_chars: fittedRows.omittedChars,
-    provider_result_amount: knownResultAmount,
-    source_record_count: collectedRawItems.length,
+    scanned_record_count: collectedRawItems.length,
     effective_record_count: fittedRows.items.length
   }
   const listState: ListQueryState = {
@@ -7963,8 +7985,7 @@ async function executeRecordGet(
     partial: false,
     omitted_items: 0,
     omitted_chars: 0,
-    provider_result_amount: 1,
-    source_record_count: 1,
+    scanned_record_count: 1,
     effective_record_count: 1
   }
   const evidence: z.infer<typeof recordGetSuccessOutputSchema>["data"]["evidence"] = {
@@ -8244,16 +8265,8 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     })
   }
   const outputProfile = resolveOutputProfile(args.output_profile)
-  const strictFull = args.strict_full ?? true
   const includeNegative = args.stat_policy?.include_negative ?? true
   const includeNull = args.stat_policy?.include_null ?? false
-  const scanMaxPages = args.scan_max_pages ?? DEFAULT_SCAN_MAX_PAGES
-  const requestedPages = args.requested_pages ?? scanMaxPages
-  const continuationPayload = resolveContinuationPayload(args.page_token, args.app_key)
-  const startPage = continuationPayload?.next_page_num ?? args.page_num ?? 1
-  const pageSize = args.page_size ?? DEFAULT_PAGE_SIZE
-  const adaptivePaging = createAdaptivePagingState(pageSize)
-  const rowCap = Math.min(args.max_rows ?? DEFAULT_ROW_LIMIT, DEFAULT_ROW_LIMIT)
   const timezone = args.time_range?.timezone ?? "Asia/Shanghai"
 
   const form = await getFormCached(args.app_key, args.user_id, false)
@@ -8271,186 +8284,88 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       ? resolveSummaryColumn(args.amount_column, index, "amount_column")
       : null
   const timeColumn = args.time_range ? resolveSummaryColumn(args.time_range.column, index, "time_range.column") : null
-
-  const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
-  const summaryFilters = [...(args.filters ?? [])]
-  if (timeColumn && (args.time_range?.from || args.time_range?.to)) {
-    summaryFilters.push({
-      que_id: timeColumn.que_id,
-      ...(args.time_range.from ? { min_value: args.time_range.from } : {}),
-      ...(args.time_range.to ? { max_value: args.time_range.to } : {})
-    })
-  }
-  validateDateRangeFilters(summaryFilters, index, "qf_query(summary)")
-
-  const queryFingerprint = buildSummaryContinuationFingerprint({
+  const aggregateExecuted = await executeRecordsAggregate({
     app_key: args.app_key,
+    user_id: args.user_id,
+    page_num: args.page_num,
+    page_token: args.page_token,
+    page_size: args.page_size,
+    requested_pages: args.requested_pages,
+    scan_max_pages: args.scan_max_pages,
     mode: args.mode,
     type: args.type,
     keyword: args.keyword,
     query_logic: args.query_logic,
     apply_ids: args.apply_ids,
-    sort: normalizedSort,
-    filters: echoFilters(summaryFilters),
-    select_columns: effectiveColumns,
-    amount_column: amountColumn,
-    time_column: timeColumn,
+    sort: args.sort,
+    filters: args.filters,
     time_range: args.time_range,
-    stat_policy: {
-      include_negative: includeNegative,
-      include_null: includeNull
-    },
-    row_cap: rowCap
+    group_by: [],
+    ...(args.amount_column !== undefined ? { amount_column: args.amount_column } : {}),
+    metrics: args.amount_column !== undefined ? ["count", "sum"] : ["count"],
+    ...(timeColumn ? { time_bucket: "day" as const } : {}),
+    stat_policy: args.stat_policy,
+    strict_full: args.strict_full,
+    output_profile: "verbose"
   })
-  const resumed = loadContinuationState(
-    "summary",
-    continuationPayload,
-    queryFingerprint,
-    "qf_query(summary)"
-  )
-  const queryId = resumed?.state.query_id ?? randomUUID()
 
-  const listState: ListQueryState = {
-    query_id: queryId,
-    app_key: args.app_key,
-    selected_columns: effectiveColumns.map((item) => item.requested),
-    filters: echoFilters(summaryFilters),
-    time_range: timeColumn
-      ? {
-          column: timeColumn.requested,
-          from: args.time_range?.from ?? null,
-          to: args.time_range?.to ?? null,
-          timezone
-        }
-      : null
+  const aggregateData = aggregateExecuted.payload.data
+  const completeness = aggregateData.completeness
+  if (!completeness) {
+    throw new Error("Aggregate summary completeness is missing")
+  }
+  const evidence = aggregateData.evidence
+  if (!evidence) {
+    throw new Error("Aggregate summary evidence is missing")
   }
 
-  let currentPage = startPage
-  const startedAt = Date.now()
-  const callScanLimit = resolveScanLimit(requestedPages, scanMaxPages)
-  let scannedPagesThisCall = 0
-  let scannedPagesTotal = resumed?.state.source_pages.length ?? 0
-  let scannedRecords = resumed?.state.scanned_records ?? 0
-  let hasMore = false
-  let nextPageNum: number | null = null
-  let resultAmount: number | null = null
-  let summaryMeta: ReturnType<typeof buildMeta> | null = null
-  let stopReason: string | null = null
-  let totalAmount = resumed?.state.total_amount ?? 0
-  let missingCount = resumed?.state.missing_count ?? 0
-  const sourcePages = resumed ? [...resumed.state.source_pages] : []
-  const totalScanLimit = (resumed?.state.scan_limit_total ?? 0) + callScanLimit
-
-  const rows = resumed ? [...resumed.state.rows] : []
-  const byDay = new Map<string, { count: number; amount: number }>(
-    resumed ? cloneByDayBuckets(resumed.state.by_day) : []
+  const rowCap = Math.min(args.max_rows ?? DEFAULT_ROW_LIMIT, DEFAULT_ROW_LIMIT)
+  const sampleRequestedPages = Math.max(
+    1,
+    Math.ceil(rowCap / Math.max(1, args.page_size ?? DEFAULT_PAGE_SIZE))
   )
-
-  while (scannedPagesThisCall < callScanLimit) {
-    if (scannedPagesThisCall > 0 && isExecutionBudgetExceeded(startedAt)) {
-      hasMore = true
-      nextPageNum = currentPage
-      stopReason = "execution_budget"
-      break
+  const sampleListArgs = buildListArgsFromQuery({
+    ...args,
+    page_token: undefined,
+    page_num: args.page_num ?? 1,
+    requested_pages: sampleRequestedPages,
+    scan_max_pages: sampleRequestedPages,
+    strict_full: false,
+    output_profile: "compact"
+  })
+  const listed = await executeRecordsList(sampleListArgs)
+  const rows = listed.payload.data.rows.map((rowRaw) => {
+    const flat = asObject(rowRaw) ?? {}
+    const summaryRow: Record<string, unknown> = {}
+    for (const column of effectiveColumns) {
+      const byRequested = flat[column.requested]
+      const byTitle = column.que_title ? flat[column.que_title] : undefined
+      const byId = flat[String(column.que_id)]
+      summaryRow[column.requested] = firstPresent(byRequested, byTitle, byId)
     }
+    return summaryRow
+  })
 
-    const activePageSize = adaptivePaging.current_page_size
-    const payload = buildListPayload({
-      pageNum: currentPage,
-      pageSize: activePageSize,
-      mode: args.mode,
-      type: args.type,
-      keyword: args.keyword,
-      queryLogic: args.query_logic,
-      applyIds: args.apply_ids,
-      sort: normalizedSort,
-      filters: summaryFilters
-    })
-    const fetchStartedAt = Date.now()
-    const response = await client.listRecords(args.app_key, payload, { userId: args.user_id })
-    const fetchMs = Date.now() - fetchStartedAt
-    summaryMeta = summaryMeta ?? buildMeta(response)
-    scannedPagesThisCall += 1
-    scannedPagesTotal += 1
-    sourcePages.push(currentPage)
-
-    const result = asObject(response.result)
-    const rawItems = asArray(result?.result)
-    const pageAmount = toPositiveInt(result?.pageAmount)
-    resultAmount = resultAmount ?? toNonNegativeInt(result?.resultAmount)
-    hasMore = pageAmount !== null ? currentPage < pageAmount : rawItems.length === activePageSize
-    nextPageNum = hasMore ? currentPage + 1 : null
-
-    for (const rawItem of rawItems) {
-      const record = asObject(rawItem) ?? {}
-      const answers = asArray(record.answers)
-      scannedRecords += 1
-
-      if (rows.length < rowCap) {
-        rows.push(buildSummaryRow(answers, effectiveColumns))
-      }
-
-      let amountContribution = 0
-      let hasAmountContribution = false
-      if (amountColumn) {
-        const amountValue = extractSummaryColumnValue(answers, amountColumn)
-        const numericAmount = toFiniteAmount(amountValue)
-
-        if (numericAmount === null) {
-          if (!includeNull) {
-            missingCount += 1
-          } else {
-            hasAmountContribution = true
+  const byDay =
+    timeColumn && Array.isArray(aggregateData.groups)
+      ? aggregateData.groups
+          .map((bucketRaw) => {
+            const bucket = asObject(bucketRaw) ?? {}
+            const group = asObject(bucket.group) ?? {}
+            return {
+              day: String(group.time_bucket_day ?? "all"),
+              count: toNonNegativeInt(bucket.count) ?? 0,
+              amount_total: amountColumn ? (typeof bucket.amount_total === "number" ? bucket.amount_total : null) : null
+            }
+          })
+          .sort((a, b) => a.day.localeCompare(b.day))
+      : [
+          {
+            day: "all",
+            count: aggregateData.summary.counts.effective_record_count,
+            amount_total: amountColumn ? aggregateData.summary.total_amount : null
           }
-        } else if (includeNegative || numericAmount >= 0) {
-          amountContribution = numericAmount
-          hasAmountContribution = true
-        }
-      }
-
-      if (hasAmountContribution) {
-        totalAmount += amountContribution
-      }
-
-      const dayKey = timeColumn
-        ? toDayBucket(extractSummaryColumnValue(answers, timeColumn), timezone)
-        : "all"
-      const bucket = byDay.get(dayKey) ?? { count: 0, amount: 0 }
-      bucket.count += 1
-      if (amountColumn && hasAmountContribution) {
-        bucket.amount += amountContribution
-      }
-      byDay.set(dayKey, bucket)
-    }
-
-    const adaptiveDecision = applyAdaptivePaging({
-      state: adaptivePaging,
-      fetchedPages: scannedPagesThisCall,
-      requestedPages: callScanLimit,
-      fetchMs,
-      startedAt
-    })
-    if (adaptiveDecision.shouldStop && hasMore) {
-      nextPageNum = nextPageNum ?? currentPage + 1
-      stopReason = "adaptive_budget"
-      break
-    }
-
-    if (!hasMore) {
-      stopReason = "source_exhausted"
-      break
-    }
-
-    currentPage = currentPage + 1
-  }
-
-  const byDayStats = Array.from(byDay.entries())
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([day, bucket]) => ({
-      day,
-      count: bucket.count,
-      amount_total: amountColumn ? bucket.amount : null
-    }))
+        ]
 
   const fieldMapping = [
     ...effectiveColumns.map((item) => ({
@@ -8484,87 +8399,18 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       : [])
   ]
 
-  if (!summaryMeta) {
-    throw new Error("Failed to build summary metadata")
-  }
-
-  const knownResultAmount = resultAmount ?? scannedRecords
-  const omittedSourceItems = Math.max(0, knownResultAmount - scannedRecords)
-  let rawNextPageToken: string | null = null
-  const rawScanComplete = !hasMore && omittedSourceItems === 0
-  if (!rawScanComplete && nextPageNum) {
-    const resumeId = setContinuationState(
-      "summary",
-      {
-        query_id: queryId,
-        query_fingerprint: queryFingerprint,
-        scanned_records: scannedRecords,
-        total_amount: totalAmount,
-        missing_count: missingCount,
-        by_day: cloneByDayBuckets(Array.from(byDay.entries())),
-        rows: [...rows],
-        source_pages: [...sourcePages],
-        scan_limit_total: totalScanLimit
-      },
-      resumed?.resumeId
-    )
-    rawNextPageToken = encodeContinuationToken({
-      app_key: args.app_key,
-      next_page_num: nextPageNum,
-      page_size: adaptivePaging.current_page_size,
-      resume_kind: "summary",
-      resume_id: resumeId
-    })
-  } else {
-    deleteContinuationState(resumed?.resumeId)
-  }
-  const outputPageComplete = rows.length >= scannedRecords
-  const scanLimitHit =
-    !rawScanComplete &&
-    (scannedPagesThisCall >= callScanLimit ||
-      stopReason === "execution_budget" ||
-      stopReason === "adaptive_budget")
-  const completeness = buildExtendedCompleteness({
-    resultAmount: knownResultAmount,
-    returnedItems: scannedRecords,
-    fetchedPages: scannedPagesTotal,
-    requestedPages: totalScanLimit,
-    hasMore,
-    nextPageToken: rawNextPageToken,
-    omittedItems: omittedSourceItems,
-    omittedChars: 0,
-    rawScanComplete,
-    scanLimitHit,
-    scannedPages: scannedPagesTotal,
-    scanLimit: totalScanLimit,
-    outputPageComplete,
-    rawNextPageToken,
-    outputNextPageToken: null,
-    stopReason,
-    providerResultAmount: knownResultAmount,
-    sourceRecordCount: scannedRecords,
-    effectiveRecordCount: scannedRecords
-  })
-  const evidence = buildEvidencePayload(listState, sourcePages)
-
-  if (strictFull && !rawScanComplete) {
-    throw new NeedMoreDataError(
-      "Summary is incomplete. Continue with next_page_token or increase requested_pages/scan_max_pages.",
-      {
-        code: "NEED_MORE_DATA",
-        completeness,
-        evidence
-      }
-    )
-  }
+  const scannedRecords =
+    toNonNegativeInt(completeness.scanned_record_count) ??
+    toNonNegativeInt(completeness.effective_record_count) ??
+    aggregateData.summary.counts.effective_record_count
 
   return {
     data: {
       summary: {
-        total_count: scannedRecords,
-        total_amount: amountColumn ? totalAmount : null,
-        by_day: byDayStats,
-        missing_count: missingCount
+        counts: aggregateData.summary.counts,
+        total_amount: aggregateData.summary.total_amount,
+        by_day: byDay,
+        missing_count: aggregateData.summary.missing_count
       },
       rows,
       completeness,
@@ -8590,20 +8436,31 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
               },
               execution: {
                 scanned_records: scannedRecords,
-                scanned_pages: scannedPagesTotal,
-                truncated: !completeness.is_complete,
+                scanned_pages:
+                  toNonNegativeInt(completeness.scanned_pages) ??
+                  toNonNegativeInt(completeness.actual_scanned_pages) ??
+                  0,
+                truncated:
+                  !completeness.is_complete ||
+                  rows.length < aggregateData.summary.counts.effective_record_count,
                 row_cap: rowCap,
-                column_cap: args.max_columns ?? null,
-                scan_max_pages: totalScanLimit
+                column_cap: sampleListArgs.max_columns ?? null,
+                scan_max_pages:
+                  toPositiveInt(completeness.scan_limit) ??
+                  sampleListArgs.scan_max_pages ??
+                  DEFAULT_SCAN_MAX_PAGES
               }
             }
           }
         : {})
     },
-    meta: summaryMeta,
-    message: completeness.is_complete
-      ? `Summarized ${scannedRecords} records`
-      : `Summarized ${scannedRecords}/${knownResultAmount} records (partial)`,
+    meta: aggregateExecuted.payload.meta ?? (() => {
+      throw new Error("Aggregate verbose meta is missing")
+    })(),
+    message:
+      aggregateData.summary.counts.final_record_count !== null
+        ? `Summarized ${aggregateData.summary.counts.final_record_count} records`
+        : `Summarized ${aggregateData.summary.counts.effective_record_count}/${completeness.result_amount} records (partial)`,
     completeness,
     evidence,
     outputProfile
@@ -8714,6 +8571,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
   let responseMeta: ReturnType<typeof buildMeta> | null = null
   let stopReason: string | null = null
   let totalAmount = resumed?.state.total_amount ?? 0
+  let missingCount = resumed?.state.missing_count ?? 0
   const sourcePages = resumed ? [...resumed.state.source_pages] : []
   const totalScanLimit = (resumed?.state.scan_limit_total ?? 0) + callScanLimit
   const groupStats: Map<
@@ -8768,6 +8626,14 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       const record = asObject(rawItem) ?? {}
       const answers = asArray(record.answers)
       scannedRecords += 1
+
+      if (primaryAmountColumn) {
+        const primaryAmountValue = extractSummaryColumnValue(answers, primaryAmountColumn)
+        const primaryNumericAmount = toFiniteAmount(primaryAmountValue)
+        if (primaryNumericAmount === null && !includeNull) {
+          missingCount += 1
+        }
+      }
 
       const group: Record<string, unknown> = {}
       for (const column of groupColumns) {
@@ -8855,6 +8721,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
         query_fingerprint: queryFingerprint,
         scanned_records: scannedRecords,
         total_amount: totalAmount,
+        missing_count: missingCount,
         source_pages: [...sourcePages],
         scan_limit_total: totalScanLimit,
         group_stats: serializeAggregateGroupStats(groupStats),
@@ -8895,8 +8762,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     rawNextPageToken,
     outputNextPageToken: null,
     stopReason,
-    providerResultAmount: knownResultAmount,
-    sourceRecordCount: scannedRecords,
+    scannedRecordCount: scannedRecords,
     effectiveRecordCount: scannedRecords,
     returnedGroupCount: Math.min(groupsTotal, maxGroups),
     totalGroupCount: groupsTotal
@@ -8974,8 +8840,12 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
       data: {
         app_key: args.app_key,
         summary: {
-          total_count: scannedRecords,
+          counts: buildSummaryCounts({
+            effectiveRecordCount: scannedRecords,
+            rawScanComplete
+          }),
           total_amount: primaryAmountColumn ? totalAmount : null,
+          missing_count: primaryAmountColumn ? missingCount : 0,
           ...(metrics.length > 0
             ? {
                 metrics: buildAggregateMetricRecord({

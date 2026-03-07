@@ -109,7 +109,7 @@ npm i -g git+https://github.com/853046310/qingflow-mcp.git
 Install from npm (pinned version):
 
 ```bash
-npm i -g qingflow-mcp@0.4.2
+npm i -g qingflow-mcp@0.5.0
 ```
 
 Or one-click installer:
@@ -162,7 +162,7 @@ Full calling contract (Chinese):
 
 1. `query_mode=auto`:
    - if `apply_id` is set, route to single-record query.
-   - if summary params are set (`amount_column` / `time_range` / `stat_policy` / `scan_max_pages`), route to summary query.
+   - if summary params are set (`amount_column` / `time_range` / `stat_policy` / `scan_max_pages`), route to aggregate-backed summary query.
    - otherwise route to list query.
 2. `query_mode=list|record|summary` forces explicit behavior.
 3. In `list` mode, `time_range` is translated to list filters when `from` or `to` is provided.
@@ -173,9 +173,10 @@ Full calling contract (Chinese):
 
 Summary mode output:
 
-1. `summary`: aggregated stats (`total_count`, `total_amount`, `by_day`, `missing_count`).
-2. `rows`: strict column rows (only requested `select_columns`).
-3. `meta`: field mapping, filter scope, stat policy, execution limits (`output_profile=verbose` only).
+1. `qf_query(summary)` is a compatibility wrapper over the aggregate core.
+2. `summary`: aggregated stats (`counts.effective_record_count`, `counts.final_record_count`, `total_amount`, `by_day`, `missing_count`).
+3. `rows`: strict sample rows (only requested `select_columns`).
+4. `meta`: field mapping, filter scope, stat policy, execution limits (`output_profile=verbose` only).
 
 Return shape:
 
@@ -188,7 +189,7 @@ Deterministic read protocol (list/summary/aggregate):
 1. output profile:
    - default `output_profile=compact`: return core data only (`rows/row/groups/summary` + `next_page_token`)
    - `output_profile=verbose`: include full contract (`completeness` + `evidence` + `meta`)
-   - exception: `qf_query(summary)` and `qf_records_aggregate` always return `completeness`, even in `compact`, so agents can block on incomplete statistics
+   - exception: aggregate-style outputs (`qf_query(summary)` compatibility wrapper and `qf_records_aggregate`) always return `completeness`, even in `compact`, so agents can block on incomplete statistics
 2. when `output_profile=verbose`, `completeness` fields are:
    - `result_amount`
    - `returned_items`
@@ -209,7 +210,7 @@ Deterministic read protocol (list/summary/aggregate):
    - `time_range`
    - `source_pages`
 4. `strict_full=true` makes incomplete results fail fast with `NEED_MORE_DATA`.
-   - for `qf_query(summary)`, `strict_full` enforces raw source scan completeness; sample rows may still be capped by `max_rows`, which is reflected by `output_page_complete=false`
+   - for `qf_query(summary)`, `strict_full` enforces raw source scan completeness; sample-row truncation does not change aggregate completeness
 5. Error payloads expose `error_code` and `fix_hint` for actionable retries.
 6. Public MCP `inputSchema` is strict:
    - numbers must be native JSON numbers
@@ -223,7 +224,7 @@ For `qf_query(summary)` and `qf_records_aggregate`, read `data.summary.completen
 
 1. `raw_scan_complete=false`: source data is not fully scanned, do not produce a final conclusion.
 2. `scan_limit_hit=true`: query stopped because scan budget was hit.
-3. `output_page_complete=false`: source may be complete, but output was truncated by `max_rows` or `max_groups`.
+3. `output_page_complete=false`: source may be complete, but aggregate output itself was truncated by output limits such as `max_groups`.
 4. `raw_next_page_token`: use this token to continue raw scan pagination (`next_page_token` remains as a backward-compatible alias). For `qf_query(summary)` / `qf_records_aggregate`, the token carries cumulative state, so keep query arguments unchanged when resuming.
 
 ## List Query Tips

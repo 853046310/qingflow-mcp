@@ -1242,16 +1242,16 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
 
     assert.equal(aggregated.ok, true)
     assert.equal(aggregated.data.kind, "aggregate")
-    assert.equal(aggregated.data.summary.record_count, 5)
-    assert.equal(aggregated.data.summary.provider_result_amount, 5)
+    assert.equal(aggregated.data.summary.counts.effective_record_count, 5)
+    assert.equal(aggregated.data.summary.counts.final_record_count, 5)
     assert.equal(aggregated.data.summary.returned_group_count, 3)
     assert.equal(aggregated.data.summary.total_group_count, 3)
     assert.equal(aggregated.data.summary.metrics_by_column["1002"].sum, 280)
     assert.ok(Array.isArray(aggregated.data.groups))
     assert.ok(aggregated.data.groups[0].metrics_by_column["1002"])
-    assert.equal(aggregated.data.completeness.source_record_count, 5)
+    assert.equal(aggregated.data.completeness.scanned_record_count, 5)
     assert.equal(aggregated.data.completeness.effective_record_count, 5)
-    assert.equal(aggregated.data.completeness.provider_result_amount, 5)
+    assert.equal(aggregated.data.completeness.result_amount, 5)
     assert.equal(aggregated.data.completeness.returned_group_count, 3)
     assert.equal(aggregated.data.completeness.total_group_count, 3)
     const snapshot = await readResourceJson(mcp.client, aggregated.data.snapshot_resource.uri)
@@ -1271,13 +1271,13 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(aggregated.ok, true)
-    assert.equal(aggregated.data.summary.record_count, 2)
-    assert.equal(aggregated.data.summary.provider_result_amount, 6)
+    assert.equal(aggregated.data.summary.counts.effective_record_count, 2)
+    assert.equal(aggregated.data.summary.counts.final_record_count, null)
     assert.equal(aggregated.data.summary.returned_group_count, 2)
     assert.equal(aggregated.data.summary.total_group_count, 2)
-    assert.equal(aggregated.data.completeness.source_record_count, 2)
+    assert.equal(aggregated.data.completeness.scanned_record_count, 2)
     assert.equal(aggregated.data.completeness.effective_record_count, 2)
-    assert.equal(aggregated.data.completeness.provider_result_amount, 6)
+    assert.equal(aggregated.data.completeness.result_amount, 6)
     assert.equal(aggregated.data.completeness.raw_scan_complete, false)
     assert.equal(typeof aggregated.data.cursor, "string")
   })
@@ -1643,7 +1643,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(summary.data.summary.completeness.is_complete, false)
     assert.equal(summary.data.summary.completeness.raw_scan_complete, false)
     assert.equal(summary.data.summary.completeness.scan_limit_hit, true)
-    assert.equal(summary.data.summary.completeness.output_page_complete, false)
+    assert.equal(summary.data.summary.completeness.output_page_complete, true)
     assert.equal(
       summary.data.summary.completeness.raw_next_page_token,
       summary.next_page_token
@@ -1666,7 +1666,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(first.ok, true)
-    assert.equal(first.data.summary.summary.total_count, 2)
+    assert.equal(first.data.summary.summary.counts.effective_record_count, 2)
+    assert.equal(first.data.summary.summary.counts.final_record_count, null)
     assert.equal(typeof first.next_page_token, "string")
 
     const resumed = await callTool(mcp.client, "qf_query", {
@@ -1684,7 +1685,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(resumed.ok, true)
-    assert.equal(resumed.data.summary.summary.total_count, 6)
+    assert.equal(resumed.data.summary.summary.counts.effective_record_count, 6)
+    assert.equal(resumed.data.summary.summary.counts.final_record_count, 6)
     assert.equal(resumed.data.summary.summary.total_amount, 350)
     assert.equal(resumed.data.summary.completeness.raw_scan_complete, true)
     assert.equal(resumed.data.summary.completeness.raw_next_page_token, null)
@@ -1714,8 +1716,13 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       query_mode: "summary",
       app_key: APP_KEY,
       mode: "all",
-      select_columns: [1002],
+      select_columns: [1001],
       amount_column: 1002,
+      time_range: {
+        column: 1003,
+        from: "2026-01-01",
+        to: "2026-01-31"
+      },
       page_size: 2,
       requested_pages: 2,
       scan_max_pages: 2,
@@ -1797,13 +1804,15 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
 
     assert.equal(summary.ok, true)
     assert.equal(summary.data.mode, "summary")
-    assert.equal(summary.data.summary.summary.total_count, 5)
+    assert.equal(summary.data.source_tool, "qf_records_aggregate")
+    assert.equal(summary.data.summary.summary.counts.effective_record_count, 5)
+    assert.equal(summary.data.summary.summary.counts.final_record_count, 5)
     assert.equal(summary.data.summary.summary.total_amount, 330)
     assert.equal(summary.data.summary.summary.missing_count, 1)
     assert.equal(summary.data.summary.rows.length, 3)
     assert.equal(summary.data.summary.completeness.raw_scan_complete, true)
-    assert.equal(summary.data.summary.completeness.output_page_complete, false)
-    assert.equal(summary.data.summary.completeness.is_complete, false)
+    assert.equal(summary.data.summary.completeness.output_page_complete, true)
+    assert.equal(summary.data.summary.completeness.is_complete, true)
     assert.equal(summary.data.summary.completeness.actual_scanned_pages, 3)
     assert.equal(summary.data.summary.evidence.source_pages.length, 3)
 
@@ -1899,8 +1908,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(failed.details.completeness.is_complete, false)
     assert.equal(failed.details.completeness.has_more, true)
     assert.ok(Array.isArray(failed.example_calls))
-    assert.equal(failed.example_calls[0].tool, "qf_query")
-    assert.equal(failed.example_calls[0].arguments.query_mode, "summary")
+    assert.equal(failed.example_calls[0].tool, "qf_records_aggregate")
   })
 
   await t.test("qf_records_aggregate returns grouped metrics with evidence", async () => {
@@ -1916,8 +1924,10 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(aggregated.ok, true)
-    assert.equal(aggregated.data.summary.total_count, 6)
+    assert.equal(aggregated.data.summary.counts.effective_record_count, 6)
+    assert.equal(aggregated.data.summary.counts.final_record_count, 6)
     assert.equal(aggregated.data.summary.total_amount, 350)
+    assert.equal(aggregated.data.summary.missing_count, 1)
     assert.equal(aggregated.data.completeness.is_complete, true)
     assert.ok(Array.isArray(aggregated.data.groups))
     assert.ok(aggregated.data.groups.length > 0)
@@ -1964,7 +1974,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(first.ok, true)
-    assert.equal(first.data.summary.total_count, 2)
+    assert.equal(first.data.summary.counts.effective_record_count, 2)
+    assert.equal(first.data.summary.counts.final_record_count, null)
     assert.equal(typeof first.next_page_token, "string")
 
     const resumed = await callTool(mcp.client, "qf_records_aggregate", {
@@ -1980,7 +1991,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(resumed.ok, true)
-    assert.equal(resumed.data.summary.total_count, 6)
+    assert.equal(resumed.data.summary.counts.effective_record_count, 6)
+    assert.equal(resumed.data.summary.counts.final_record_count, 6)
     assert.equal(resumed.data.summary.total_amount, 350)
     assert.equal(resumed.data.completeness.raw_scan_complete, true)
     assert.equal(resumed.data.completeness.raw_next_page_token, null)
@@ -2008,7 +2020,8 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
 
     assert.equal(aggregated.ok, true)
-    assert.equal(aggregated.data.summary.total_count, 5)
+    assert.equal(aggregated.data.summary.counts.effective_record_count, 5)
+    assert.equal(aggregated.data.summary.counts.final_record_count, 5)
     assert.equal(aggregated.data.summary.total_amount, 280)
     assert.equal(aggregated.data.summary.metrics["1002"].sum, 280)
     assert.equal(aggregated.data.summary.metrics["1002"].count, 4)

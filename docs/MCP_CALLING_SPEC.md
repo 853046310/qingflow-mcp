@@ -1,4 +1,4 @@
-# Qingflow MCP 调用规范（v0.4.x）
+# Qingflow MCP 调用规范（v0.5.0）
 
 本规范用于智能体、前端编排层、后端服务统一接入 `qingflow-mcp`。
 
@@ -8,7 +8,7 @@
 2. 读工具以“可证明”为目标，支持两种输出模式：
    - `output_profile=compact`（默认）：仅返回核心数据与 `next_page_token`
    - `output_profile=verbose`：额外返回 `evidence`、`meta` 等可审计字段
-   - 例外：`qf_query(summary)` 与 `qf_records_aggregate` 即使在 `compact` 模式也会返回 `completeness`，因为它们直接承载统计结论
+   - 例外：聚合型输出即使在 `compact` 模式也会返回 `completeness`，包括 `qf_query(summary)`（兼容包装层）与 `qf_records_aggregate`
    - `error_code` / `fix_hint`：在 `verbose` 成功响应中为 `null`，失败时给出结构化错误与修复建议
 3. 统计结论必须看 `is_complete`（`verbose` 模式）：
    - `is_complete=true` 才能直接用于最终统计结论
@@ -45,13 +45,15 @@
 - `omitted_items`: 由于限流/截断未返回的条数
 - `omitted_chars`: 由于大小保护省略的字符量估算
 
-其中 `qf_query(summary)` / `qf_records_aggregate` 还会返回扩展字段，用于区分“源数据没扫全”和“输出被裁剪”：
+其中 `qf_query(summary)` / `qf_records_aggregate` 还会返回扩展字段，用于区分“源数据没扫全”和“聚合输出被裁剪”：
 
 - `raw_scan_complete`: 底层源数据是否已扫全
 - `scan_limit_hit`: 是否因为扫描预算/执行预算命中上限而提前停止
 - `scanned_pages`: 实际扫描页数
+- `scanned_record_count`: 实际从源数据扫描并纳入统计的记录数
+- `effective_record_count`: 当前返回结果实际表达的记录数
 - `scan_limit`: 本次扫描页上限
-- `output_page_complete`: 当前输出层是否完整
+- `output_page_complete`: 当前聚合输出层是否完整
 - `raw_next_page_token`: 底层源扫描续拉 token；对 `qf_query(summary)` / `qf_records_aggregate` 来说，它会携带累计状态，续拉时必须保持查询参数不变
 - `output_next_page_token`: 输出层分页 token（当前一般为 `null`）
 - `stop_reason`: 停止原因（如 `source_exhausted` / `execution_budget` / `adaptive_budget`）
@@ -59,7 +61,7 @@
 判定规则：
 
 - `raw_scan_complete=false`：不能把统计结果当全量结论
-- `output_page_complete=false`：说明输出被裁剪（例如 `max_rows` / `max_groups`），但不一定代表底层源数据没扫全
+- `output_page_complete=false`：说明聚合输出被裁剪（例如 `max_groups`），但不一定代表底层源数据没扫全
 - `is_complete = raw_scan_complete && output_page_complete`
 
 ## 3. 证据链协议（evidence，`output_profile=verbose`）
@@ -81,7 +83,7 @@
    - `details.completeness`
    - `details.evidence`
 2. 当 `strict_full=false`（或未开启）时，可返回部分结果，并由上层根据 `completeness` 决策。
-3. 对 `qf_query(summary)` 来说，`strict_full` 只约束“源数据必须扫全”；`rows` 受 `max_rows` 裁剪不会触发 `NEED_MORE_DATA`，但会把 `output_page_complete` 标成 `false`。
+3. 对 `qf_query(summary)` 来说，`strict_full` 只约束“源数据必须扫全”；兼容输出里的样例 `rows` 受 `max_rows` 裁剪不会触发 `NEED_MORE_DATA`，也不会改变聚合 `completeness`。
 
 ## 5. 分页规范（确定性）
 
@@ -236,7 +238,10 @@
 说明：
 - `list` 模式中 `time_range` 会自动下推为筛选条件。
 - `summary` 默认 `strict_full=true`。
+- `summary` 是兼容包装层，内部走与 `qf_records_aggregate` 相同的聚合核心。
 - `output_profile` 默认 `compact`，但 `summary` 模式下仍会返回 `completeness`，避免把部分统计当成全量。
+- `summary.counts.effective_record_count` 表示当前汇总实际基于多少条记录计算
+- `summary.counts.final_record_count` 只有在 `raw_scan_complete=true` 时才有值；否则为 `null`
 - 顶层 `from` / `to` / `dateFrom` / `dateTo` 会被拒绝；请统一放进 `time_range`
 - `filters` 里不要传 `searchKey` / `searchKeys` / `from` / `to` / `dateFrom` / `dateTo`
 
@@ -254,7 +259,7 @@
   - 完整性：`strict_full`
 
 返回核心：
-- `summary`: 总数/总金额
+- `summary`: `counts.effective_record_count` / `counts.final_record_count` / `total_amount`
 - `groups`: 分组统计（count、amount、占比 + 可选 metrics）
 - `completeness`: 无论 `compact/verbose` 都返回，用于判断统计是否可直接下结论
 - `evidence`: `output_profile=verbose` 时返回
