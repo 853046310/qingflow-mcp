@@ -263,9 +263,40 @@ function buildForm() {
       { queId: 1002, queTitle: "金额", queType: 6, subQuestionBaseInfos: [] },
       { queId: 1003, queTitle: "下单日期", queType: 4, subQuestionBaseInfos: [] },
       { queId: 1004, queTitle: "归属销售", queType: { code: 18, name: "member" }, subQuestionBaseInfos: [] },
-      { queId: 1005, queTitle: "归属部门", queType: { code: 19, name: "department" }, subQuestionBaseInfos: [] }
+      { queId: 1005, queTitle: "归属部门", queType: { code: 19, name: "department" }, subQuestionBaseInfos: [] },
+      {
+        queId: 1006,
+        queTitle: "报销类型",
+        queType: { code: 3, name: "single_select" },
+        options: [
+          { optId: 1, optValue: "出差", linkQueIds: ["1007"] },
+          { optId: 2, optValue: "日常", linkQueIds: [] }
+        ],
+        subQuestionBaseInfos: []
+      },
+      {
+        queId: 1007,
+        queTitle: "出差城市",
+        queType: 2,
+        required: true,
+        subQuestionBaseInfos: []
+      },
+      {
+        queId: 1008,
+        queTitle: "系统创建时间",
+        queType: 4,
+        readonly: true,
+        system: true,
+        subQuestionBaseInfos: []
+      }
     ],
-    questionRelations: []
+    questionRelations: [
+      {
+        sourceQueId: 1006,
+        targetQueId: 1007,
+        relationType: "show_when_option_selected"
+      }
+    ]
   }
 }
 
@@ -1156,6 +1187,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.ok(names.includes("qf_apply_audit_record_get"))
     assert.ok(names.includes("qf_field_resolve"))
     assert.ok(names.includes("qf_query_plan"))
+    assert.ok(names.includes("qf_write_plan"))
     assert.ok(names.includes("qf_query"))
     assert.ok(names.includes("qf_records_list"))
     assert.ok(names.includes("qf_records_batch_get"))
@@ -1189,6 +1221,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     expectSchemaProps("qf_users_list", ["page_num", "pageNum", "page_size", "pageSize"])
     expectSchemaProps("qf_user_get", ["user_id", "userId"])
     expectSchemaProps("qf_query_plan", ["tool", "arguments", "resolve_fields", "probe"])
+    expectSchemaProps("qf_write_plan", ["operation", "app_key", "apply_id", "fields", "answers"])
     expectSchemaProps("qf_records_list", ["app_key", "page_size", "select_columns", "filters"])
     expectSchemaProps("qf_record_get", ["apply_id", "select_columns"])
     expectSchemaProps("qf_query", ["query_mode", "app_key", "select_columns", "amount_column"])
@@ -1254,7 +1287,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
 
     const form = await callTool(mcp.client, "qf_form_get", { app_key: APP_KEY })
     assert.equal(form.ok, true)
-    assert.equal(form.data.total_fields, 5)
+    assert.equal(form.data.total_fields, 8)
     const memberField = form.data.field_summaries.find((item) => item.que_id === 1004)
     const departmentField = form.data.field_summaries.find((item) => item.que_id === 1005)
     assert.equal(memberField.write_format.kind, "member_list")
@@ -1632,6 +1665,50 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(planned.ok, true)
     assert.equal(planned.data.ready_for_final_conclusion, true)
     assert.deepEqual(planned.data.final_conclusion_blockers, [])
+  })
+
+  await t.test("qf_write_plan resolves fields and flags linked required risks", async () => {
+    const planned = await callTool(mcp.client, "qf_write_plan", {
+      app_key: APP_KEY,
+      operation: "create",
+      fields: {
+        客户名称: "测试客户",
+        报销类型: [{ optionId: 1, value: "出差" }]
+      }
+    })
+
+    assert.equal(planned.ok, true)
+    assert.equal(planned.data.operation, "create")
+    assert.equal(planned.data.ready_to_submit, false)
+    assert.equal(planned.data.dependencies.question_relations_present, true)
+    assert.equal(planned.data.dependencies.relation_count, 1)
+    assert.ok(planned.data.dependencies.option_links.length > 0)
+    assert.equal(planned.data.dependencies.option_links[0].missing_linked_fields[0].que_id, 1007)
+    assert.equal(planned.data.validation.likely_hidden_required_fields[0].que_id, 1007)
+    assert.ok(
+      planned.data.recommended_next_actions.some((item) =>
+        item.includes("Provide fields linked by the currently selected options")
+      )
+    )
+  })
+
+  await t.test("qf_write_plan flags readonly/system fields and invalid member shape", async () => {
+    const planned = await callTool(mcp.client, "qf_write_plan", {
+      app_key: APP_KEY,
+      operation: "update",
+      apply_id: "5001",
+      fields: {
+        1004: "张三",
+        1008: "2026-01-01"
+      }
+    })
+
+    assert.equal(planned.ok, true)
+    assert.equal(planned.data.validation.valid, false)
+    assert.equal(planned.data.validation.invalid_fields[0].error_code, "FIELD_VALUE_FORMAT_ERROR")
+    assert.equal(planned.data.validation.invalid_fields[0].expected_format.kind, "member_list")
+    assert.equal(planned.data.validation.readonly_or_system_fields[0].que_id, 1008)
+    assert.equal(planned.data.ready_to_submit, false)
   })
 
   await t.test("qf_records_list defaults to compact output profile", async () => {

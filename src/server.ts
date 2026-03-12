@@ -173,7 +173,7 @@ const WAIT_RESULT_DEFAULT_TIMEOUT_MS =
   toPositiveInt(process.env.QINGFLOW_WAIT_RESULT_TIMEOUT_MS) ?? 5000
 const WAIT_RESULT_POLL_INTERVAL_MS =
   toPositiveInt(process.env.QINGFLOW_WAIT_RESULT_POLL_INTERVAL_MS) ?? 500
-const SERVER_VERSION = "0.3.23"
+const SERVER_VERSION = "0.3.24"
 const MEMBER_QUE_TYPE_KEYWORDS = ["member", "user", "成员", "人员"] as const
 const DEPARTMENT_QUE_TYPE_KEYWORDS = ["department", "dept", "部门"] as const
 
@@ -1630,6 +1630,122 @@ const queryPlanOutputSchema = z.object({
   })
 })
 
+const writePlanInputPublicSchema = z.object({
+  operation: z.enum(["create", "update"]).optional(),
+  app_key: publicStringSchema,
+  apply_id: publicFieldSelectorSchema.optional(),
+  user_id: publicStringSchema.optional(),
+  force_refresh_form: z.boolean().optional(),
+  answers: z.array(publicAnswerInputSchema).optional(),
+  fields: z.record(z.unknown()).optional()
+})
+
+const writePlanInputSchema = z.preprocess(
+  normalizeWritePlanInput,
+  z
+    .object({
+      operation: z.enum(["create", "update"]).optional(),
+      app_key: z.string().min(1),
+      apply_id: z.union([z.string().min(1), z.number().int()]).optional(),
+      user_id: z.string().min(1).optional(),
+      force_refresh_form: z.boolean().optional(),
+      answers: z.array(answerInputSchema).optional(),
+      fields: z.record(fieldValueSchema).optional()
+    })
+    .refine((value) => hasWritePayload(value.answers, value.fields), {
+      message: "Either answers or fields is required"
+    })
+)
+
+const writePlanFieldRefSchema = z.object({
+  source: z.enum(["fields", "answers"]),
+  requested: z.string(),
+  resolved: z.boolean(),
+  que_id: z.union([z.string(), z.number(), z.null()]),
+  que_title: z.string().nullable(),
+  que_type: z.unknown().nullable(),
+  required: z.boolean().nullable(),
+  readonly: z.boolean().nullable(),
+  system: z.boolean().nullable(),
+  write_format: fieldSummarySchema.shape.write_format,
+  reason: z.string().nullable()
+})
+
+const writePlanFieldIssueSchema = z.object({
+  que_id: z.union([z.string(), z.number(), z.null()]),
+  que_title: z.string().nullable(),
+  que_type: z.unknown().nullable(),
+  reason: z.string()
+})
+
+const writePlanInvalidFieldSchema = z.object({
+  location: z.string().nullable(),
+  message: z.string(),
+  error_code: z.string().nullable(),
+  field: z
+    .object({
+      que_id: z.union([z.string(), z.number(), z.null()]),
+      que_title: z.string().nullable(),
+      que_type: z.unknown().nullable()
+    })
+    .nullable(),
+  expected_format: fieldSummarySchema.shape.write_format,
+  received_value: z.unknown().optional()
+})
+
+const writePlanOptionLinkSchema = z.object({
+  source_que_id: z.union([z.string(), z.number(), z.null()]),
+  source_que_title: z.string().nullable(),
+  option_id: z.union([z.string(), z.number(), z.null()]),
+  option_value: z.string().nullable(),
+  linked_fields: z.array(
+    z.object({
+      que_id: z.union([z.string(), z.number(), z.null()]),
+      que_title: z.string().nullable(),
+      required: z.boolean().nullable(),
+      provided: z.boolean()
+    })
+  ),
+  missing_linked_fields: z.array(
+    z.object({
+      que_id: z.union([z.string(), z.number(), z.null()]),
+      que_title: z.string().nullable(),
+      required: z.boolean().nullable()
+    })
+  )
+})
+
+const writePlanOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    operation: z.enum(["create", "update"]),
+    app_key: z.string(),
+    apply_id: z.union([z.string(), z.number(), z.null()]),
+    normalized_answers: z.array(z.record(z.unknown())),
+    resolved_fields: z.array(writePlanFieldRefSchema),
+    validation: z.object({
+      valid: z.boolean(),
+      missing_required_fields: z.array(writePlanFieldIssueSchema),
+      likely_hidden_required_fields: z.array(writePlanFieldIssueSchema),
+      readonly_or_system_fields: z.array(writePlanFieldIssueSchema),
+      invalid_fields: z.array(writePlanInvalidFieldSchema),
+      warnings: z.array(z.string())
+    }),
+    dependencies: z.object({
+      question_relations_present: z.boolean(),
+      relation_count: z.number().int().nonnegative(),
+      option_links: z.array(writePlanOptionLinkSchema)
+    }),
+    ready_to_submit: z.boolean(),
+    blockers: z.array(z.string()),
+    recommended_next_actions: z.array(z.string())
+  }),
+  meta: z.object({
+    version: z.string(),
+    generated_at: z.string()
+  })
+})
+
 const batchGetInputPublicSchema = z
   .object({
     app_key: publicStringSchema,
@@ -2610,6 +2726,30 @@ server.registerTool(
       const parsedArgs = queryPlanInputSchema.parse(args)
       const payload = await executeQueryPlan(parsedArgs)
       return okResult(payload, `Planned ${parsedArgs.tool}`)
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_write_plan",
+  {
+    title: "Qingflow Write Plan",
+    description:
+      "Static preflight for create/update payloads. Resolves fields, normalizes answers, checks obvious required/dependency risks, and warns when questionRelations make runtime validation uncertain.",
+    inputSchema: writePlanInputPublicSchema,
+    outputSchema: writePlanOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = writePlanInputSchema.parse(args)
+      const payload = await executeWritePlan(parsedArgs)
+      return okResult(payload, `Planned ${payload.data.operation} for ${parsedArgs.app_key}`)
     } catch (error) {
       return errorResult(error)
     }
@@ -4254,6 +4394,29 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       }
     },
     {
+      tool: "qf_write_plan",
+      required: ["app_key", "answers or fields"],
+      limits: {
+        operation: "create|update (default create; auto-switches to update when apply_id is present)",
+        input_contract: "strict JSON only; answers must be array and fields must be object",
+        capability_boundary:
+          "Static preflight only. Can detect obvious required/dependency risks, but cannot fully execute runtime visibility/validation rules from Qingflow frontend.",
+        special_field_write_formats: {
+          member_list: [{ userId: "u_123", userName: "张三" }],
+          department_list: [{ deptId: 111, deptName: "销售部" }]
+        }
+      },
+      aliases: {},
+      minimal_example: {
+        app_key: "21b3d559",
+        operation: "create",
+        fields: {
+          客户名称: "测试客户",
+          归属销售: [{ userId: "u_123", userName: "张三" }]
+        }
+      }
+    },
+    {
       tool: "qf_records_list",
       required: ["app_key", "select_columns"],
       limits: {
@@ -4673,6 +4836,27 @@ function normalizeQueryPlanInput(raw: unknown): unknown {
     arguments: asObject(parseJsonLikeDeep(normalizedObj.arguments)) ?? normalizedObj.arguments,
     resolve_fields: coerceBooleanLike(normalizedObj.resolve_fields),
     probe: coerceBooleanLike(normalizedObj.probe)
+  }
+}
+
+function normalizeWritePlanInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    ...COMMON_INPUT_ALIASES,
+    applyId: "apply_id",
+    forceRefreshForm: "force_refresh_form",
+    mode: "operation",
+    action: "operation"
+  })
+  return {
+    ...normalizedObj,
+    apply_id: coerceNumberLike(normalizeSelectorInputValue(normalizedObj.apply_id)) ?? coerceStringLike(normalizedObj.apply_id),
+    user_id: coerceStringLike(normalizedObj.user_id),
+    force_refresh_form: coerceBooleanLike(normalizedObj.force_refresh_form)
   }
 }
 
@@ -6915,6 +7099,540 @@ async function executeQueryPlan(
       generated_at: new Date().toISOString()
     }
   }
+}
+
+async function executeWritePlan(
+  args: z.infer<typeof writePlanInputSchema>
+): Promise<z.infer<typeof writePlanOutputSchema>> {
+  const operation = args.operation ?? (args.apply_id !== undefined ? "update" : "create")
+  const form = await getFormCached(args.app_key, args.user_id, Boolean(args.force_refresh_form))
+  const formObj = asObject(form.result)
+  const index = buildFieldIndex(form.result)
+  const fields = Array.from(index.byId.values())
+  const resolvedFields = collectWritePlanFieldRefs({
+    fieldsInput: args.fields,
+    answersInput: args.answers,
+    index
+  })
+
+  const invalidFields: Array<z.infer<typeof writePlanInvalidFieldSchema>> = []
+  const warnings: string[] = []
+  let normalizedAnswers: Record<string, unknown>[] = []
+
+  try {
+    normalizedAnswers = resolveAnswers({
+      explicitAnswers: args.answers,
+      fields: args.fields,
+      form: form.result,
+      tool: "qf_write_plan"
+    })
+  } catch (error) {
+    invalidFields.push(...normalizeWritePlanErrors(error))
+  }
+
+  const providedFieldIds = new Set<string>()
+  for (const ref of resolvedFields) {
+    if (ref.resolved && ref.que_id !== null) {
+      providedFieldIds.add(String(ref.que_id))
+    }
+  }
+  for (const answer of normalizedAnswers) {
+    const queId = answer.queId
+    if (queId !== undefined && queId !== null) {
+      providedFieldIds.add(String(normalizeQueId(queId)))
+    }
+  }
+
+  const questionRelations = asArray(formObj?.questionRelations)
+  const relationReferencedFieldIds = extractRelationReferencedFieldIds(questionRelations)
+  const optionLinks = collectWritePlanOptionLinks({
+    normalizedAnswers,
+    index,
+    providedFieldIds
+  })
+  const optionLinkedMissingIds = new Set<string>()
+  for (const item of optionLinks) {
+    for (const linked of item.missing_linked_fields) {
+      if (linked.que_id !== null) {
+        optionLinkedMissingIds.add(String(linked.que_id))
+      }
+    }
+  }
+
+  const missingRequiredFields: Array<z.infer<typeof writePlanFieldIssueSchema>> = []
+  const likelyHiddenRequiredFields: Array<z.infer<typeof writePlanFieldIssueSchema>> = []
+  const readonlyOrSystemFields: Array<z.infer<typeof writePlanFieldIssueSchema>> = []
+
+  for (const field of fields) {
+    if (field.queId === undefined || field.queId === null) {
+      continue
+    }
+    const queId = normalizeQueId(field.queId)
+    const required = extractFieldRequiredFlag(field)
+    const readonly = extractFieldReadonlyFlag(field)
+    const system = extractFieldSystemFlag(field)
+    const provided = providedFieldIds.has(String(queId))
+
+    if (provided && (readonly === true || system === true)) {
+      readonlyOrSystemFields.push({
+        que_id: queId,
+        que_title: asNullableString(field.queTitle),
+        que_type: field.queType ?? null,
+        reason:
+          readonly === true && system === true
+            ? "field looks readonly and system-managed"
+            : readonly === true
+              ? "field looks readonly"
+              : "field looks system-managed"
+      })
+    }
+
+    if (provided || required !== true) {
+      continue
+    }
+
+    const issue = {
+      que_id: queId,
+      que_title: asNullableString(field.queTitle),
+      que_type: field.queType ?? null,
+      reason: optionLinkedMissingIds.has(String(queId))
+        ? "required field is linked by a selected option but not provided"
+        : relationReferencedFieldIds.has(String(queId))
+          ? "required field participates in questionRelations; it may be runtime-hidden/linked"
+          : "required field not provided"
+    }
+
+    if (
+      optionLinkedMissingIds.has(String(queId)) ||
+      relationReferencedFieldIds.has(String(queId))
+    ) {
+      likelyHiddenRequiredFields.push(issue)
+    } else {
+      missingRequiredFields.push(issue)
+    }
+  }
+
+  if (questionRelations.length > 0) {
+    warnings.push(
+      `form contains ${questionRelations.length} questionRelations; qf_write_plan can only provide static preflight and cannot fully evaluate runtime visibility/required rules`
+    )
+  }
+  if (optionLinks.some((item) => item.missing_linked_fields.length > 0)) {
+    warnings.push("selected options link to additional fields that are not yet provided")
+  }
+  if (normalizedAnswers.length === 0 && invalidFields.length === 0) {
+    warnings.push("no normalized answers were produced from the current payload")
+  }
+
+  const blockers: string[] = []
+  if (invalidFields.length > 0) {
+    blockers.push(`invalid fields: ${invalidFields.map((item) => item.message).join("; ")}`)
+  }
+  if (missingRequiredFields.length > 0) {
+    blockers.push(
+      `missing required fields: ${missingRequiredFields
+        .map((item) => item.que_title ?? String(item.que_id ?? "unknown"))
+        .join(", ")}`
+    )
+  }
+  if (likelyHiddenRequiredFields.length > 0) {
+    blockers.push(
+      `linked or runtime-dependent required fields may still be missing: ${likelyHiddenRequiredFields
+        .map((item) => item.que_title ?? String(item.que_id ?? "unknown"))
+        .join(", ")}`
+    )
+  }
+  if (readonlyOrSystemFields.length > 0) {
+    blockers.push(
+      `payload includes readonly/system fields: ${readonlyOrSystemFields
+        .map((item) => item.que_title ?? String(item.que_id ?? "unknown"))
+        .join(", ")}`
+    )
+  }
+
+  const recommendedNextActions: string[] = [
+    "Use qf_form_get to inspect field_summaries and write_format before final submit."
+  ]
+  if (missingRequiredFields.length > 0 || likelyHiddenRequiredFields.length > 0) {
+    recommendedNextActions.push("Fill missing required fields before calling qf_record_create or qf_record_update.")
+  }
+  if (optionLinks.some((item) => item.missing_linked_fields.length > 0)) {
+    recommendedNextActions.push("Provide fields linked by the currently selected options, or change the option values.")
+  }
+  if (invalidFields.some((item) => item.expected_format?.kind === "member_list")) {
+    recommendedNextActions.push("Use qf_users_list or qf_department_users_list to resolve valid userId values.")
+  }
+  if (invalidFields.some((item) => item.expected_format?.kind === "department_list")) {
+    recommendedNextActions.push("Use qf_departments_list to resolve valid deptId values.")
+  }
+  if (questionRelations.length > 0) {
+    recommendedNextActions.push("Even when ready_to_submit=true, final submit can still fail because runtime questionRelations are not fully evaluable via OpenAPI.")
+  }
+
+  return {
+    ok: true,
+    data: {
+      operation,
+      app_key: args.app_key,
+      apply_id: args.apply_id ?? null,
+      normalized_answers: normalizedAnswers,
+      resolved_fields: resolvedFields,
+      validation: {
+        valid:
+          invalidFields.length === 0 &&
+          missingRequiredFields.length === 0 &&
+          likelyHiddenRequiredFields.length === 0 &&
+          readonlyOrSystemFields.length === 0,
+        missing_required_fields: missingRequiredFields,
+        likely_hidden_required_fields: likelyHiddenRequiredFields,
+        readonly_or_system_fields: readonlyOrSystemFields,
+        invalid_fields: invalidFields,
+        warnings: uniqueStringList(warnings)
+      },
+      dependencies: {
+        question_relations_present: questionRelations.length > 0,
+        relation_count: questionRelations.length,
+        option_links: optionLinks
+      },
+      ready_to_submit:
+        invalidFields.length === 0 &&
+        missingRequiredFields.length === 0 &&
+        likelyHiddenRequiredFields.length === 0 &&
+        readonlyOrSystemFields.length === 0,
+      blockers: uniqueStringList(blockers),
+      recommended_next_actions: uniqueStringList(recommendedNextActions)
+    },
+    meta: {
+      version: SERVER_VERSION,
+      generated_at: new Date().toISOString()
+    }
+  }
+}
+
+function collectWritePlanFieldRefs(params: {
+  fieldsInput?: Record<string, unknown>
+  answersInput?: z.infer<typeof answerInputSchema>[]
+  index: FieldIndex
+}): Array<z.infer<typeof writePlanFieldRefSchema>> {
+  const refs: Array<z.infer<typeof writePlanFieldRefSchema>> = []
+
+  for (const fieldKey of Object.keys(params.fieldsInput ?? {})) {
+    refs.push(
+      resolveWritePlanFieldRef({
+        source: "fields",
+        requested: fieldKey,
+        index: params.index
+      })
+    )
+  }
+
+  for (const item of params.answersInput ?? []) {
+    const requestedRaw = item.que_id ?? item.queId ?? item.que_title ?? item.queTitle
+    if (requestedRaw === undefined || requestedRaw === null) {
+      continue
+    }
+    refs.push(
+      resolveWritePlanFieldRef({
+        source: "answers",
+        requested: String(requestedRaw),
+        index: params.index
+      })
+    )
+  }
+
+  return refs
+}
+
+function resolveWritePlanFieldRef(params: {
+  source: "fields" | "answers"
+  requested: string
+  index: FieldIndex
+}): z.infer<typeof writePlanFieldRefSchema> {
+  const requested = params.requested.trim()
+  let field: FormField | null = null
+  let reason: string | null = null
+
+  if (requested) {
+    if (isNumericKey(requested)) {
+      field = params.index.byId.get(String(Number(requested))) ?? null
+      if (!field) {
+        reason = "field not found in form metadata"
+      }
+    } else {
+      try {
+        field = resolveFieldSelectorStrict({
+          fieldKey: requested,
+          index: params.index,
+          tool: "qf_write_plan",
+          location: `${params.source}.${requested}`
+        })
+      } catch (error) {
+        reason = error instanceof Error ? error.message : String(error)
+      }
+    }
+  }
+
+  return {
+    source: params.source,
+    requested,
+    resolved: Boolean(field && field.queId !== undefined && field.queId !== null),
+    que_id:
+      field?.queId !== undefined && field.queId !== null ? normalizeQueId(field.queId) : null,
+    que_title: asNullableString(field?.queTitle),
+    que_type: field?.queType ?? null,
+    required: field ? extractFieldRequiredFlag(field) : null,
+    readonly: field ? extractFieldReadonlyFlag(field) : null,
+    system: field ? extractFieldSystemFlag(field) : null,
+    write_format: field ? inferFieldWriteFormat(field) : null,
+    reason
+  }
+}
+
+function normalizeWritePlanErrors(error: unknown): Array<z.infer<typeof writePlanInvalidFieldSchema>> {
+  if (error instanceof InputValidationError) {
+    const details = asObject(error.details)
+    const field = asObject(details?.field)
+    return [
+      {
+        location: asNullableString(details?.location),
+        message: error.message,
+        error_code: error.errorCode,
+        field: field
+          ? {
+              que_id: (field.que_id as string | number | null | undefined) ?? null,
+              que_title: asNullableString(field.que_title),
+              que_type: field.que_type ?? null
+            }
+          : null,
+        expected_format:
+          (details?.expected_format as z.infer<typeof fieldSummarySchema>["write_format"]) ?? null,
+        received_value: details?.received_value
+      }
+    ]
+  }
+
+  if (error instanceof z.ZodError) {
+    return error.issues.map((issue) => ({
+      location: issue.path.length > 0 ? issue.path.join(".") : null,
+      message: issue.message,
+      error_code: "INVALID_ARGUMENTS",
+      field: null,
+      expected_format: null,
+      received_value: undefined
+    }))
+  }
+
+  return [
+    {
+      location: null,
+      message: error instanceof Error ? error.message : String(error),
+      error_code: "WRITE_PLAN_ERROR",
+      field: null,
+      expected_format: null,
+      received_value: undefined
+    }
+  ]
+}
+
+function collectWritePlanOptionLinks(params: {
+  normalizedAnswers: Record<string, unknown>[]
+  index: FieldIndex
+  providedFieldIds: Set<string>
+}): Array<z.infer<typeof writePlanOptionLinkSchema>> {
+  const links: Array<z.infer<typeof writePlanOptionLinkSchema>> = []
+
+  for (const answer of params.normalizedAnswers) {
+    const queId = answer.queId
+    if (queId === undefined || queId === null) {
+      continue
+    }
+    const field = params.index.byId.get(String(normalizeQueId(queId)))
+    const fieldObj = asObject(field)
+    const options = asArray(fieldObj?.options)
+    if (options.length === 0) {
+      continue
+    }
+    const selected = collectSelectedOptionKeys(asArray(answer.values))
+    for (const optionRaw of options) {
+      const option = asObject(optionRaw)
+      if (!option) {
+        continue
+      }
+      const optionIdRaw =
+        (option.optId as string | number | null | undefined) ?? option.optionId ?? option.id ?? null
+      const optionId =
+        typeof optionIdRaw === "number" && Number.isFinite(optionIdRaw)
+          ? Math.trunc(optionIdRaw)
+          : (asNullableString(optionIdRaw) ?? null)
+      const optionValue = asNullableString(option.optValue ?? option.value ?? option.label ?? option.name)
+      const isSelected =
+        (optionId !== null && selected.ids.has(String(optionId))) ||
+        (optionValue !== null && selected.values.has(optionValue.trim().toLowerCase()))
+      if (!isSelected) {
+        continue
+      }
+      const linkedFieldIds = uniqueStringList(
+        asArray(option.linkQueIds)
+          .map((item) =>
+            typeof item === "number"
+              ? String(Math.trunc(item))
+              : (asNullableString(item)?.trim() ?? "")
+          )
+          .filter((item) => item.length > 0)
+      )
+      if (linkedFieldIds.length === 0) {
+        continue
+      }
+
+      const linkedFields = linkedFieldIds.map((fieldId) => {
+        const linked =
+          params.index.byId.get(String(Number(fieldId))) ?? params.index.byId.get(fieldId) ?? null
+        return {
+          que_id:
+            linked?.queId !== undefined && linked.queId !== null
+              ? normalizeQueId(linked.queId)
+              : (isNumericKey(fieldId) ? Number(fieldId) : fieldId),
+          que_title: asNullableString(linked?.queTitle),
+          required: linked ? extractFieldRequiredFlag(linked) : null,
+          provided: params.providedFieldIds.has(fieldId) || params.providedFieldIds.has(String(Number(fieldId)))
+        }
+      })
+
+      links.push({
+        source_que_id: normalizeQueId(queId),
+        source_que_title: asNullableString(field?.queTitle),
+        option_id: optionId ?? null,
+        option_value: optionValue,
+        linked_fields: linkedFields,
+        missing_linked_fields: linkedFields
+          .filter((item) => !item.provided)
+          .map((item) => ({
+            que_id: item.que_id,
+            que_title: item.que_title,
+            required: item.required
+          }))
+      })
+    }
+  }
+
+  return links
+}
+
+function collectSelectedOptionKeys(values: unknown[]): {
+  ids: Set<string>
+  values: Set<string>
+} {
+  const ids = new Set<string>()
+  const texts = new Set<string>()
+
+  for (const value of values) {
+    if (value === null || value === undefined) {
+      continue
+    }
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      ids.add(String(value))
+      texts.add(String(value).trim().toLowerCase())
+      continue
+    }
+    const obj = asObject(value)
+    if (!obj) {
+      continue
+    }
+    for (const candidate of [obj.optionId, obj.optId, obj.id]) {
+      if (candidate === undefined || candidate === null) {
+        continue
+      }
+      ids.add(String(candidate))
+    }
+    for (const candidate of [obj.value, obj.dataValue, obj.valueStr, obj.label, obj.name]) {
+      const normalized = asNullableString(candidate)?.trim().toLowerCase()
+      if (normalized) {
+        texts.add(normalized)
+      }
+    }
+  }
+
+  return { ids, values: texts }
+}
+
+function extractRelationReferencedFieldIds(relations: unknown[]): Set<string> {
+  const ids = new Set<string>()
+
+  const visit = (value: unknown, keyHint = ""): void => {
+    if (value === null || value === undefined) {
+      return
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        visit(item, keyHint)
+      }
+      return
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      if (keyHint && /queid|linkqueids/i.test(keyHint)) {
+        ids.add(String(Math.trunc(value)))
+      }
+      return
+    }
+    if (typeof value === "string") {
+      const trimmed = value.trim()
+      if (trimmed && keyHint && /queid|linkqueids/i.test(keyHint)) {
+        ids.add(isNumericKey(trimmed) ? String(Number(trimmed)) : trimmed)
+      }
+      return
+    }
+    const obj = asObject(value)
+    if (!obj) {
+      return
+    }
+    for (const [key, child] of Object.entries(obj)) {
+      visit(child, key)
+    }
+  }
+
+  visit(relations)
+  return ids
+}
+
+function extractFieldRequiredFlag(field: FormField): boolean | null {
+  const obj = asObject(field)
+  if (!obj) {
+    return null
+  }
+  return firstBooleanFromKeys(obj, ["required", "isRequired", "verifyRequired", "mustFill", "must_fill"])
+}
+
+function extractFieldReadonlyFlag(field: FormField): boolean | null {
+  const obj = asObject(field)
+  if (!obj) {
+    return null
+  }
+  const direct = firstBooleanFromKeys(obj, ["readonly", "readOnly", "isReadonly", "isReadOnly"])
+  if (direct !== null) {
+    return direct
+  }
+  const editable = firstBooleanFromKeys(obj, ["editable", "isEditable"])
+  return editable === null ? null : !editable
+}
+
+function extractFieldSystemFlag(field: FormField): boolean | null {
+  const obj = asObject(field)
+  if (!obj) {
+    return null
+  }
+  return firstBooleanFromKeys(obj, ["system", "isSystem", "systemField", "isSystemField"])
+}
+
+function firstBooleanFromKeys(
+  obj: Record<string, unknown>,
+  keys: string[]
+): boolean | null {
+  for (const key of keys) {
+    if (typeof obj[key] === "boolean") {
+      return obj[key] as boolean
+    }
+  }
+  return null
 }
 
 async function executeRecordsBatchGet(

@@ -13,6 +13,7 @@ This MCP server wraps Qingflow OpenAPI for:
 - `qf_form_get`
 - `qf_field_resolve`
 - `qf_query_plan`
+- `qf_write_plan`
 - `qf_records_list`
 - `qf_record_get`
 - `qf_records_batch_get`
@@ -117,7 +118,7 @@ npm i -g git+https://github.com/853046310/qingflow-mcp.git
 Install from npm (pinned version):
 
 ```bash
-npm i -g qingflow-mcp@0.3.23
+npm i -g qingflow-mcp@0.3.24
 ```
 
 Or one-click installer:
@@ -154,8 +155,9 @@ MCP client config example:
 
 1. `qf_apps_list` to pick app.
 2. `qf_form_get` to inspect field ids/titles and `field_summaries[].write_format`.
-3. `qf_record_create` or `qf_record_update`.
-4. If create/update returns only `request_id`, call `qf_operation_get` to resolve async result.
+3. For complex forms, run `qf_write_plan` first to surface static blockers and linked-field risks.
+4. `qf_record_create` or `qf_record_update`.
+5. If create/update returns only `request_id`, call `qf_operation_get` to resolve async result.
 
 Directory / org flow:
 
@@ -182,7 +184,7 @@ Full calling contract (Chinese):
 
 ## Write Format Discovery
 
-For create/update, `0.3.23` now makes special write formats explicit:
+For create/update, `0.3.24` now makes special write formats explicit:
 
 1. `qf_form_get`
    - `field_summaries[].write_format` is populated for member/department fields.
@@ -190,6 +192,10 @@ For create/update, `0.3.23` now makes special write formats explicit:
    - `qf_record_create` / `qf_record_update` include member/department examples in `limits.special_field_write_formats`.
 3. `qf_record_create` / `qf_record_update`
    - invalid member/department values fail fast with `FIELD_VALUE_FORMAT_ERROR`.
+4. `qf_write_plan`
+   - performs static preflight only
+   - detects obvious missing required fields, option-linked fields, readonly/system field writes
+   - warns when `questionRelations` means final submit may still fail
 
 Examples:
 
@@ -216,6 +222,28 @@ Invalid examples that will now fail:
   }
 }
 ```
+
+`qf_write_plan` example:
+
+```json
+{
+  "app_key": "21b3d559",
+  "operation": "create",
+  "fields": {
+    "客户名称": "测试客户",
+    "归属销售": [{ "userId": "u_123", "userName": "张三" }],
+    "报销类型": [{ "optionId": 1, "value": "出差" }]
+  }
+}
+```
+
+Use it when:
+
+1. the form has conditional required fields
+2. selected options may reveal linked fields
+3. you need a static blocker list before actual submit
+
+Do not treat `qf_write_plan` as a guarantee of successful submit. It is a static preflight built from OpenAPI-visible form metadata, not the full Qingflow frontend validation engine.
 
 ## Unified Query (`qf_query`)
 
@@ -466,7 +494,7 @@ If you see runtime errors around `Headers` or missing web APIs:
 2. Upgrade package to latest:
 
 ```bash
-npm i -g qingflow-mcp@0.3.23
+npm i -g qingflow-mcp@0.3.24
 ```
 
 3. Verify runtime:

@@ -1,4 +1,4 @@
-# Qingflow MCP 调用规范（v0.3.23）
+# Qingflow MCP 调用规范（v0.3.24）
 
 本规范用于智能体、前端编排层、后端服务统一接入 `qingflow-mcp`。
 
@@ -332,6 +332,37 @@
 - `ready_for_final_conclusion`（当前计划是否适合直接产出最终结论）
 - `final_conclusion_blockers` / `recommended_next_actions`
 
+## 6.4A `qf_write_plan`
+
+用途：写入前静态预检。读取表单结构、标准化 `fields/answers`、检查明显缺失项、选项联动缺口、只读/系统字段写入风险。
+
+关键入参：
+- 必填：`app_key` + (`answers` 或 `fields`)
+- 可选：`operation(create|update)`, `apply_id`, `user_id`, `force_refresh_form`
+
+返回核心：
+- `normalized_answers`
+- `resolved_fields`
+- `validation.missing_required_fields`
+- `validation.likely_hidden_required_fields`
+- `validation.readonly_or_system_fields`
+- `validation.invalid_fields`
+- `dependencies.question_relations_present`
+- `dependencies.option_links`
+- `ready_to_submit`
+- `blockers`
+- `recommended_next_actions`
+
+边界说明：
+- `qf_write_plan` 只做静态预检，不真正提交
+- 它可以发现：
+  - 明显缺失的必填字段
+  - 当前选项会联动出的字段
+  - 成员/部门字段 shape 错误
+  - 只读/系统字段被误写
+- 它不能完整执行轻流前端的运行时联动/隐藏/公式校验
+- 所以 `ready_to_submit=true` 也不等于最终一定提交成功
+
 ## 6.5 `qf_records_list`
 
 用途：多条记录列表查询（推荐用于数据拉取）。
@@ -459,10 +490,11 @@
 
 推荐流程：
 1. 先 `qf_form_get` 读取字段 `write_format`
-2. 成员字段如需找 `userId`：
+2. 复杂表单先 `qf_write_plan`
+3. 成员字段如需找 `userId`：
    - `qf_users_list`
    - 或 `qf_department_users_list`
-3. 部门字段如需找 `deptId`：
+4. 部门字段如需找 `deptId`：
    - `qf_departments_list`
 
 ## 7. 错误协议
@@ -488,7 +520,7 @@
 
 ## 8. 当前未公开能力
 
-以下接口在 `0.3.23` 中明确不公开为 MCP 工具：
+以下接口在 `0.3.24` 中明确不公开为 MCP 工具：
 
 - `GET /accessToken`
 - 应用/应用包创建、更新、删除
@@ -503,12 +535,13 @@
 ## 8. 推荐调用流程
 
 1. 用 `qf_form_get` 获取字段映射；写入前先看 `field_summaries[].write_format`。
-2. 用 `qf_records_list` 或 `qf_query(list)` 拉列表（带 `select_columns`）。
-3. 若需要跨页全量统计：
+2. 复杂写入先调用 `qf_write_plan`，看 `blockers` / `ready_to_submit` / `option_links`。
+3. 用 `qf_records_list` 或 `qf_query(list)` 拉列表（带 `select_columns`）。
+4. 若需要跨页全量统计：
    - 首选 `qf_records_aggregate` 或 `qf_query(summary)`
    - 开启 `strict_full=true`
-4. 若返回 `NEED_MORE_DATA`：按 `raw_next_page_token`（兼容旧字段 `next_page_token`）继续调用直到 `raw_scan_complete=true`。
-5. 只要出现以下任一条件，就禁止输出“完整分析”：
+5. 若返回 `NEED_MORE_DATA`：按 `raw_next_page_token`（兼容旧字段 `next_page_token`）继续调用直到 `raw_scan_complete=true`。
+6. 只要出现以下任一条件，就禁止输出“完整分析”：
    - `is_complete=false`
    - `raw_scan_complete=false`
    - `scan_limit_hit=true`
