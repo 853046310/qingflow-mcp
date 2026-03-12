@@ -66,6 +66,112 @@ export class QingflowClient {
     })
   }
 
+  listAppsInfo(options: { appKey?: string; pageNum: number; pageSize: number }) {
+    return this.request<{
+      apps?: unknown[]
+      pageNum?: number
+      pageSize?: number
+      pageAmount?: number
+      resultAmount?: number
+    }>({
+      method: "GET",
+      path: "/apps",
+      options: {
+        query: {
+          appKey: options.appKey,
+          pageNum: options.pageNum,
+          pageSize: options.pageSize
+        }
+      }
+    })
+  }
+
+  listAppPackages(options: { userId: string }) {
+    return this.request<{
+      tagList?: unknown[]
+    }>({
+      method: "GET",
+      path: "/tags",
+      options: {
+        query: {
+          userId: options.userId
+        }
+      }
+    })
+  }
+
+  listApplyAuditRecords(applyId: string) {
+    return this.request<unknown>({
+      method: "GET",
+      path: `/apply/${encodeURIComponent(applyId)}/auditRecord`
+    })
+  }
+
+  getApplyAuditRecord(applyId: string, auditRcdId: string) {
+    return this.request<unknown>({
+      method: "GET",
+      path: `/apply/${encodeURIComponent(applyId)}/auditRecord/${encodeURIComponent(auditRcdId)}`
+    })
+  }
+
+  listDepartments(options: { deptId?: string | number } = {}) {
+    return this.request<{
+      department?: unknown[]
+    }>({
+      method: "GET",
+      path: "/department",
+      options: {
+        query: {
+          deptId:
+            options.deptId !== undefined && options.deptId !== null
+              ? String(options.deptId)
+              : undefined
+        }
+      }
+    })
+  }
+
+  listDepartmentUsers(deptId: string, options: { fetchChild: boolean }) {
+    return this.request<{
+      leaderIds?: unknown[]
+      userList?: unknown[]
+    }>({
+      method: "GET",
+      path: `/department/${encodeURIComponent(deptId)}/user`,
+      options: {
+        query: {
+          fetchChild: options.fetchChild
+        }
+      }
+    })
+  }
+
+  listUsers(options: { pageNum: number; pageSize: number }) {
+    return this.request<{
+      pageSize?: number
+      pageNum?: number
+      resultAmount?: number
+      pageAmount?: number
+      result?: unknown[]
+    }>({
+      method: "GET",
+      path: "/user",
+      options: {
+        query: {
+          pageNum: options.pageNum,
+          pageSize: options.pageSize
+        }
+      }
+    })
+  }
+
+  getUser(userId: string) {
+    return this.request<unknown>({
+      method: "GET",
+      path: `/user/${encodeURIComponent(userId)}`
+    })
+  }
+
   getForm(appKey: string, options: { userId?: string } = {}) {
     return this.request<{
       questionBaseInfos?: unknown[]

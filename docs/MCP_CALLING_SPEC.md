@@ -1,4 +1,4 @@
-# Qingflow MCP 调用规范（v0.3.x）
+# Qingflow MCP 调用规范（v0.3.23）
 
 本规范用于智能体、前端编排层、后端服务统一接入 `qingflow-mcp`。
 
@@ -100,6 +100,178 @@
 关键入参：
 - 可选：`keyword`, `limit`, `offset`, `favourite`, `user_id`
 
+## 6.1A 部门与成员工具
+
+### `qf_departments_list`
+
+用途：列出部门，可选按 `dept_id` 读取单个部门/子树上下文。
+
+关键入参：
+- 可选：`dept_id`, `keyword`, `limit`, `offset`
+
+支持 alias：
+- `deptId`
+- `department_id`
+- `departmentId`
+
+返回核心：
+- `total_departments`
+- `returned_departments`
+- `dept_id_filter`
+- `departments[]`
+
+### `qf_department_users_list`
+
+用途：读取某部门成员，可选递归包含子部门成员。
+
+关键入参：
+- 必填：`dept_id`, `fetch_child`
+- 可选：`keyword`, `limit`, `offset`
+
+支持 alias：
+- `deptId`
+- `department_id`
+- `departmentId`
+- `fetchChild`
+
+返回核心：
+- `dept_id`
+- `fetch_child`
+- `leader_ids`
+- `total_users`
+- `returned_users`
+- `users[]`
+
+### `qf_users_list`
+
+用途：分页读取工作区全部成员。
+
+关键入参：
+- 必填：`page_num`, `page_size`
+
+支持 alias：
+- `pageNum`
+- `pageSize`
+
+返回核心：
+- `pagination.page_num`
+- `pagination.page_size`
+- `pagination.page_amount`
+- `pagination.result_amount`
+- `users[]`
+
+### `qf_user_get`
+
+用途：读取单个成员。
+
+关键入参：
+- 必填：`user_id`
+
+支持 alias：
+- `userId`
+
+常见错误：
+- `DEPARTMENT_NOT_FOUND`
+- `USER_NOT_FOUND`
+- `MISSING_REQUIRED_FIELD`
+
+## 6.1B 应用管理只读工具
+
+### `qf_apps_info_list`
+
+用途：分页读取应用的管理员视角基础信息。
+
+关键入参：
+- 必填：`page_num`, `page_size`
+- 可选：`app_key`
+
+支持 alias：
+- `pageNum`
+- `pageSize`
+- `appKey`
+
+返回核心：
+- `pagination.page_num`
+- `pagination.page_size`
+- `pagination.page_amount`
+- `pagination.result_amount`
+- `apps[]`
+
+### `qf_app_info_get`
+
+用途：按 `app_key` 精确读取单个应用详情。
+
+关键入参：
+- 必填：`app_key`
+
+支持 alias：
+- `appKey`
+
+常见错误：
+- `APP_NOT_FOUND`
+- `MISSING_REQUIRED_FIELD`
+
+### `qf_app_packages_list`
+
+用途：读取某用户视角下可见的工作区应用包信息。
+
+关键入参：
+- 必填：`user_id`
+- 可选：`tag_id`, `keyword`, `limit`, `offset`
+
+支持 alias：
+- `userId`
+- `tagId`
+
+返回核心：
+- `user_id`
+- `tag_id_filter`
+- `total_packages`
+- `returned_packages`
+- `packages[]`
+
+常见错误：
+- `APP_PACKAGE_NOT_FOUND`
+- `MISSING_REQUIRED_FIELD`
+
+## 6.1C 流程日志只读工具
+
+### `qf_apply_audit_records_list`
+
+用途：读取单条数据的流程日志摘要与当前待处理节点信息。
+
+关键入参：
+- 必填：`apply_id`
+
+支持 alias：
+- `applyId`
+
+返回核心：
+- `apply_status`
+- `audit_records[]`
+- `current_nodes[]`
+
+### `qf_apply_audit_record_get`
+
+用途：读取某条流程日志的字段修改详情。
+
+关键入参：
+- 必填：`apply_id`, `audit_rcd_id`
+
+支持 alias：
+- `applyId`
+- `auditRcdId`
+
+返回核心：
+- `apply_id`
+- `audit_rcd_id`
+- `modifies[]`
+
+常见错误：
+- `APPLY_NOT_FOUND`
+- `AUDIT_RECORD_NOT_FOUND`
+- `MISSING_REQUIRED_FIELD`
+
 ## 6.2 `qf_form_get`
 
 用途：读取应用表单字段元数据（用于字段映射）。
@@ -107,6 +279,24 @@
 关键入参：
 - 必填：`app_key`
 - 可选：`include_raw`, `force_refresh`, `user_id`
+
+关键返回：
+- `field_summaries[].que_id`
+- `field_summaries[].que_title`
+- `field_summaries[].que_type`
+- `field_summaries[].write_format`
+
+写入格式发现：
+- 成员字段会返回：
+  - `write_format.kind = "member_list"`
+  - `write_format.example = [{"userId":"u_123","userName":"张三"}]`
+- 部门字段会返回：
+  - `write_format.kind = "department_list"`
+  - `write_format.example = [{"deptId":111,"deptName":"销售部"}]`
+
+说明：
+- 对普通字段，`write_format = null`
+- 智能体写入前应优先读取 `write_format`，不要猜成员/部门字段 payload shape
 
 ## 6.3 `qf_field_resolve`
 
@@ -209,7 +399,7 @@
 各模式关键要求：
 - `list`：必填 `app_key`, `select_columns`
 - `record`：必填 `apply_id`, `select_columns`
-- `summary`：必填 `app_key`, `select_columns`
+- `summary`：必填 `app_key`；`select_columns` 可省略，MCP 会根据 `amount_column` / `time_range` 自动推断预览列
 
 说明：
 - `list` 模式中 `time_range` 会自动下推为筛选条件。
@@ -243,6 +433,38 @@
 - create/update 支持 `answers` 与 `fields` 两种写法
 - 若返回 `request_id`，通过 `qf_operation_get` 查询最终状态
 
+成员/部门字段写法：
+- 成员字段：
+```json
+{
+  "values": [
+    { "userId": "u_123", "userName": "张三" }
+  ]
+}
+```
+- 部门字段：
+```json
+{
+  "values": [
+    { "deptId": 111, "deptName": "销售部" }
+  ]
+}
+```
+
+错误写法（会失败）：
+- `"张三"`
+- `"销售部"`
+- `{ "user_id": "u_123" }`
+- `{ "dept_id": 111 }`
+
+推荐流程：
+1. 先 `qf_form_get` 读取字段 `write_format`
+2. 成员字段如需找 `userId`：
+   - `qf_users_list`
+   - 或 `qf_department_users_list`
+3. 部门字段如需找 `deptId`：
+   - `qf_departments_list`
+
 ## 7. 错误协议
 
 失败统一为 JSON（在 MCP `isError=true` 文本里）：
@@ -253,17 +475,34 @@
   - `message`
   - `fix_hint`
   - 可选 `err_code`, `err_msg`, `http_status`, `details`, `next_page_token`
+- 写入格式错误：
+  - `error_code="FIELD_VALUE_FORMAT_ERROR"`
+  - `details.expected_format`
+  - `details.field`
+  - `details.received_value`
 - 不完整失败（严格模式）：
   - `code="NEED_MORE_DATA"`
   - `status="need_more_data"`
   - `error_code="NEED_MORE_DATA"`
   - `fix_hint` 提示续拉方式
+
+## 8. 当前未公开能力
+
+以下接口在 `0.3.23` 中明确不公开为 MCP 工具：
+
+- `GET /accessToken`
+- 应用/应用包创建、更新、删除
+- 流程处理、催办、回退、重新指派
+
+说明：
+- 这些接口要么涉及凭证发放，要么属于高风险写操作。
+- 本期只公开只读能力，降低 agent 误调用风险。
   - `details.completeness`
   - `details.evidence`
 
 ## 8. 推荐调用流程
 
-1. 用 `qf_form_get` 获取字段映射。
+1. 用 `qf_form_get` 获取字段映射；写入前先看 `field_summaries[].write_format`。
 2. 用 `qf_records_list` 或 `qf_query(list)` 拉列表（带 `select_columns`）。
 3. 若需要跨页全量统计：
    - 首选 `qf_records_aggregate` 或 `qf_query(summary)`

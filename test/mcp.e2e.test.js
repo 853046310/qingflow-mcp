@@ -19,13 +19,251 @@ const execFileAsync = promisify(execFile)
 
 const ACCESS_TOKEN = "test-token"
 const APP_KEY = "app_demo"
+const BIG_APPLY_ID = "499569877794004993"
+const BIG_RECORD = makeRecord({ applyId: BIG_APPLY_ID, customer: "大ID客户", amount: 888, day: "2026-01-04" })
+
+const DEPARTMENTS = [
+  {
+    deptId: 1,
+    name: "总部",
+    parentId: null,
+    ordinal: 1,
+    deptLeader: ["u_admin"]
+  },
+  {
+    deptId: 111,
+    name: "销售部",
+    parentId: 1,
+    ordinal: 2,
+    deptLeader: ["u_1", "u_2"]
+  },
+  {
+    deptId: 112,
+    name: "销售支持",
+    parentId: 111,
+    ordinal: 1,
+    deptLeader: ["u_2"]
+  },
+  {
+    deptId: 210,
+    name: "研发部",
+    parentId: 1,
+    ordinal: 3,
+    deptLeader: ["u_9"]
+  }
+]
+
+const DIRECTORY_USERS = [
+  {
+    userId: "u_admin",
+    name: "管理员",
+    areaCode: "86",
+    mobileNum: "13800000001",
+    email: "admin@example.com",
+    headImg: "https://img.example.com/admin.png",
+    department: ["1"],
+    role: ["r_admin"],
+    customRole: [],
+    customDepartment: [],
+    beingDisabled: false,
+    beingActive: true,
+    superiorId: null
+  },
+  {
+    userId: "u_1",
+    name: "张三",
+    areaCode: "86",
+    mobileNum: "13800000002",
+    email: "zhangsan@example.com",
+    headImg: "https://img.example.com/u1.png",
+    department: ["111"],
+    role: ["sales"],
+    customRole: ["custom_sales"],
+    customDepartment: ["111"],
+    beingDisabled: false,
+    beingActive: true,
+    superiorId: "u_admin"
+  },
+  {
+    userId: "u_2",
+    name: "李四",
+    areaCode: "86",
+    mobileNum: "13800000003",
+    email: "lisi@example.com",
+    headImg: "https://img.example.com/u2.png",
+    department: ["111", "112"],
+    role: ["sales_manager"],
+    customRole: [],
+    customDepartment: ["112"],
+    beingDisabled: false,
+    beingActive: true,
+    superiorId: "u_admin"
+  },
+  {
+    userId: "u_3",
+    name: "赵六",
+    areaCode: "86",
+    mobileNum: "13800000004",
+    email: "zhaoliu@example.com",
+    headImg: "https://img.example.com/u3.png",
+    department: ["112"],
+    role: ["sales_support"],
+    customRole: [],
+    customDepartment: ["112"],
+    beingDisabled: false,
+    beingActive: true,
+    superiorId: "u_2"
+  },
+  {
+    userId: "u_9",
+    name: "王五",
+    areaCode: "86",
+    mobileNum: "13800000009",
+    email: "wangwu@example.com",
+    headImg: "https://img.example.com/u9.png",
+    department: ["210"],
+    role: ["rd"],
+    customRole: [],
+    customDepartment: [],
+    beingDisabled: false,
+    beingActive: true,
+    superiorId: "u_admin"
+  }
+]
+
+const APP_INFO_ITEMS = [
+  {
+    appKey: APP_KEY,
+    appName: "Demo Sales",
+    appAuth: 1,
+    appIcon: "icon-sales",
+    authmembers: {
+      users: [{ userId: "u_1", userName: "张三" }],
+      depts: [{ deptId: 111, deptName: "销售部" }],
+      roles: [{ roleId: 10, roleName: "销售经理" }]
+    },
+    creator: {
+      userId: "u_admin",
+      nickName: "管理员",
+      headImg: "https://img.example.com/admin.png"
+    },
+    createTime: "2024-01-01 10:00:00",
+    tags: [{ tagId: 1001, tagName: "销售应用包" }],
+    appPublishStatus: 1
+  },
+  {
+    appKey: "app_rd",
+    appName: "研发日报",
+    appAuth: 2,
+    appIcon: "icon-rd",
+    authmembers: {
+      users: [{ userId: "u_9", userName: "王五" }],
+      depts: [{ deptId: 210, deptName: "研发部" }],
+      roles: [{ roleId: 20, roleName: "研发经理" }]
+    },
+    creator: {
+      userId: "u_9",
+      nickName: "王五",
+      headImg: "https://img.example.com/u9.png"
+    },
+    createTime: "2024-01-02 10:00:00",
+    tags: [{ tagId: 1002, tagName: "研发应用包" }],
+    appPublishStatus: 2
+  }
+]
+
+const APP_PACKAGE_LIST = [
+  {
+    tagId: 1001,
+    tagName: "销售应用包",
+    tagIcon: "icon-tag-sales",
+    appList: [
+      { appKey: APP_KEY, appName: "Demo Sales" },
+      { appKey: "app_quote", appName: "报价系统" }
+    ],
+    dashList: [{ dashKey: "dash_sales", dashName: "销售总览" }]
+  },
+  {
+    tagId: 1002,
+    tagName: "研发应用包",
+    tagIcon: "icon-tag-rd",
+    appList: [{ appKey: "app_rd", appName: "研发日报" }],
+    dashList: [{ dashKey: "dash_rd", dashName: "研发看板" }]
+  }
+]
+
+const APPLY_AUDIT_RECORDS = {
+  "5001": {
+    applyStatus: { value: 1, label: "processing" },
+    auditRecords: [
+      {
+        auditRcdId: 1111,
+        auditNodeId: 1,
+        auditNodeName: "直属主管审批",
+        auditTime: 1534482649832,
+        auditResult: { value: "pass", label: "通过" },
+        auditFeedback: "同意",
+        auditUser: {
+          userId: "u_1",
+          userName: "张三",
+          nickName: "张三",
+          headImg: "https://img.example.com/u1.png"
+        },
+        waitAuditUserList: [
+          {
+            userId: "u_2",
+            userName: "李四",
+            nickName: "李四",
+            headImg: "https://img.example.com/u2.png"
+          }
+        ]
+      }
+    ],
+    currentNodes: [
+      {
+        auditRcdId: null,
+        auditNodeId: 2,
+        auditNodeName: "财务审批",
+        auditTime: null,
+        auditResult: null,
+        auditFeedback: null,
+        auditUser: null,
+        waitAuditUserList: [
+          {
+            userId: "u_3",
+            userName: "赵六",
+            nickName: "赵六",
+            headImg: "https://img.example.com/u3.png"
+          }
+        ]
+      }
+    ]
+  }
+}
+
+const APPLY_AUDIT_RECORD_DETAILS = {
+  "5001:1111": {
+    auditRcdId: 1111,
+    auditModifies: {
+      first: {
+        queId: 876,
+        queTitle: "单行文字",
+        queType: { code: 2, name: "text" },
+        beforeAnswer: ["旧值"],
+        afterAnswer: ["新值"]
+      }
+    }
+  }
+}
 
 function buildForm() {
   return {
     questionBaseInfos: [
       { queId: 1001, queTitle: "客户名称", queType: 2, subQuestionBaseInfos: [] },
       { queId: 1002, queTitle: "金额", queType: 6, subQuestionBaseInfos: [] },
-      { queId: 1003, queTitle: "下单日期", queType: 4, subQuestionBaseInfos: [] }
+      { queId: 1003, queTitle: "下单日期", queType: 4, subQuestionBaseInfos: [] },
+      { queId: 1004, queTitle: "归属销售", queType: { code: 18, name: "member" }, subQuestionBaseInfos: [] },
+      { queId: 1005, queTitle: "归属部门", queType: { code: 19, name: "department" }, subQuestionBaseInfos: [] }
     ],
     questionRelations: []
   }
@@ -201,6 +439,9 @@ function handleFilter(state, body) {
 
   const applyIds = Array.isArray(body.applyIds) ? new Set(body.applyIds.map((item) => String(item))) : null
   if (applyIds && applyIds.size > 0) {
+    if (applyIds.has(BIG_APPLY_ID)) {
+      items.push(clone(BIG_RECORD))
+    }
     items = items.filter((record) => applyIds.has(String(record.applyId)))
   }
 
@@ -346,6 +587,195 @@ async function startMockQingflowServer() {
       return
     }
 
+    if (method === "GET" && pathname === "/apps") {
+      const appKey = url.searchParams.get("appKey")
+      const pageNum = normalizeQueId(url.searchParams.get("pageNum")) ?? 1
+      const pageSize = normalizeQueId(url.searchParams.get("pageSize")) ?? 50
+      let apps = APP_INFO_ITEMS.map((item) => clone(item))
+      if (appKey) {
+        apps = apps.filter((item) => item.appKey === appKey)
+      }
+      const pageAmount = apps.length > 0 ? Math.ceil(apps.length / pageSize) : 0
+      const start = (pageNum - 1) * pageSize
+      const pageItems = apps.slice(start, start + pageSize)
+      sendJson(res, {
+        errCode: 0,
+        errMsg: "ok",
+        result: {
+          pageNum,
+          pageSize,
+          pageAmount,
+          resultAmount: apps.length,
+          apps: pageItems
+        }
+      })
+      return
+    }
+
+    if (method === "GET" && pathname === "/tags") {
+      const userId = url.searchParams.get("userId")
+      if (!userId) {
+        sendJson(res, { errCode: 400, errMsg: "missing userId", result: null })
+        return
+      }
+      sendJson(res, {
+        errCode: 0,
+        errMsg: "ok",
+        result: {
+          tagList: APP_PACKAGE_LIST.map((item) => clone(item))
+        }
+      })
+      return
+    }
+
+    const auditRecordDetailMatch = pathname.match(/^\/apply\/([^/]+)\/auditRecord\/([^/]+)$/)
+    if (method === "GET" && auditRecordDetailMatch) {
+      const applyId = decodeURIComponent(auditRecordDetailMatch[1])
+      const auditRcdId = decodeURIComponent(auditRecordDetailMatch[2])
+      const detail = APPLY_AUDIT_RECORD_DETAILS[`${applyId}:${auditRcdId}`]
+      if (!detail) {
+        sendJson(res, { errCode: 404, errMsg: "audit record not found", result: null })
+        return
+      }
+      sendJson(res, {
+        errCode: 0,
+        errMsg: "ok",
+        result: clone(detail)
+      })
+      return
+    }
+
+    const auditRecordsMatch = pathname.match(/^\/apply\/([^/]+)\/auditRecord$/)
+    if (method === "GET" && auditRecordsMatch) {
+      const applyId = decodeURIComponent(auditRecordsMatch[1])
+      const detail = APPLY_AUDIT_RECORDS[applyId]
+      if (!detail) {
+        sendJson(res, { errCode: 404, errMsg: "apply not found", result: null })
+        return
+      }
+      sendJson(res, {
+        errCode: 0,
+        errMsg: "ok",
+        result: clone(detail)
+      })
+      return
+    }
+
+    if (method === "GET" && pathname === "/department") {
+      const deptId = normalizeQueId(url.searchParams.get("deptId"))
+      if (url.searchParams.has("deptId") && deptId === null) {
+        sendJson(res, { errCode: 404, errMsg: "department not found", result: null })
+        return
+      }
+
+      let departments = DEPARTMENTS.map((item) => clone(item))
+      if (deptId !== null) {
+        const root = DEPARTMENTS.find((item) => item.deptId === deptId)
+        if (!root) {
+          sendJson(res, { errCode: 404, errMsg: "department not found", result: null })
+          return
+        }
+
+        const included = new Set([deptId])
+        let changed = true
+        while (changed) {
+          changed = false
+          for (const item of DEPARTMENTS) {
+            if (item.parentId !== null && included.has(item.parentId) && !included.has(item.deptId)) {
+              included.add(item.deptId)
+              changed = true
+            }
+          }
+        }
+        departments = departments.filter((item) => included.has(item.deptId))
+      }
+
+      sendJson(res, {
+        errCode: 0,
+        errMsg: "ok",
+        result: {
+          department: departments
+        }
+      })
+      return
+    }
+
+    const departmentUsersMatch = pathname.match(/^\/department\/([^/]+)\/user$/)
+    if (method === "GET" && departmentUsersMatch) {
+      const deptId = decodeURIComponent(departmentUsersMatch[1])
+      const numericDeptId = normalizeQueId(deptId)
+      const fetchChild = url.searchParams.get("fetchChild") === "true"
+      const root = DEPARTMENTS.find((item) => String(item.deptId) === String(numericDeptId ?? deptId))
+      if (!root) {
+        sendJson(res, { errCode: 404, errMsg: "department not found", result: null })
+        return
+      }
+
+      const included = new Set([String(root.deptId)])
+      if (fetchChild) {
+        let changed = true
+        while (changed) {
+          changed = false
+          for (const item of DEPARTMENTS) {
+            if (item.parentId !== null && included.has(String(item.parentId)) && !included.has(String(item.deptId))) {
+              included.add(String(item.deptId))
+              changed = true
+            }
+          }
+        }
+      }
+
+      const userList = DIRECTORY_USERS.filter((user) =>
+        (Array.isArray(user.department) ? user.department : []).some((id) => included.has(String(id)))
+      )
+
+      sendJson(res, {
+        errCode: 0,
+        errMsg: "ok",
+        result: {
+          leaderIds: Array.isArray(root.deptLeader) ? root.deptLeader : [],
+          userList: userList.map((item) => clone(item))
+        }
+      })
+      return
+    }
+
+    if (method === "GET" && pathname === "/user") {
+      const pageNum = normalizeQueId(url.searchParams.get("pageNum")) ?? 1
+      const pageSize = normalizeQueId(url.searchParams.get("pageSize")) ?? 50
+      const pageAmount = DIRECTORY_USERS.length > 0 ? Math.ceil(DIRECTORY_USERS.length / pageSize) : 0
+      const start = (pageNum - 1) * pageSize
+      const pageItems = DIRECTORY_USERS.slice(start, start + pageSize).map((item) => clone(item))
+      sendJson(res, {
+        errCode: 0,
+        errMsg: "ok",
+        result: {
+          pageSize,
+          pageNum,
+          resultAmount: DIRECTORY_USERS.length,
+          pageAmount,
+          result: pageItems
+        }
+      })
+      return
+    }
+
+    const userMatch = pathname.match(/^\/user\/([^/]+)$/)
+    if (method === "GET" && userMatch) {
+      const userId = decodeURIComponent(userMatch[1])
+      const user = DIRECTORY_USERS.find((item) => item.userId === userId)
+      if (!user) {
+        sendJson(res, { errCode: 404, errMsg: "user not found", result: null })
+        return
+      }
+      sendJson(res, {
+        errCode: 0,
+        errMsg: "ok",
+        result: clone(user)
+      })
+      return
+    }
+
     const formMatch = pathname.match(/^\/app\/([^/]+)\/form$/)
     if (method === "GET" && formMatch) {
       const appKey = decodeURIComponent(formMatch[1])
@@ -420,6 +850,10 @@ async function startMockQingflowServer() {
     const applyMatch = pathname.match(/^\/apply\/([^/]+)$/)
     if (applyMatch && method === "GET") {
       const applyId = decodeURIComponent(applyMatch[1])
+      if (applyId === "5002" || applyId === BIG_APPLY_ID) {
+        sendJson(res, { errCode: 49304, errMsg: "record get unsupported", result: null })
+        return
+      }
       const record = state.records.find((item) => String(item.applyId) === String(applyId))
       if (!record) {
         sendJson(res, { errCode: 404, errMsg: "record not found", result: null })
@@ -711,6 +1145,15 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     const tools = await mcp.client.listTools()
     const names = tools.tools.map((item) => item.name)
     assert.ok(names.includes("qf_tool_spec_get"))
+    assert.ok(names.includes("qf_departments_list"))
+    assert.ok(names.includes("qf_department_users_list"))
+    assert.ok(names.includes("qf_users_list"))
+    assert.ok(names.includes("qf_user_get"))
+    assert.ok(names.includes("qf_apps_info_list"))
+    assert.ok(names.includes("qf_app_info_get"))
+    assert.ok(names.includes("qf_app_packages_list"))
+    assert.ok(names.includes("qf_apply_audit_records_list"))
+    assert.ok(names.includes("qf_apply_audit_record_get"))
     assert.ok(names.includes("qf_field_resolve"))
     assert.ok(names.includes("qf_query_plan"))
     assert.ok(names.includes("qf_query"))
@@ -736,6 +1179,15 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     }
 
     expectSchemaProps("qf_tool_spec_get", ["tool_name", "include_all"])
+    expectSchemaProps("qf_apps_info_list", ["page_num", "pageNum", "page_size", "pageSize", "app_key", "appKey"])
+    expectSchemaProps("qf_app_info_get", ["app_key", "appKey"])
+    expectSchemaProps("qf_app_packages_list", ["user_id", "userId", "tag_id", "tagId"])
+    expectSchemaProps("qf_apply_audit_records_list", ["apply_id", "applyId"])
+    expectSchemaProps("qf_apply_audit_record_get", ["apply_id", "applyId", "audit_rcd_id", "auditRcdId"])
+    expectSchemaProps("qf_departments_list", ["dept_id", "deptId", "department_id", "departmentId"])
+    expectSchemaProps("qf_department_users_list", ["dept_id", "fetch_child", "fetchChild"])
+    expectSchemaProps("qf_users_list", ["page_num", "pageNum", "page_size", "pageSize"])
+    expectSchemaProps("qf_user_get", ["user_id", "userId"])
     expectSchemaProps("qf_query_plan", ["tool", "arguments", "resolve_fields", "probe"])
     expectSchemaProps("qf_records_list", ["app_key", "page_size", "select_columns", "filters"])
     expectSchemaProps("qf_record_get", ["apply_id", "select_columns"])
@@ -761,7 +1213,11 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(aggregateSchema.properties.time_range.type, "object")
     assert.ok(Array.isArray(aggregateSchema.required))
     assert.ok(aggregateSchema.required.includes("app_key"))
-    assert.ok(aggregateSchema.required.includes("group_by"))
+
+    const departmentUsersSchema = byName.get("qf_department_users_list").inputSchema
+    assert.equal(departmentUsersSchema.additionalProperties, false)
+    assert.equal(departmentUsersSchema.properties.fetch_child.type, "boolean")
+    assert.equal(departmentUsersSchema.properties.fetchChild.type, "boolean")
   })
 
   await t.test("cli mode can list tools and call one tool", async () => {
@@ -770,6 +1226,10 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     const tools = JSON.parse(listed.stdout)
     const names = tools.map((item) => item.name)
     assert.ok(names.includes("qf_tool_spec_get"))
+    assert.ok(names.includes("qf_apps_info_list"))
+    assert.ok(names.includes("qf_apply_audit_record_get"))
+    assert.ok(names.includes("qf_departments_list"))
+    assert.ok(names.includes("qf_users_list"))
     assert.ok(names.includes("qf_query"))
     assert.ok(names.includes("qf_records_aggregate"))
 
@@ -794,7 +1254,228 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
 
     const form = await callTool(mcp.client, "qf_form_get", { app_key: APP_KEY })
     assert.equal(form.ok, true)
-    assert.equal(form.data.total_fields, 3)
+    assert.equal(form.data.total_fields, 5)
+    const memberField = form.data.field_summaries.find((item) => item.que_id === 1004)
+    const departmentField = form.data.field_summaries.find((item) => item.que_id === 1005)
+    assert.equal(memberField.write_format.kind, "member_list")
+    assert.equal(memberField.write_format.example[0].userId, "u_123")
+    assert.equal(departmentField.write_format.kind, "department_list")
+    assert.equal(departmentField.write_format.example[0].deptId, 111)
+  })
+
+  await t.test("app info and audit tools spec + behaviors", async () => {
+    const appInfoSpec = await callTool(mcp.client, "qf_tool_spec_get", {
+      tool_name: "qf_apps_info_list"
+    })
+    assert.equal(appInfoSpec.ok, true)
+    assert.equal(appInfoSpec.data.tools[0].tool, "qf_apps_info_list")
+    assert.deepEqual(appInfoSpec.data.tools[0].aliases.page_num, ["pageNum"])
+
+    const appsInfo = await callTool(mcp.client, "qf_apps_info_list", {
+      pageNum: 1,
+      pageSize: 1,
+      appKey: APP_KEY
+    })
+    assert.equal(appsInfo.ok, true)
+    assert.equal(appsInfo.data.pagination.page_num, 1)
+    assert.equal(appsInfo.data.pagination.page_size, 1)
+    assert.equal(appsInfo.data.pagination.result_amount, 1)
+    assert.equal(appsInfo.data.apps[0].app_key, APP_KEY)
+    assert.equal(appsInfo.data.apps[0].auth_members.users[0].user_id, "u_1")
+    assert.equal(appsInfo.data.apps[0].tags[0].tag_id, 1001)
+
+    const appInfo = await callTool(mcp.client, "qf_app_info_get", {
+      appKey: APP_KEY
+    })
+    assert.equal(appInfo.ok, true)
+    assert.equal(appInfo.data.app.app_key, APP_KEY)
+    assert.equal(appInfo.data.app.creator.user_id, "u_admin")
+
+    const appPackages = await callTool(mcp.client, "qf_app_packages_list", {
+      userId: "u_1",
+      tagId: 1001,
+      keyword: "销售",
+      limit: 10,
+      offset: 0
+    })
+    assert.equal(appPackages.ok, true)
+    assert.equal(appPackages.data.user_id, "u_1")
+    assert.equal(appPackages.data.tag_id_filter, 1001)
+    assert.equal(appPackages.data.total_packages, 1)
+    assert.equal(appPackages.data.packages[0].apps[0].app_key, APP_KEY)
+    assert.equal(appPackages.data.packages[0].dashboards[0].dash_key, "dash_sales")
+
+    const auditRecords = await callTool(mcp.client, "qf_apply_audit_records_list", {
+      applyId: "5001"
+    })
+    assert.equal(auditRecords.ok, true)
+    assert.equal(auditRecords.data.apply_id, "5001")
+    assert.equal(auditRecords.data.audit_records[0].audit_rcd_id, 1111)
+    assert.equal(auditRecords.data.current_nodes[0].audit_node_id, 2)
+    assert.equal(auditRecords.data.audit_records[0].audit_user.user_id, "u_1")
+
+    const auditRecord = await callTool(mcp.client, "qf_apply_audit_record_get", {
+      applyId: "5001",
+      auditRcdId: "1111"
+    })
+    assert.equal(auditRecord.ok, true)
+    assert.equal(auditRecord.data.apply_id, "5001")
+    assert.equal(auditRecord.data.audit_rcd_id, 1111)
+    assert.equal(Array.isArray(auditRecord.data.modifies), true)
+    assert.equal(auditRecord.data.modifies[0].que_id, 876)
+  })
+
+  await t.test("app info and audit tools return local validation/not-found errors", async () => {
+    const missingAppListPage = await callTool(mcp.client, "qf_apps_info_list", {
+      page_size: 10
+    })
+    assert.equal(missingAppListPage.ok, false)
+    assert.equal(missingAppListPage.error_code, "MISSING_REQUIRED_FIELD")
+
+    const missingUserId = await callTool(mcp.client, "qf_app_packages_list", {})
+    assert.equal(missingUserId.ok, false)
+    assert.equal(missingUserId.error_code, "MISSING_REQUIRED_FIELD")
+
+    const missingApplyId = await callTool(mcp.client, "qf_apply_audit_record_get", {
+      audit_rcd_id: "1111"
+    })
+    assert.equal(missingApplyId.ok, false)
+    assert.equal(missingApplyId.error_code, "MISSING_REQUIRED_FIELD")
+
+    const unknownApp = await callTool(mcp.client, "qf_app_info_get", {
+      app_key: "missing_app"
+    })
+    assert.equal(unknownApp.ok, false)
+    assert.equal(unknownApp.error_code, "APP_NOT_FOUND")
+
+    const unknownPackage = await callTool(mcp.client, "qf_app_packages_list", {
+      user_id: "u_1",
+      tag_id: 9999
+    })
+    assert.equal(unknownPackage.ok, false)
+    assert.equal(unknownPackage.error_code, "APP_PACKAGE_NOT_FOUND")
+
+    const unknownApply = await callTool(mcp.client, "qf_apply_audit_records_list", {
+      apply_id: "9999"
+    })
+    assert.equal(unknownApply.ok, false)
+    assert.equal(unknownApply.error_code, "APPLY_NOT_FOUND")
+
+    const unknownAudit = await callTool(mcp.client, "qf_apply_audit_record_get", {
+      apply_id: "5001",
+      audit_rcd_id: "9999"
+    })
+    assert.equal(unknownAudit.ok, false)
+    assert.equal(unknownAudit.error_code, "AUDIT_RECORD_NOT_FOUND")
+  })
+
+  await t.test("directory tools spec and list basics", async () => {
+    const departmentSpec = await callTool(mcp.client, "qf_tool_spec_get", {
+      tool_name: "qf_departments_list"
+    })
+    assert.equal(departmentSpec.ok, true)
+    assert.equal(departmentSpec.data.tools[0].tool, "qf_departments_list")
+    assert.deepEqual(departmentSpec.data.tools[0].aliases.dept_id, [
+      "deptId",
+      "department_id",
+      "departmentId"
+    ])
+
+    const departments = await callTool(mcp.client, "qf_departments_list", {})
+    assert.equal(departments.ok, true)
+    assert.equal(departments.data.total_departments, 4)
+    assert.equal(departments.data.returned_departments, 4)
+    assert.equal(departments.data.departments[1].dept_id, 111)
+    assert.equal(departments.data.departments[1].parent_id, 1)
+    assert.deepEqual(departments.data.departments[1].dept_leader_ids, ["u_1", "u_2"])
+
+    const filteredDepartments = await callTool(mcp.client, "qf_departments_list", {
+      deptId: 111,
+      keyword: "销售",
+      limit: 1,
+      offset: 1
+    })
+    assert.equal(filteredDepartments.ok, true)
+    assert.equal(filteredDepartments.data.total_departments, 2)
+    assert.equal(filteredDepartments.data.returned_departments, 1)
+    assert.equal(filteredDepartments.data.dept_id_filter, 111)
+    assert.equal(filteredDepartments.data.departments[0].dept_id, 112)
+  })
+
+  await t.test("directory department users list supports fetch_child alias and local slicing", async () => {
+    const directOnly = await callTool(mcp.client, "qf_department_users_list", {
+      dept_id: 111,
+      fetch_child: false
+    })
+    assert.equal(directOnly.ok, true)
+    assert.equal(directOnly.data.total_users, 2)
+    assert.equal(directOnly.data.returned_users, 2)
+    assert.deepEqual(directOnly.data.leader_ids, ["u_1", "u_2"])
+    assert.equal(directOnly.data.users[0].user_id, "u_1")
+
+    const withChildren = await callTool(mcp.client, "qf_department_users_list", {
+      deptId: 111,
+      fetchChild: true,
+      keyword: "example.com",
+      limit: 2,
+      offset: 1
+    })
+    assert.equal(withChildren.ok, true)
+    assert.equal(withChildren.data.total_users, 3)
+    assert.equal(withChildren.data.returned_users, 2)
+    assert.equal(withChildren.data.dept_id, "111")
+    assert.equal(withChildren.data.fetch_child, true)
+    assert.equal(withChildren.data.users[0].user_id, "u_2")
+    assert.equal(withChildren.data.users[1].user_id, "u_3")
+  })
+
+  await t.test("directory users list and user get support canonical and alias inputs", async () => {
+    const users = await callTool(mcp.client, "qf_users_list", {
+      pageNum: 1,
+      pageSize: 2
+    })
+    assert.equal(users.ok, true)
+    assert.equal(users.data.pagination.page_num, 1)
+    assert.equal(users.data.pagination.page_size, 2)
+    assert.equal(users.data.pagination.result_amount, 5)
+    assert.equal(users.data.pagination.page_amount, 3)
+    assert.equal(users.data.users.length, 2)
+    assert.equal(users.data.users[0].user_id, "u_admin")
+
+    const user = await callTool(mcp.client, "qf_user_get", {
+      userId: "u_2"
+    })
+    assert.equal(user.ok, true)
+    assert.equal(user.data.user.user_id, "u_2")
+    assert.deepEqual(user.data.user.department_ids, ["111", "112"])
+    assert.equal(user.data.user.being_active, true)
+  })
+
+  await t.test("directory tools return local not-found and missing-field errors", async () => {
+    const missingFetchChild = await callTool(mcp.client, "qf_department_users_list", {
+      dept_id: 111
+    })
+    assert.equal(missingFetchChild.ok, false)
+    assert.equal(missingFetchChild.error_code, "MISSING_REQUIRED_FIELD")
+
+    const missingPageSize = await callTool(mcp.client, "qf_users_list", {
+      page_num: 1
+    })
+    assert.equal(missingPageSize.ok, false)
+    assert.equal(missingPageSize.error_code, "MISSING_REQUIRED_FIELD")
+
+    const unknownDepartment = await callTool(mcp.client, "qf_department_users_list", {
+      dept_id: 999,
+      fetch_child: false
+    })
+    assert.equal(unknownDepartment.ok, false)
+    assert.equal(unknownDepartment.error_code, "DEPARTMENT_NOT_FOUND")
+
+    const unknownUser = await callTool(mcp.client, "qf_user_get", {
+      user_id: "missing_user"
+    })
+    assert.equal(unknownUser.ok, false)
+    assert.equal(unknownUser.error_code, "USER_NOT_FOUND")
   })
 
   await t.test("qf_tool_spec_get returns constraints and examples", async () => {
@@ -820,6 +1501,19 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(item.limits.output_profile, "compact|verbose (default compact)")
     assert.equal(item.minimal_example.app_key, "21b3d559")
     assert.ok(Array.isArray(item.minimal_example.select_columns))
+
+    const createSpec = await callTool(mcp.client, "qf_tool_spec_get", {
+      tool_name: "qf_record_create"
+    })
+    assert.equal(createSpec.ok, true)
+    assert.deepEqual(createSpec.data.tools[0].limits.special_field_write_formats.member_list[0], {
+      userId: "u_123",
+      userName: "张三"
+    })
+    assert.deepEqual(createSpec.data.tools[0].limits.special_field_write_formats.department_list[0], {
+      deptId: 111,
+      deptName: "销售部"
+    })
   })
 
   await t.test("qf_field_resolve maps title/id queries to que_id", async () => {
@@ -1032,7 +1726,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.match(errorText, /qf_query/)
   })
 
-  await t.test("qf_query list mode rejects camelCase aliases at MCP boundary", async () => {
+  await t.test("qf_query list mode returns structured missing-field errors for camelCase aliases", async () => {
     const errorText = await callToolProtocolError(mcp.client, "qf_query", {
       queryMode: "list",
       appKey: APP_KEY,
@@ -1042,11 +1736,11 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       selectColumns: [1001]
     })
 
-    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /MISSING_REQUIRED_FIELD/)
     assert.match(errorText, /select_columns|app_key|qf_query/)
   })
 
-  await t.test("qf_query list mode rejects model-style date_range filter at MCP boundary", async () => {
+  await t.test("qf_query list mode rejects model-style date_range filter with actionable error", async () => {
     const errorText = await callToolProtocolError(mcp.client, "qf_query", {
       query_mode: "list",
       app_key: APP_KEY,
@@ -1066,7 +1760,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       ]
     })
 
-    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /MISSING_REQUIRED_FIELD|filters|qf_query/)
     assert.match(errorText, /select_columns|filters|qf_query/)
   })
 
@@ -1112,6 +1806,19 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(rowValueByCandidates(record.data.row, ["客户名称", "1001"]), "客户A")
   })
 
+  await t.test("qf_record_get falls back to list lookup when direct record endpoint returns 49304", async () => {
+    const record = await callTool(mcp.client, "qf_record_get", {
+      apply_id: "5002",
+      app_key: APP_KEY,
+      select_columns: [1001, 1002]
+    })
+
+    assert.equal(record.ok, true)
+    assert.equal(record.data.apply_id, "5002")
+    assert.equal(rowValueByCandidates(record.data.row, ["客户名称", "1001"]), "客户B")
+    assert.equal(rowValueByCandidates(record.data.row, ["金额", "1002"]), 200)
+  })
+
   await t.test("qf_records_batch_get returns rows and missing ids", async () => {
     const batch = await callTool(mcp.client, "qf_records_batch_get", {
       app_key: APP_KEY,
@@ -1125,6 +1832,63 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.equal(batch.data.missing_apply_ids[0], "999999999")
     assert.equal(batch.data.rows.length, 1)
     assert.equal(rowValueByCandidates(batch.data.rows[0], ["客户名称", "1001"]), "客户A")
+  })
+
+  await t.test("qf_records_batch_get no longer depends on direct record endpoint", async () => {
+    const batch = await callTool(mcp.client, "qf_records_batch_get", {
+      app_key: APP_KEY,
+      apply_ids: ["5002"],
+      select_columns: [1001, 1002]
+    })
+
+    assert.equal(batch.ok, true)
+    assert.equal(batch.data.found_count, 1)
+    assert.equal(batch.data.rows.length, 1)
+    assert.equal(rowValueByCandidates(batch.data.rows[0], ["客户名称", "1001"]), "客户B")
+    assert.equal(rowValueByCandidates(batch.data.rows[0], ["金额", "1002"]), 200)
+  })
+
+  await t.test("qf_record_get can infer app_key from cache after batch/list/update flows", async () => {
+    const record = await callTool(mcp.client, "qf_record_get", {
+      apply_id: "5002",
+      select_columns: [1001, 1002]
+    })
+
+    assert.equal(record.ok, true)
+    assert.equal(record.data.apply_id, "5002")
+    assert.equal(rowValueByCandidates(record.data.row, ["客户名称", "1001"]), "客户B")
+    assert.equal(rowValueByCandidates(record.data.row, ["金额", "1002"]), 200)
+  })
+
+  await t.test("large apply_id stays exact across record_get, batch_get and qf_query(record)", async () => {
+    const record = await callTool(mcp.client, "qf_record_get", {
+      apply_id: BIG_APPLY_ID,
+      app_key: APP_KEY,
+      select_columns: [1001, 1002]
+    })
+    assert.equal(record.ok, true)
+    assert.equal(record.data.apply_id, BIG_APPLY_ID)
+    assert.equal(rowValueByCandidates(record.data.row, ["客户名称", "1001"]), "大ID客户")
+
+    const batch = await callTool(mcp.client, "qf_records_batch_get", {
+      app_key: APP_KEY,
+      apply_ids: [BIG_APPLY_ID],
+      select_columns: [1001, 1002],
+      output_profile: "verbose"
+    })
+    assert.equal(batch.ok, true)
+    assert.deepEqual(batch.data.requested_apply_ids, [BIG_APPLY_ID])
+    assert.equal(rowValueByCandidates(batch.data.rows[0], ["客户名称", "1001"]), "大ID客户")
+
+    const queryRecord = await callTool(mcp.client, "qf_query", {
+      query_mode: "record",
+      app_key: APP_KEY,
+      apply_id: BIG_APPLY_ID,
+      select_columns: [1001, 1002]
+    })
+    assert.equal(queryRecord.ok, true)
+    assert.equal(queryRecord.data.record.apply_id, BIG_APPLY_ID)
+    assert.equal(rowValueByCandidates(queryRecord.data.record.row, ["客户名称", "1001"]), "大ID客户")
   })
 
   await t.test("qf_export_json writes export file with preview", async () => {
@@ -1434,7 +2198,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     assert.match(errorText, /amount_column|page_size|select_columns/)
   })
 
-  await t.test("qf_query list mode missing select_columns is rejected by MCP schema", async () => {
+  await t.test("qf_query list mode missing select_columns returns local validation error", async () => {
     const errorText = await callToolProtocolError(mcp.client, "qf_query", {
       query_mode: "list",
       app_key: APP_KEY,
@@ -1443,7 +2207,7 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
       max_rows: 2
     })
 
-    assert.match(errorText, /Input validation error/)
+    assert.match(errorText, /MISSING_REQUIRED_FIELD/)
     assert.match(errorText, /select_columns/)
   })
 
@@ -1733,5 +2497,43 @@ test("MCP E2E: unified query + strict column controls + CRUD", async (t) => {
     })
     assert.equal(afterUpdate.ok, true)
     assert.equal(rowValueByCandidates(afterUpdate.data.row, ["金额", "1002"]), 456)
+  })
+
+  await t.test("create/update enforce explicit member and department write formats", async () => {
+    const invalidMember = await callTool(mcp.client, "qf_record_create", {
+      app_key: APP_KEY,
+      fields: {
+        1004: "张三"
+      }
+    })
+    assert.equal(invalidMember.ok, false)
+    assert.equal(invalidMember.error_code, "FIELD_VALUE_FORMAT_ERROR")
+    assert.match(invalidMember.fix_hint, /userId/)
+    assert.equal(invalidMember.details.expected_format.kind, "member_list")
+
+    const invalidDepartment = await callTool(mcp.client, "qf_record_update", {
+      apply_id: "5001",
+      app_key: APP_KEY,
+      answers: [
+        {
+          queId: 1005,
+          values: [{ dept_id: 111 }]
+        }
+      ]
+    })
+    assert.equal(invalidDepartment.ok, false)
+    assert.equal(invalidDepartment.error_code, "FIELD_VALUE_FORMAT_ERROR")
+    assert.match(invalidDepartment.fix_hint, /deptId/)
+    assert.equal(invalidDepartment.details.expected_format.kind, "department_list")
+
+    const validSpecialFields = await callTool(mcp.client, "qf_record_create", {
+      app_key: APP_KEY,
+      fields: {
+        客户名称: "带成员部门",
+        1004: [{ userId: "u_1", userName: "张三" }],
+        1005: [{ deptId: 111, deptName: "销售部" }]
+      }
+    })
+    assert.equal(validSpecialFields.ok, true)
   })
 })

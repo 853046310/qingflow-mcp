@@ -42,6 +42,11 @@ interface FormCacheEntry {
   data: QingflowResponse<unknown>
 }
 
+interface ApplyAppKeyCacheEntry {
+  appKey: string
+  expiresAt: number
+}
+
 interface FieldIndex {
   byId: Map<string, FormField>
   byTitle: Map<string, FormField[]>
@@ -141,6 +146,10 @@ class InputValidationError extends Error {
 
 const FORM_CACHE_TTL_MS = Number(process.env.QINGFLOW_FORM_CACHE_TTL_MS ?? "300000")
 const formCache = new Map<string, FormCacheEntry>()
+const APPLY_APP_KEY_CACHE_TTL_MS =
+  Number(process.env.QINGFLOW_APPLY_APP_KEY_CACHE_TTL_MS ?? "1800000")
+const applyAppKeyCache = new Map<string, ApplyAppKeyCacheEntry>()
+const requestAppKeyCache = new Map<string, ApplyAppKeyCacheEntry>()
 const CONTINUATION_CACHE_TTL_MS =
   Number(process.env.QINGFLOW_CONTINUATION_CACHE_TTL_MS ?? "900000")
 const continuationCache = new Map<string, ContinuationCacheEntry>()
@@ -160,7 +169,13 @@ const ADAPTIVE_TARGET_PAGE_MS = toPositiveInt(process.env.QINGFLOW_ADAPTIVE_TARG
 const MAX_LIST_ITEMS_BYTES = toPositiveInt(process.env.QINGFLOW_LIST_MAX_ITEMS_BYTES) ?? 400000
 const REQUEST_TIMEOUT_MS = toPositiveInt(process.env.QINGFLOW_REQUEST_TIMEOUT_MS) ?? 18000
 const EXECUTION_BUDGET_MS = toPositiveInt(process.env.QINGFLOW_EXECUTION_BUDGET_MS) ?? 20000
-const SERVER_VERSION = "0.3.14"
+const WAIT_RESULT_DEFAULT_TIMEOUT_MS =
+  toPositiveInt(process.env.QINGFLOW_WAIT_RESULT_TIMEOUT_MS) ?? 5000
+const WAIT_RESULT_POLL_INTERVAL_MS =
+  toPositiveInt(process.env.QINGFLOW_WAIT_RESULT_POLL_INTERVAL_MS) ?? 500
+const SERVER_VERSION = "0.3.23"
+const MEMBER_QUE_TYPE_KEYWORDS = ["member", "user", "成员", "人员"] as const
+const DEPARTMENT_QUE_TYPE_KEYWORDS = ["department", "dept", "部门"] as const
 
 const accessToken = process.env.QINGFLOW_ACCESS_TOKEN
 const baseUrl = process.env.QINGFLOW_BASE_URL
@@ -288,6 +303,7 @@ const queryContractFields = {
   output_profile: outputProfileSchema.optional(),
   completeness: completenessSchema.optional(),
   evidence: z.record(z.unknown()).optional(),
+  resolved_mappings: z.record(z.unknown()).optional(),
   error_code: z.null().optional(),
   fix_hint: z.null().optional(),
   next_page_token: z.string().nullable().optional()
@@ -302,6 +318,15 @@ const fieldSummarySchema = z.object({
   que_id: z.union([z.number(), z.string(), z.null()]),
   que_title: z.string().nullable(),
   que_type: z.unknown(),
+  write_format: z
+    .object({
+      kind: z.enum(["member_list", "department_list"]),
+      description: z.string(),
+      item_shape: z.record(z.string()),
+      example: z.array(z.record(z.unknown())),
+      resolution_hint: z.string()
+    })
+    .nullable(),
   has_sub_fields: z.boolean(),
   sub_field_count: z.number().int().nonnegative()
 })
@@ -332,6 +357,152 @@ const appsSuccessOutputSchema = z.object({
 })
 const appsOutputSchema = appsSuccessOutputSchema
 
+const publicDirectorySelectorSchema = z.union([z.string().min(1), z.number().int()])
+
+const departmentOutputSchema = z.object({
+  dept_id: z.number().int().nullable(),
+  name: z.string().nullable(),
+  parent_id: z.number().int().nullable(),
+  ordinal: z.number().int().nullable(),
+  dept_leader_ids: z.array(z.string())
+})
+
+const directoryUserSchema = z.object({
+  user_id: z.string().nullable(),
+  name: z.string().nullable(),
+  area_code: z.string().nullable(),
+  mobile_num: z.string().nullable(),
+  email: z.string().nullable(),
+  head_img: z.string().nullable(),
+  department_ids: z.array(z.string()),
+  role_ids: z.array(z.string()),
+  custom_role_ids: z.array(z.string()),
+  custom_department_ids: z.array(z.string()),
+  being_disabled: z.boolean().nullable(),
+  being_active: z.boolean().nullable(),
+  superior_id: z.string().nullable()
+})
+
+const departmentListInputPublicSchema = z.object({
+  dept_id: publicDirectorySelectorSchema.optional(),
+  deptId: publicDirectorySelectorSchema.optional(),
+  department_id: publicDirectorySelectorSchema.optional(),
+  departmentId: publicDirectorySelectorSchema.optional(),
+  keyword: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(500).optional(),
+  offset: z.number().int().nonnegative().optional()
+})
+
+const departmentListInputSchema = z.preprocess(
+  normalizeDepartmentListInput,
+  z.object({
+    dept_id: z.union([z.string().min(1), z.number().int()]).optional(),
+    keyword: z.string().min(1).optional(),
+    limit: z.number().int().positive().max(500).optional(),
+    offset: z.number().int().nonnegative().optional()
+  })
+)
+
+const departmentListOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    total_departments: z.number().int().nonnegative(),
+    returned_departments: z.number().int().nonnegative(),
+    limit: z.number().int().positive(),
+    offset: z.number().int().nonnegative(),
+    dept_id_filter: z.union([z.string(), z.number(), z.null()]),
+    departments: z.array(departmentOutputSchema)
+  }),
+  meta: apiMetaSchema
+})
+
+const departmentUsersInputPublicSchema = z.object({
+  dept_id: publicDirectorySelectorSchema.optional(),
+  deptId: publicDirectorySelectorSchema.optional(),
+  department_id: publicDirectorySelectorSchema.optional(),
+  departmentId: publicDirectorySelectorSchema.optional(),
+  fetch_child: z.boolean().optional(),
+  fetchChild: z.boolean().optional(),
+  keyword: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(500).optional(),
+  offset: z.number().int().nonnegative().optional()
+})
+
+const departmentUsersInputSchema = z.preprocess(
+  normalizeDepartmentUsersInput,
+  z.object({
+    dept_id: z.union([z.string().min(1), z.number().int()]).optional(),
+    fetch_child: z.boolean().optional(),
+    keyword: z.string().min(1).optional(),
+    limit: z.number().int().positive().max(500).optional(),
+    offset: z.number().int().nonnegative().optional()
+  })
+)
+
+const departmentUsersOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    dept_id: z.string(),
+    fetch_child: z.boolean(),
+    leader_ids: z.array(z.string()),
+    total_users: z.number().int().nonnegative(),
+    returned_users: z.number().int().nonnegative(),
+    limit: z.number().int().positive(),
+    offset: z.number().int().nonnegative(),
+    users: z.array(directoryUserSchema)
+  }),
+  meta: apiMetaSchema
+})
+
+const usersListInputPublicSchema = z.object({
+  page_num: z.number().int().positive().optional(),
+  pageNum: z.number().int().positive().optional(),
+  page_size: z.number().int().positive().optional(),
+  pageSize: z.number().int().positive().optional()
+})
+
+const usersListInputSchema = z.preprocess(
+  normalizeUsersListInput,
+  z.object({
+    page_num: z.number().int().positive().optional(),
+    page_size: z.number().int().positive().optional()
+  })
+)
+
+const usersListOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    pagination: z.object({
+      page_num: z.number().int().positive(),
+      page_size: z.number().int().positive(),
+      page_amount: z.number().int().nonnegative(),
+      result_amount: z.number().int().nonnegative()
+    }),
+    users: z.array(directoryUserSchema)
+  }),
+  meta: apiMetaSchema
+})
+
+const userGetInputPublicSchema = z.object({
+  user_id: z.string().min(1).optional(),
+  userId: z.string().min(1).optional()
+})
+
+const userGetInputSchema = z.preprocess(
+  normalizeUserGetInput,
+  z.object({
+    user_id: z.string().min(1).optional()
+  })
+)
+
+const userGetOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    user: directoryUserSchema
+  }),
+  meta: apiMetaSchema
+})
+
 const formInputSchema = z.object({
   app_key: z.string().min(1),
   user_id: z.string().min(1).optional(),
@@ -353,6 +524,229 @@ const formOutputSchema = formSuccessOutputSchema
 
 const publicStringSchema = z.string().min(1)
 const publicFieldSelectorSchema = z.union([publicStringSchema, z.number().int()])
+
+const appAuthUserSchema = z.object({
+  user_id: z.string().nullable(),
+  user_name: z.string().nullable()
+})
+
+const appAuthDepartmentSchema = z.object({
+  dept_id: z.number().int().nullable(),
+  dept_name: z.string().nullable()
+})
+
+const appAuthRoleSchema = z.object({
+  role_id: z.number().int().nullable(),
+  role_name: z.string().nullable()
+})
+
+const appAuthMembersSchema = z.object({
+  users: z.array(appAuthUserSchema),
+  departments: z.array(appAuthDepartmentSchema),
+  roles: z.array(appAuthRoleSchema)
+})
+
+const appCreatorSchema = z.object({
+  user_id: z.string().nullable(),
+  nick_name: z.string().nullable(),
+  head_img: z.string().nullable()
+})
+
+const appTagRefSchema = z.object({
+  tag_id: z.number().int().nullable(),
+  tag_name: z.string().nullable()
+})
+
+const appInfoSchema = z.object({
+  app_key: z.string().nullable(),
+  app_name: z.string().nullable(),
+  app_auth: z.number().int().nullable(),
+  app_icon: z.string().nullable(),
+  auth_members: appAuthMembersSchema,
+  creator: appCreatorSchema,
+  create_time: z.string().nullable(),
+  tags: z.array(appTagRefSchema),
+  app_publish_status: z.number().int().nullable()
+})
+
+const appInfoListInputPublicSchema = z.object({
+  page_num: z.number().int().positive().optional(),
+  pageNum: z.number().int().positive().optional(),
+  page_size: z.number().int().positive().optional(),
+  pageSize: z.number().int().positive().optional(),
+  app_key: publicStringSchema.optional(),
+  appKey: publicStringSchema.optional()
+})
+
+const appInfoListInputSchema = z.preprocess(
+  normalizeAppInfoListInput,
+  z.object({
+    page_num: z.number().int().positive().optional(),
+    page_size: z.number().int().positive().optional(),
+    app_key: z.string().min(1).optional()
+  })
+)
+
+const appInfoListOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    pagination: z.object({
+      page_num: z.number().int().positive(),
+      page_size: z.number().int().positive(),
+      page_amount: z.number().int().nonnegative(),
+      result_amount: z.number().int().nonnegative()
+    }),
+    apps: z.array(appInfoSchema)
+  }),
+  meta: apiMetaSchema
+})
+
+const appInfoGetInputPublicSchema = z.object({
+  app_key: publicStringSchema.optional(),
+  appKey: publicStringSchema.optional()
+})
+
+const appInfoGetInputSchema = z.preprocess(
+  normalizeAppInfoGetInput,
+  z.object({
+    app_key: z.string().min(1).optional()
+  })
+)
+
+const appInfoGetOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    app: appInfoSchema
+  }),
+  meta: apiMetaSchema
+})
+
+const appPackageAppSchema = z.object({
+  app_key: z.string().nullable(),
+  app_name: z.string().nullable()
+})
+
+const dashboardRefSchema = z.object({
+  dash_key: z.string().nullable(),
+  dash_name: z.string().nullable()
+})
+
+const appPackageSchema = z.object({
+  tag_id: z.number().int().nullable(),
+  tag_name: z.string().nullable(),
+  tag_icon: z.string().nullable(),
+  apps: z.array(appPackageAppSchema),
+  dashboards: z.array(dashboardRefSchema)
+})
+
+const appPackageListInputPublicSchema = z.object({
+  user_id: publicStringSchema.optional(),
+  userId: publicStringSchema.optional(),
+  tag_id: publicDirectorySelectorSchema.optional(),
+  tagId: publicDirectorySelectorSchema.optional(),
+  keyword: publicStringSchema.optional(),
+  limit: z.number().int().positive().max(500).optional(),
+  offset: z.number().int().nonnegative().optional()
+})
+
+const appPackageListInputSchema = z.preprocess(
+  normalizeAppPackageListInput,
+  z.object({
+    user_id: z.string().min(1).optional(),
+    tag_id: z.union([z.string().min(1), z.number().int()]).optional(),
+    keyword: z.string().min(1).optional(),
+    limit: z.number().int().positive().max(500).optional(),
+    offset: z.number().int().nonnegative().optional()
+  })
+)
+
+const appPackageListOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    user_id: z.string(),
+    tag_id_filter: z.union([z.string(), z.number(), z.null()]),
+    total_packages: z.number().int().nonnegative(),
+    returned_packages: z.number().int().nonnegative(),
+    limit: z.number().int().positive(),
+    offset: z.number().int().nonnegative(),
+    packages: z.array(appPackageSchema)
+  }),
+  meta: apiMetaSchema
+})
+
+const auditUserInfoSchema = z.object({
+  user_id: z.string().nullable(),
+  user_name: z.string().nullable(),
+  nick_name: z.string().nullable(),
+  head_img: z.string().nullable()
+})
+
+const auditRecordSummarySchema = z.object({
+  audit_rcd_id: z.number().int().nullable(),
+  audit_node_id: z.number().int().nullable(),
+  audit_node_name: z.string().nullable(),
+  audit_time_ms: z.number().int().nullable(),
+  audit_result: z.unknown().nullable(),
+  audit_feedback: z.string().nullable(),
+  audit_user: auditUserInfoSchema.nullable(),
+  wait_audit_users: z.array(auditUserInfoSchema)
+})
+
+const applyAuditRecordsInputPublicSchema = z.object({
+  apply_id: publicStringSchema.optional(),
+  applyId: publicStringSchema.optional()
+})
+
+const applyAuditRecordsInputSchema = z.preprocess(
+  normalizeApplyAuditRecordsInput,
+  z.object({
+    apply_id: z.string().min(1).optional()
+  })
+)
+
+const applyAuditRecordsOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    apply_id: z.string(),
+    apply_status: z.unknown().nullable(),
+    audit_records: z.array(auditRecordSummarySchema),
+    current_nodes: z.array(auditRecordSummarySchema)
+  }),
+  meta: apiMetaSchema
+})
+
+const auditModifySchema = z.object({
+  que_id: z.union([z.number(), z.string(), z.null()]),
+  que_title: z.string().nullable(),
+  que_type: z.unknown().nullable(),
+  before_answer: z.array(z.unknown()),
+  after_answer: z.array(z.unknown())
+})
+
+const applyAuditRecordGetInputPublicSchema = z.object({
+  apply_id: publicStringSchema.optional(),
+  applyId: publicStringSchema.optional(),
+  audit_rcd_id: publicStringSchema.optional(),
+  auditRcdId: publicStringSchema.optional()
+})
+
+const applyAuditRecordGetInputSchema = z.preprocess(
+  normalizeApplyAuditRecordGetInput,
+  z.object({
+    apply_id: z.string().min(1).optional(),
+    audit_rcd_id: z.string().min(1).optional()
+  })
+)
+
+const applyAuditRecordGetOutputSchema = z.object({
+  ok: z.literal(true),
+  data: z.object({
+    apply_id: z.string(),
+    audit_rcd_id: z.union([z.string(), z.number()]),
+    modifies: z.array(auditModifySchema)
+  }),
+  meta: apiMetaSchema
+})
 
 const publicSortItemSchema = z.object({
   que_id: publicFieldSelectorSchema,
@@ -589,6 +983,7 @@ const listOutputSchema = listSuccessOutputSchema
 const recordGetInputPublicSchema = z
   .object({
     apply_id: publicFieldSelectorSchema,
+    app_key: publicStringSchema.optional(),
     max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
     select_columns: z.array(publicFieldSelectorSchema).min(1).max(MAX_COLUMN_LIMIT),
     output_profile: outputProfileSchema.optional()
@@ -598,6 +993,7 @@ const recordGetInputSchema = z.preprocess(
   normalizeRecordGetInput,
   z.object({
     apply_id: z.union([z.string().min(1), z.number().int()]),
+    app_key: z.string().min(1).optional(),
     max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
     select_columns: z
       .array(z.union([z.string().min(1), z.number().int()]))
@@ -636,6 +1032,8 @@ const createInputPublicSchema = z
     app_key: publicStringSchema,
     user_id: publicStringSchema.optional(),
     force_refresh_form: z.boolean().optional(),
+    wait_result: z.boolean().optional(),
+    wait_timeout_ms: z.number().int().positive().max(20000).optional(),
     apply_user: publicApplyUserSchema.optional(),
     answers: z.array(publicAnswerInputSchema).optional(),
     fields: z.record(z.unknown()).optional()
@@ -646,6 +1044,8 @@ const createInputSchema = z
     app_key: z.string().min(1),
     user_id: z.string().min(1).optional(),
     force_refresh_form: z.boolean().optional(),
+    wait_result: z.boolean().optional(),
+    wait_timeout_ms: z.number().int().positive().max(20000).optional(),
     apply_user: z
       .object({
         email: z.string().optional(),
@@ -664,9 +1064,23 @@ const createInputSchema = z
 const createSuccessOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
+    status: z.enum(["completed", "pending", "timeout", "failed"]),
     request_id: z.string().nullable(),
     apply_id: z.union([z.string(), z.number(), z.null()]),
-    async_hint: z.string()
+    resource: z
+      .object({
+        type: z.literal("record"),
+        apply_id: z.union([z.string(), z.number()])
+      })
+      .nullable(),
+    next_action: z
+      .object({
+        tool: z.string(),
+        arguments: z.record(z.unknown()),
+        reason: z.string().optional()
+      })
+      .nullable(),
+    raw: z.object({ operation_result: z.unknown() }).nullable()
   }),
   meta: apiMetaSchema
 })
@@ -678,6 +1092,8 @@ const updateInputPublicSchema = z
     app_key: publicStringSchema.optional(),
     user_id: publicStringSchema.optional(),
     force_refresh_form: z.boolean().optional(),
+    wait_result: z.boolean().optional(),
+    wait_timeout_ms: z.number().int().positive().max(20000).optional(),
     answers: z.array(publicAnswerInputSchema).optional(),
     fields: z.record(z.unknown()).optional()
   })
@@ -688,6 +1104,8 @@ const updateInputSchema = z
     app_key: z.string().min(1).optional(),
     user_id: z.string().min(1).optional(),
     force_refresh_form: z.boolean().optional(),
+    wait_result: z.boolean().optional(),
+    wait_timeout_ms: z.number().int().positive().max(20000).optional(),
     answers: z.array(answerInputSchema).optional(),
     fields: z.record(fieldValueSchema).optional()
   })
@@ -698,8 +1116,23 @@ const updateInputSchema = z
 const updateSuccessOutputSchema = z.object({
   ok: z.literal(true),
   data: z.object({
+    status: z.enum(["completed", "pending", "timeout", "failed"]),
     request_id: z.string().nullable(),
-    async_hint: z.string()
+    apply_id: z.union([z.string(), z.number(), z.null()]),
+    resource: z
+      .object({
+        type: z.literal("record"),
+        apply_id: z.union([z.string(), z.number()])
+      })
+      .nullable(),
+    next_action: z
+      .object({
+        tool: z.string(),
+        arguments: z.record(z.unknown()),
+        reason: z.string().optional()
+      })
+      .nullable(),
+    raw: z.object({ operation_result: z.unknown() }).nullable()
   }),
   meta: apiMetaSchema
 })
@@ -752,7 +1185,7 @@ const queryInputPublicSchema = z
     max_rows: z.number().int().positive().max(200).optional(),
     max_items: z.number().int().positive().max(200).optional(),
     max_columns: z.number().int().positive().max(MAX_COLUMN_LIMIT).optional(),
-    select_columns: z.array(publicFieldSelectorSchema).min(1).max(MAX_COLUMN_LIMIT),
+    select_columns: z.array(publicFieldSelectorSchema).min(1).max(MAX_COLUMN_LIMIT).optional(),
     include_answers: z.boolean().optional(),
     amount_column: publicFieldSelectorSchema.optional(),
     time_range: publicTimeRangeSchema.optional(),
@@ -865,6 +1298,7 @@ const querySummaryOutputSchema = z.object({
   rows: z.array(z.record(z.unknown())),
   completeness: completenessSchema.optional(),
   evidence: evidenceSchema.optional(),
+  resolved_mappings: z.record(z.unknown()).optional(),
   meta: z.object({
     field_mapping: z.array(
       z.object({
@@ -948,7 +1382,7 @@ const aggregateInputPublicSchema = z
     sort: z.array(publicSortItemSchema).optional(),
     filters: z.array(publicFilterItemSchema).optional(),
     time_range: publicTimeRangeSchema.optional(),
-    group_by: z.array(publicFieldSelectorSchema).min(1).max(20),
+    group_by: z.array(publicFieldSelectorSchema).max(20).optional(),
     amount_column: publicFieldSelectorSchema.optional(),
     amount_columns: z.array(publicFieldSelectorSchema).min(1).max(5).optional(),
     metrics: z.array(z.enum(["count", "sum", "avg", "min", "max"])).min(1).max(5).optional(),
@@ -1020,7 +1454,7 @@ const aggregateInputSchema = z
         timezone: z.string().optional()
       })
       .optional(),
-    group_by: z.array(z.union([z.string().min(1), z.number().int()])).min(1).max(20),
+    group_by: z.array(z.union([z.string().min(1), z.number().int()])).max(20).optional(),
     amount_column: z.union([z.string().min(1), z.number().int()]).optional(),
     amount_columns: z
       .array(z.union([z.string().min(1), z.number().int()]))
@@ -1505,6 +1939,599 @@ server.registerTool(
 )
 
 server.registerTool(
+  "qf_apps_info_list",
+  {
+    title: "Qingflow Apps Info List",
+    description: "List app admin info with explicit pagination. Requires admin-level visibility.",
+    inputSchema: appInfoListInputPublicSchema,
+    outputSchema: appInfoListOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = appInfoListInputSchema.parse(args)
+      if (parsedArgs.page_num === undefined) {
+        throw missingRequiredFieldError({
+          field: "page_num",
+          tool: "qf_apps_info_list",
+          fixHint: "Provide page_num (or pageNum), for example: {\"page_num\":1,\"page_size\":50}."
+        })
+      }
+      if (parsedArgs.page_size === undefined) {
+        throw missingRequiredFieldError({
+          field: "page_size",
+          tool: "qf_apps_info_list",
+          fixHint: "Provide page_size (or pageSize), for example: {\"page_num\":1,\"page_size\":50}."
+        })
+      }
+
+      let response: QingflowResponse<unknown>
+      try {
+        response = await client.listAppsInfo({
+          appKey: parsedArgs.app_key,
+          pageNum: parsedArgs.page_num,
+          pageSize: parsedArgs.page_size
+        })
+      } catch (error) {
+        if (parsedArgs.app_key) {
+          throw translateAdminApiError(error, {
+            tool: "qf_apps_info_list",
+            entity: "app",
+            appKey: parsedArgs.app_key
+          })
+        }
+        throw error
+      }
+
+      const result = asObject(response.result)
+      const apps = asArray(result?.apps).map((item) => normalizeAppInfo(item))
+      return okResult(
+        {
+          ok: true,
+          data: {
+            pagination: {
+              page_num: toPositiveInt(result?.pageNum) ?? parsedArgs.page_num,
+              page_size: toPositiveInt(result?.pageSize) ?? parsedArgs.page_size,
+              page_amount: toNonNegativeInt(result?.pageAmount) ?? 0,
+              result_amount: toNonNegativeInt(result?.resultAmount) ?? apps.length
+            },
+            apps
+          },
+          meta: buildMeta(response)
+        },
+        `Returned ${apps.length} app info rows`
+      )
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_app_info_get",
+  {
+    title: "Qingflow App Info Get",
+    description: "Get one app's admin info by app_key. Requires admin-level visibility.",
+    inputSchema: appInfoGetInputPublicSchema,
+    outputSchema: appInfoGetOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = appInfoGetInputSchema.parse(args)
+      if (!parsedArgs.app_key) {
+        throw missingRequiredFieldError({
+          field: "app_key",
+          tool: "qf_app_info_get",
+          fixHint: "Provide app_key (or appKey), for example: {\"app_key\":\"21b3d559\"}."
+        })
+      }
+
+      let response: QingflowResponse<unknown>
+      try {
+        response = await client.listAppsInfo({
+          appKey: parsedArgs.app_key,
+          pageNum: 1,
+          pageSize: 1
+        })
+      } catch (error) {
+        throw translateAdminApiError(error, {
+          tool: "qf_app_info_get",
+          entity: "app",
+          appKey: parsedArgs.app_key
+        })
+      }
+
+      const result = asObject(response.result)
+      const app = asArray(result?.apps)
+        .map((item) => normalizeAppInfo(item))
+        .find((item) => item.app_key === parsedArgs.app_key)
+
+      if (!app) {
+        throw new InputValidationError({
+          message: `App \"${parsedArgs.app_key}\" not found`,
+          errorCode: "APP_NOT_FOUND",
+          fixHint: "Call qf_apps_list or qf_apps_info_list first to confirm the exact app_key.",
+          details: {
+            tool: "qf_app_info_get",
+            app_key: parsedArgs.app_key
+          }
+        })
+      }
+
+      return okResult(
+        {
+          ok: true,
+          data: {
+            app
+          },
+          meta: buildMeta(response)
+        },
+        `Fetched app ${parsedArgs.app_key}`
+      )
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_app_packages_list",
+  {
+    title: "Qingflow App Packages List",
+    description: "List app packages visible to one user, with optional local tag/keyword slicing.",
+    inputSchema: appPackageListInputPublicSchema,
+    outputSchema: appPackageListOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = appPackageListInputSchema.parse(args)
+      if (!parsedArgs.user_id) {
+        throw missingRequiredFieldError({
+          field: "user_id",
+          tool: "qf_app_packages_list",
+          fixHint: "Provide user_id (or userId), for example: {\"user_id\":\"u_123\"}."
+        })
+      }
+
+      const response = await client.listAppPackages({
+        userId: parsedArgs.user_id
+      })
+      const keyword = parsedArgs.keyword?.trim().toLowerCase() ?? null
+      const limit = parsedArgs.limit ?? 50
+      const offset = parsedArgs.offset ?? 0
+      let packages = asArray(asObject(response.result)?.tagList).map((item) => normalizeAppPackage(item))
+
+      if (parsedArgs.tag_id !== undefined) {
+        packages = packages.filter((item) => String(item.tag_id ?? "") === String(parsedArgs.tag_id))
+        if (packages.length === 0) {
+          throw new InputValidationError({
+            message: `App package \"${String(parsedArgs.tag_id)}\" not found`,
+            errorCode: "APP_PACKAGE_NOT_FOUND",
+            fixHint: "Call qf_app_packages_list without tag_id first to confirm the exact package id.",
+            details: {
+              tool: "qf_app_packages_list",
+              tag_id: parsedArgs.tag_id,
+              user_id: parsedArgs.user_id
+            }
+          })
+        }
+      }
+
+      const filtered = keyword
+        ? packages.filter((item) => {
+            const values = [
+              item.tag_name ?? "",
+              ...item.apps.map((app) => app.app_name ?? ""),
+              ...item.dashboards.map((dash) => dash.dash_name ?? "")
+            ]
+            return values.some((value) => value.toLowerCase().includes(keyword))
+          })
+        : packages
+      const sliced = filtered.slice(offset, offset + limit)
+
+      return okResult(
+        {
+          ok: true,
+          data: {
+            user_id: parsedArgs.user_id,
+            tag_id_filter: parsedArgs.tag_id ?? null,
+            total_packages: filtered.length,
+            returned_packages: sliced.length,
+            limit,
+            offset,
+            packages: sliced
+          },
+          meta: buildMeta(response)
+        },
+        `Returned ${sliced.length}/${filtered.length} app packages`
+      )
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_apply_audit_records_list",
+  {
+    title: "Qingflow Apply Audit Records List",
+    description: "List one record's workflow audit log and current pending nodes.",
+    inputSchema: applyAuditRecordsInputPublicSchema,
+    outputSchema: applyAuditRecordsOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = applyAuditRecordsInputSchema.parse(args)
+      if (!parsedArgs.apply_id) {
+        throw missingRequiredFieldError({
+          field: "apply_id",
+          tool: "qf_apply_audit_records_list",
+          fixHint: "Provide apply_id (or applyId), for example: {\"apply_id\":\"50001234\"}."
+        })
+      }
+
+      let response: QingflowResponse<unknown>
+      try {
+        response = await client.listApplyAuditRecords(parsedArgs.apply_id)
+      } catch (error) {
+        throw translateAdminApiError(error, {
+          tool: "qf_apply_audit_records_list",
+          entity: "apply",
+          applyId: parsedArgs.apply_id
+        })
+      }
+
+      const result = asObject(response.result)
+      return okResult(
+        {
+          ok: true,
+          data: {
+            apply_id: parsedArgs.apply_id,
+            apply_status: result?.applyStatus ?? null,
+            audit_records: asArray(result?.auditRecords).map((item) => normalizeAuditRecordSummary(item)),
+            current_nodes: asArray(result?.currentNodes).map((item) => normalizeAuditRecordSummary(item))
+          },
+          meta: buildMeta(response)
+        },
+        `Fetched audit records for apply ${parsedArgs.apply_id}`
+      )
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_apply_audit_record_get",
+  {
+    title: "Qingflow Apply Audit Record Get",
+    description: "Get one workflow audit record detail by apply_id and audit_rcd_id.",
+    inputSchema: applyAuditRecordGetInputPublicSchema,
+    outputSchema: applyAuditRecordGetOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = applyAuditRecordGetInputSchema.parse(args)
+      if (!parsedArgs.apply_id) {
+        throw missingRequiredFieldError({
+          field: "apply_id",
+          tool: "qf_apply_audit_record_get",
+          fixHint: "Provide apply_id (or applyId), for example: {\"apply_id\":\"50001234\",\"audit_rcd_id\":\"1111\"}."
+        })
+      }
+      if (!parsedArgs.audit_rcd_id) {
+        throw missingRequiredFieldError({
+          field: "audit_rcd_id",
+          tool: "qf_apply_audit_record_get",
+          fixHint: "Provide audit_rcd_id (or auditRcdId), for example: {\"apply_id\":\"50001234\",\"audit_rcd_id\":\"1111\"}."
+        })
+      }
+
+      let response: QingflowResponse<unknown>
+      try {
+        response = await client.getApplyAuditRecord(parsedArgs.apply_id, parsedArgs.audit_rcd_id)
+      } catch (error) {
+        throw translateAdminApiError(error, {
+          tool: "qf_apply_audit_record_get",
+          entity: "audit_record",
+          applyId: parsedArgs.apply_id,
+          auditRcdId: parsedArgs.audit_rcd_id
+        })
+      }
+
+      const result = asObject(response.result)
+      return okResult(
+        {
+          ok: true,
+          data: {
+            apply_id: parsedArgs.apply_id,
+            audit_rcd_id: (result?.auditRcdId as string | number | null | undefined) ?? parsedArgs.audit_rcd_id,
+            modifies: normalizeAuditModifies(result?.auditModifies)
+          },
+          meta: buildMeta(response)
+        },
+        `Fetched audit record ${parsedArgs.audit_rcd_id} for apply ${parsedArgs.apply_id}`
+      )
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_departments_list",
+  {
+    title: "Qingflow Departments List",
+    description: "List departments with optional dept_id filter and local keyword slicing.",
+    inputSchema: departmentListInputPublicSchema,
+    outputSchema: departmentListOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = departmentListInputSchema.parse(args)
+      let response: QingflowResponse<unknown>
+      try {
+        response = await client.listDepartments(
+          parsedArgs.dept_id !== undefined ? { deptId: parsedArgs.dept_id } : {}
+        )
+      } catch (error) {
+        if (parsedArgs.dept_id !== undefined) {
+          throw translateDirectoryApiError(error, {
+            tool: "qf_departments_list",
+            entity: "department",
+            deptId: parsedArgs.dept_id
+          })
+        }
+        throw error
+      }
+
+      const keyword = parsedArgs.keyword?.trim().toLowerCase() ?? null
+      const limit = parsedArgs.limit ?? 50
+      const offset = parsedArgs.offset ?? 0
+      const departments = asArray(asObject(response.result)?.department).map((item) => normalizeDepartment(item))
+      const filtered = keyword
+        ? departments.filter(
+            (item) =>
+              (item.name ?? "").toLowerCase().includes(keyword) ||
+              String(item.dept_id ?? "").toLowerCase().includes(keyword)
+          )
+        : departments
+      const sliced = filtered.slice(offset, offset + limit)
+
+      return okResult(
+        {
+          ok: true,
+          data: {
+            total_departments: filtered.length,
+            returned_departments: sliced.length,
+            limit,
+            offset,
+            dept_id_filter: parsedArgs.dept_id ?? null,
+            departments: sliced
+          },
+          meta: buildMeta(response)
+        },
+        `Returned ${sliced.length}/${filtered.length} departments`
+      )
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_department_users_list",
+  {
+    title: "Qingflow Department Users List",
+    description: "List department members with optional child recursion and local keyword slicing.",
+    inputSchema: departmentUsersInputPublicSchema,
+    outputSchema: departmentUsersOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = departmentUsersInputSchema.parse(args)
+      if (parsedArgs.dept_id === undefined) {
+        throw missingRequiredFieldError({
+          field: "dept_id",
+          tool: "qf_department_users_list",
+          fixHint: "Provide dept_id (or deptId), for example: {\"dept_id\":111,\"fetch_child\":false}."
+        })
+      }
+      if (parsedArgs.fetch_child === undefined) {
+        throw missingRequiredFieldError({
+          field: "fetch_child",
+          tool: "qf_department_users_list",
+          fixHint: "Provide fetch_child as a native JSON boolean, for example: {\"dept_id\":111,\"fetch_child\":true}."
+        })
+      }
+
+      let response: QingflowResponse<unknown>
+      try {
+        response = await client.listDepartmentUsers(String(parsedArgs.dept_id), {
+          fetchChild: parsedArgs.fetch_child
+        })
+      } catch (error) {
+        throw translateDirectoryApiError(error, {
+          tool: "qf_department_users_list",
+          entity: "department",
+          deptId: parsedArgs.dept_id
+        })
+      }
+
+      const keyword = parsedArgs.keyword?.trim().toLowerCase() ?? null
+      const limit = parsedArgs.limit ?? 200
+      const offset = parsedArgs.offset ?? 0
+      const result = asObject(response.result)
+      const users = asArray(result?.userList).map((item) => normalizeUser(item))
+      const filtered = keyword
+        ? users.filter((item) =>
+            [item.user_id, item.name, item.email, item.mobile_num]
+              .map((value) => (value ?? "").toLowerCase())
+              .some((value) => value.includes(keyword))
+          )
+        : users
+      const sliced = filtered.slice(offset, offset + limit)
+
+      return okResult(
+        {
+          ok: true,
+          data: {
+            dept_id: String(parsedArgs.dept_id),
+            fetch_child: parsedArgs.fetch_child,
+            leader_ids: normalizeStringArray(result?.leaderIds),
+            total_users: filtered.length,
+            returned_users: sliced.length,
+            limit,
+            offset,
+            users: sliced
+          },
+          meta: buildMeta(response)
+        },
+        `Returned ${sliced.length}/${filtered.length} department users`
+      )
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_users_list",
+  {
+    title: "Qingflow Users List",
+    description: "List workspace users with explicit pagination.",
+    inputSchema: usersListInputPublicSchema,
+    outputSchema: usersListOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = usersListInputSchema.parse(args)
+      if (parsedArgs.page_num === undefined) {
+        throw missingRequiredFieldError({
+          field: "page_num",
+          tool: "qf_users_list",
+          fixHint: "Provide page_num (or pageNum), for example: {\"page_num\":1,\"page_size\":100}."
+        })
+      }
+      if (parsedArgs.page_size === undefined) {
+        throw missingRequiredFieldError({
+          field: "page_size",
+          tool: "qf_users_list",
+          fixHint: "Provide page_size (or pageSize), for example: {\"page_num\":1,\"page_size\":100}."
+        })
+      }
+
+      const response = await client.listUsers({
+        pageNum: parsedArgs.page_num,
+        pageSize: parsedArgs.page_size
+      })
+      const result = asObject(response.result)
+      const users = asArray(result?.result).map((item) => normalizeUser(item))
+
+      return okResult(
+        {
+          ok: true,
+          data: {
+            pagination: {
+              page_num: toPositiveInt(result?.pageNum) ?? parsedArgs.page_num,
+              page_size: toPositiveInt(result?.pageSize) ?? parsedArgs.page_size,
+              page_amount: toNonNegativeInt(result?.pageAmount) ?? 0,
+              result_amount: toNonNegativeInt(result?.resultAmount) ?? users.length
+            },
+            users
+          },
+          meta: buildMeta(response)
+        },
+        `Returned ${users.length} users`
+      )
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
+  "qf_user_get",
+  {
+    title: "Qingflow User Get",
+    description: "Get one workspace user by user_id.",
+    inputSchema: userGetInputPublicSchema,
+    outputSchema: userGetOutputSchema,
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true
+    }
+  },
+  async (args) => {
+    try {
+      const parsedArgs = userGetInputSchema.parse(args)
+      if (!parsedArgs.user_id) {
+        throw missingRequiredFieldError({
+          field: "user_id",
+          tool: "qf_user_get",
+          fixHint: "Provide user_id (or userId), for example: {\"user_id\":\"u_123\"}."
+        })
+      }
+
+      let response: QingflowResponse<unknown>
+      try {
+        response = await client.getUser(parsedArgs.user_id)
+      } catch (error) {
+        throw translateDirectoryApiError(error, {
+          tool: "qf_user_get",
+          entity: "user",
+          userId: parsedArgs.user_id
+        })
+      }
+
+      return okResult(
+        {
+          ok: true,
+          data: {
+            user: normalizeUser(response.result)
+          },
+          meta: buildMeta(response)
+        },
+        `Fetched user ${parsedArgs.user_id}`
+      )
+    } catch (error) {
+      return errorResult(error)
+    }
+  }
+)
+
+server.registerTool(
   "qf_form_get",
   {
     title: "Qingflow Form Get",
@@ -1570,7 +2597,7 @@ server.registerTool(
   {
     title: "Qingflow Query Plan",
     description:
-      "Preflight query arguments: normalize inputs, validate required fields, resolve mappings and estimate scan limits before execution.",
+      "Debug/explain tool: preflight query arguments, validate required fields, resolve field mappings and estimate scan pages before actual execution. Use for complex queries or when troubleshooting. For normal queries, use qf_query directly.",
     inputSchema: queryPlanInputPublicSchema,
     outputSchema: queryPlanOutputSchema,
     annotations: {
@@ -1711,7 +2738,7 @@ server.registerTool(
   {
     title: "Qingflow Unified Query",
     description:
-      "Unified read entry for list/record/summary. Use query_mode=auto to route automatically.",
+      "Unified read entry for list/record/summary modes. Use query_mode=auto to route: apply_id→record; amount_column/time_range/stat_policy→summary; otherwise→list. In summary mode, select_columns is optional (auto-derived from amount_column/time_range). Field titles are accepted everywhere—que_id resolution is automatic.",
     inputSchema: queryInputPublicSchema,
     outputSchema: queryOutputSchema,
     annotations: {
@@ -1770,6 +2797,7 @@ server.registerTool(
               summary: executed.data
             },
             output_profile: executed.outputProfile,
+            resolved_mappings: executed.resolvedMappings,
             ...(isVerboseProfile(executed.outputProfile)
               ? {
                   completeness,
@@ -1802,6 +2830,7 @@ server.registerTool(
             list: executed.payload.data
           },
           output_profile: executed.outputProfile,
+          resolved_mappings: executed.resolvedMappings,
           ...(isVerboseProfile(executed.outputProfile)
             ? {
                 completeness,
@@ -1830,7 +2859,7 @@ server.registerTool(
   {
     title: "Qingflow Record Create",
     description:
-      "Create one record. Supports explicit answers and ergonomic fields mapping (title or queId).",
+      "Create one record. Supports fields{} mapping by title or queId, and explicit answers[]. Set wait_result=true to poll until the record is resolved (returns apply_id directly instead of requiring a follow-up qf_operation_get call).",
     inputSchema: createInputPublicSchema,
     outputSchema: createOutputSchema,
     annotations: {
@@ -1841,8 +2870,10 @@ server.registerTool(
   async (args) => {
     try {
       const parsedArgs = createInputSchema.parse(args)
+      const shouldFetchForm =
+        hasWritePayload(parsedArgs.answers, parsedArgs.fields) || Boolean(parsedArgs.force_refresh_form)
       const form =
-        needsFormResolution(parsedArgs.fields) || Boolean(parsedArgs.force_refresh_form)
+        shouldFetchForm
           ? await getFormCached(
               parsedArgs.app_key,
               parsedArgs.user_id,
@@ -1853,7 +2884,8 @@ server.registerTool(
       const normalizedAnswers = resolveAnswers({
         explicitAnswers: parsedArgs.answers,
         fields: parsedArgs.fields,
-        form: form?.result
+        form: form?.result,
+        tool: "qf_record_create"
       })
 
       const payload: Record<string, unknown> = {
@@ -1868,13 +2900,51 @@ server.registerTool(
       })
 
       const result = asObject(response.result)
+      const requestId = asNullableString(result?.requestId)
+      const immediateApplyId = (result?.applyId as string | number | null | undefined) ?? null
+      rememberRequestAppKey(requestId, parsedArgs.app_key)
+      rememberApplyAppKey(immediateApplyId, parsedArgs.app_key)
+      const shouldWaitForResult = (parsedArgs.wait_result ?? false) && requestId !== null && immediateApplyId === null
+
+      let finalApplyId: string | number | null = immediateApplyId
+      let waitStatus: "completed" | "pending" | "timeout" | "failed" = immediateApplyId !== null ? "completed" : "pending"
+      let rawOperationResult: unknown = null
+
+      if (shouldWaitForResult) {
+        const waited = await waitForOperationResolution({
+          requestId: requestId!,
+          timeoutMs: parsedArgs.wait_timeout_ms ?? WAIT_RESULT_DEFAULT_TIMEOUT_MS
+        })
+        waitStatus = waited.status
+        rawOperationResult = waited.operationResult
+        finalApplyId = waited.applyId
+        rememberApplyAppKey(waited.applyId, parsedArgs.app_key)
+      }
+
+      const createResource =
+        finalApplyId !== null ? { type: "record" as const, apply_id: finalApplyId } : null
+      const createNextAction =
+        waitStatus === "pending" || waitStatus === "timeout"
+          ? {
+              tool: "qf_operation_get",
+              arguments: { request_id: requestId },
+              reason:
+                waitStatus === "timeout"
+                  ? "Operation timed out; poll again to check completion."
+                  : "Operation is async; poll to check completion."
+            }
+          : null
+
       return okResult(
         {
           ok: true,
           data: {
-            request_id: asNullableString(result?.requestId),
-            apply_id: (result?.applyId as string | number | null | undefined) ?? null,
-            async_hint: "Use qf_operation_get with request_id when apply_id is null."
+            status: waitStatus,
+            request_id: requestId,
+            apply_id: finalApplyId,
+            resource: createResource,
+            next_action: createNextAction,
+            raw: rawOperationResult !== null ? { operation_result: rawOperationResult } : null
           },
           meta: buildMeta(response)
         },
@@ -1890,7 +2960,7 @@ server.registerTool(
   "qf_record_update",
   {
     title: "Qingflow Record Update",
-    description: "Patch one record by applyId with explicit answers or ergonomic fields mapping.",
+    description: "Patch one record by applyId with explicit answers or ergonomic fields mapping (title or queId). Set wait_result=true to poll until the update is confirmed instead of requiring a follow-up qf_operation_get call.",
     inputSchema: updateInputPublicSchema,
     outputSchema: updateOutputSchema,
     annotations: {
@@ -1901,15 +2971,21 @@ server.registerTool(
   async (args) => {
     try {
       const parsedArgs = updateInputSchema.parse(args)
-      const requiresForm = needsFormResolution(parsedArgs.fields)
-      if (requiresForm && !parsedArgs.app_key) {
-        throw new Error("app_key is required when fields uses title-based keys")
+      const resolvedAppKey = parsedArgs.app_key ?? getCachedApplyAppKey(parsedArgs.apply_id)
+      const requiresFormByTitle = needsFormResolution(parsedArgs.fields)
+      if (requiresFormByTitle && !resolvedAppKey) {
+        throw missingRequiredFieldError({
+          field: "app_key",
+          tool: "qf_record_update",
+          fixHint: "Provide app_key when fields uses title-based keys, or switch fields to numeric que_id."
+        })
       }
 
       const form =
-        requiresForm && parsedArgs.app_key
+        (hasWritePayload(parsedArgs.answers, parsedArgs.fields) || Boolean(parsedArgs.force_refresh_form)) &&
+        resolvedAppKey
           ? await getFormCached(
-              parsedArgs.app_key,
+              resolvedAppKey,
               parsedArgs.user_id,
               Boolean(parsedArgs.force_refresh_form)
             )
@@ -1918,7 +2994,8 @@ server.registerTool(
       const normalizedAnswers = resolveAnswers({
         explicitAnswers: parsedArgs.answers,
         fields: parsedArgs.fields,
-        form: form?.result
+        form: form?.result,
+        tool: "qf_record_update"
       })
 
       const response = await client.updateRecord(
@@ -1927,13 +3004,57 @@ server.registerTool(
         { userId: parsedArgs.user_id }
       )
       const result = asObject(response.result)
+      const updateRequestId = asNullableString(result?.requestId)
+      rememberRequestAppKey(updateRequestId, parsedArgs.app_key ?? null)
+      rememberApplyAppKey(parsedArgs.apply_id, parsedArgs.app_key ?? null)
+      const shouldWaitForUpdate = (parsedArgs.wait_result ?? false) && updateRequestId !== null
+
+      let updateStatus: "completed" | "pending" | "timeout" | "failed" = "pending"
+      let updateRawOperationResult: unknown = null
+      let updateApplyId: string | number | null = parsedArgs.apply_id
+
+      if (shouldWaitForUpdate) {
+        const waited = await waitForOperationResolution({
+          requestId: updateRequestId!,
+          timeoutMs: parsedArgs.wait_timeout_ms ?? WAIT_RESULT_DEFAULT_TIMEOUT_MS
+        })
+        updateStatus = waited.status
+        updateRawOperationResult = waited.operationResult
+        // For updates, the apply_id is already known from input; keep it unless operation returned a different one
+        if (waited.applyId !== null) {
+          updateApplyId = waited.applyId
+        }
+        rememberApplyAppKey(waited.applyId, parsedArgs.app_key ?? null)
+      } else if (updateRequestId === null) {
+        // No async operation — synchronous completion
+        updateStatus = "completed"
+      }
+      // else: wait_result=false but has requestId — submitted, not polled, stays "pending"
+
+      const updateResource =
+        updateApplyId !== null ? { type: "record" as const, apply_id: updateApplyId } : null
+      const updateNextAction =
+        updateStatus === "pending" || updateStatus === "timeout"
+          ? {
+              tool: "qf_operation_get",
+              arguments: { request_id: updateRequestId },
+              reason:
+                updateStatus === "timeout"
+                  ? "Operation timed out; poll again to check completion."
+                  : "Operation is async; poll to check completion."
+            }
+          : null
 
       return okResult(
         {
           ok: true,
           data: {
-            request_id: asNullableString(result?.requestId),
-            async_hint: "Use qf_operation_get with request_id to fetch update result when needed."
+            status: updateStatus,
+            request_id: updateRequestId,
+            apply_id: updateApplyId,
+            resource: updateResource,
+            next_action: updateNextAction,
+            raw: updateRawOperationResult !== null ? { operation_result: updateRawOperationResult } : null
           },
           meta: buildMeta(response)
         },
@@ -1960,6 +3081,8 @@ server.registerTool(
   async (args) => {
     try {
       const response = await client.getOperation(args.request_id)
+      const cachedAppKey = getCachedRequestAppKey(args.request_id)
+      rememberApplyAppKey(extractOperationApplyId(response.result), cachedAppKey)
       return okResult(
         {
           ok: true,
@@ -1982,7 +3105,7 @@ server.registerTool(
   {
     title: "Qingflow Records Aggregate",
     description:
-      "Aggregate records by group_by columns with optional amount metrics. Designed for deterministic, auditable statistics.",
+      "Aggregate records with optional group_by columns and amount metrics. Omit group_by for total-only summary (count/sum/avg across all records). Field titles are resolved automatically. Designed for deterministic, auditable statistics.",
     inputSchema: aggregateInputPublicSchema,
     outputSchema: aggregateOutputSchema,
     annotations: {
@@ -2319,6 +3442,344 @@ function buildMeta(response: QingflowResponse<unknown>) {
   }
 }
 
+function rememberApplyAppKey(applyId: string | number | null | undefined, appKey: string | null | undefined): void {
+  const normalizedApplyId = asNullableString(applyId)?.trim()
+  const normalizedAppKey = asNullableString(appKey)?.trim()
+  if (!normalizedApplyId || !normalizedAppKey) {
+    return
+  }
+  applyAppKeyCache.set(normalizedApplyId, {
+    appKey: normalizedAppKey,
+    expiresAt: Date.now() + APPLY_APP_KEY_CACHE_TTL_MS
+  })
+}
+
+function rememberRequestAppKey(requestId: string | null | undefined, appKey: string | null | undefined): void {
+  const normalizedRequestId = asNullableString(requestId)?.trim()
+  const normalizedAppKey = asNullableString(appKey)?.trim()
+  if (!normalizedRequestId || !normalizedAppKey) {
+    return
+  }
+  requestAppKeyCache.set(normalizedRequestId, {
+    appKey: normalizedAppKey,
+    expiresAt: Date.now() + APPLY_APP_KEY_CACHE_TTL_MS
+  })
+}
+
+function getCachedApplyAppKey(applyId: string | number | null | undefined): string | null {
+  const normalizedApplyId = asNullableString(applyId)?.trim()
+  if (!normalizedApplyId) {
+    return null
+  }
+  const hit = applyAppKeyCache.get(normalizedApplyId)
+  if (!hit) {
+    return null
+  }
+  if (hit.expiresAt <= Date.now()) {
+    applyAppKeyCache.delete(normalizedApplyId)
+    return null
+  }
+  return hit.appKey
+}
+
+function getCachedRequestAppKey(requestId: string | null | undefined): string | null {
+  const normalizedRequestId = asNullableString(requestId)?.trim()
+  if (!normalizedRequestId) {
+    return null
+  }
+  const hit = requestAppKeyCache.get(normalizedRequestId)
+  if (!hit) {
+    return null
+  }
+  if (hit.expiresAt <= Date.now()) {
+    requestAppKeyCache.delete(normalizedRequestId)
+    return null
+  }
+  return hit.appKey
+}
+
+async function fetchRecordsByApplyIds(params: {
+  appKey: string
+  applyIds: string[]
+  userId?: string
+}): Promise<{
+  response: QingflowResponse<unknown>
+  records: Array<Record<string, unknown>>
+}> {
+  const response = await client.listRecords(
+    params.appKey,
+    buildListPayload({
+      pageNum: 1,
+      pageSize: Math.min(Math.max(params.applyIds.length, 1), 200),
+      applyIds: params.applyIds
+    }),
+    { userId: params.userId }
+  )
+  const records = asArray(asObject(response.result)?.result)
+    .map((item) => asObject(item))
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+  return { response, records }
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  return uniqueStringList(
+    asArray(value)
+      .map((item) => asNullableString(item)?.trim() ?? "")
+      .filter((item) => item.length > 0)
+  )
+}
+
+function normalizeDepartment(raw: unknown): z.infer<typeof departmentOutputSchema> {
+  const obj = asObject(raw) ?? {}
+  return {
+    dept_id: toNonNegativeInt(obj.deptId),
+    name: asNullableString(obj.name),
+    parent_id: toNonNegativeInt(obj.parentId),
+    ordinal: toNonNegativeInt(obj.ordinal),
+    dept_leader_ids: normalizeStringArray(obj.deptLeader)
+  }
+}
+
+function normalizeUser(raw: unknown): z.infer<typeof directoryUserSchema> {
+  const obj = asObject(raw) ?? {}
+  return {
+    user_id: asNullableString(obj.userId),
+    name: asNullableString(obj.name),
+    area_code: asNullableString(obj.areaCode),
+    mobile_num: asNullableString(obj.mobileNum),
+    email: asNullableString(obj.email),
+    head_img: asNullableString(obj.headImg),
+    department_ids: normalizeStringArray(obj.department),
+    role_ids: normalizeStringArray(obj.role),
+    custom_role_ids: normalizeStringArray(obj.customRole),
+    custom_department_ids: normalizeStringArray(obj.customDepartment),
+    being_disabled: typeof obj.beingDisabled === "boolean" ? obj.beingDisabled : null,
+    being_active: typeof obj.beingActive === "boolean" ? obj.beingActive : null,
+    superior_id: asNullableString(obj.superiorId)
+  }
+}
+
+function normalizeAppAuthMembers(raw: unknown): z.infer<typeof appAuthMembersSchema> {
+  const obj = asObject(raw) ?? {}
+  return {
+    users: asArray(obj.users).map((item) => {
+      const entry = asObject(item) ?? {}
+      return {
+        user_id: asNullableString(entry.userId),
+        user_name: asNullableString(entry.userName)
+      }
+    }),
+    departments: asArray(obj.depts).map((item) => {
+      const entry = asObject(item) ?? {}
+      return {
+        dept_id: toNonNegativeInt(entry.deptId),
+        dept_name: asNullableString(entry.deptName)
+      }
+    }),
+    roles: asArray(obj.roles).map((item) => {
+      const entry = asObject(item) ?? {}
+      return {
+        role_id: toNonNegativeInt(entry.roleId),
+        role_name: asNullableString(entry.roleName)
+      }
+    })
+  }
+}
+
+function normalizeAppInfo(raw: unknown): z.infer<typeof appInfoSchema> {
+  const obj = asObject(raw) ?? {}
+  const creator = asObject(obj.creator) ?? {}
+  return {
+    app_key: asNullableString(obj.appKey),
+    app_name: asNullableString(obj.appName),
+    app_auth: toNonNegativeInt(obj.appAuth),
+    app_icon: asNullableString(obj.appIcon),
+    auth_members: normalizeAppAuthMembers(obj.authmembers ?? obj.authMembers),
+    creator: {
+      user_id: asNullableString(creator.userId),
+      nick_name: asNullableString(creator.nickName),
+      head_img: asNullableString(creator.headImg)
+    },
+    create_time: asNullableString(obj.createTime),
+    tags: asArray(obj.tags).map((item) => {
+      const entry = asObject(item) ?? {}
+      return {
+        tag_id: toNonNegativeInt(entry.tagId),
+        tag_name: asNullableString(entry.tagName)
+      }
+    }),
+    app_publish_status: toNonNegativeInt(obj.appPublishStatus)
+  }
+}
+
+function normalizeAppPackage(raw: unknown): z.infer<typeof appPackageSchema> {
+  const obj = asObject(raw) ?? {}
+  return {
+    tag_id: toNonNegativeInt(obj.tagId),
+    tag_name: asNullableString(obj.tagName),
+    tag_icon: asNullableString(obj.tagIcon),
+    apps: asArray(obj.appList).map((item) => {
+      const entry = asObject(item) ?? {}
+      return {
+        app_key: asNullableString(entry.appKey),
+        app_name: asNullableString(entry.appName)
+      }
+    }),
+    dashboards: asArray(obj.dashList).map((item) => {
+      const entry = asObject(item) ?? {}
+      return {
+        dash_key: asNullableString(entry.dashKey),
+        dash_name: asNullableString(entry.dashName)
+      }
+    })
+  }
+}
+
+function normalizeAuditUserInfo(raw: unknown): z.infer<typeof auditUserInfoSchema> {
+  const obj = asObject(raw) ?? {}
+  return {
+    user_id: asNullableString(obj.userId),
+    user_name: asNullableString(obj.userName),
+    nick_name: asNullableString(obj.nickName),
+    head_img: asNullableString(obj.headImg)
+  }
+}
+
+function toNullableSpecialId(value: unknown): string | number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.trunc(value)
+  }
+  if (typeof value === "string" && value.trim()) {
+    const normalized = value.trim()
+    if (/^\d+$/.test(normalized)) {
+      return Number(normalized)
+    }
+    return normalized
+  }
+  const obj = asObject(value)
+  if (!obj) {
+    return null
+  }
+  const candidate = obj.queId ?? obj.id ?? obj.value ?? obj.dataValue ?? null
+  return candidate === null ? null : toNullableSpecialId(candidate)
+}
+
+function normalizeAuditRecordSummary(raw: unknown): z.infer<typeof auditRecordSummarySchema> {
+  const obj = asObject(raw) ?? {}
+  return {
+    audit_rcd_id: toNonNegativeInt(obj.auditRcdId),
+    audit_node_id: toNonNegativeInt(obj.auditNodeId),
+    audit_node_name: asNullableString(obj.auditNodeName),
+    audit_time_ms: toNonNegativeInt(obj.auditTime),
+    audit_result: obj.auditResult ?? null,
+    audit_feedback: asNullableString(obj.auditFeedback),
+    audit_user: obj.auditUser ? normalizeAuditUserInfo(obj.auditUser) : null,
+    wait_audit_users: asArray(obj.waitAuditUserList).map((item) => normalizeAuditUserInfo(item))
+  }
+}
+
+function normalizeAuditModifies(raw: unknown): Array<z.infer<typeof auditModifySchema>> {
+  const source = Array.isArray(raw)
+    ? raw
+    : asObject(raw)
+      ? Object.values(raw as Record<string, unknown>)
+      : []
+  return source.map((item) => {
+    const entry = asObject(item) ?? {}
+    return {
+      que_id: toNullableSpecialId(entry.queId),
+      que_title: asNullableString(entry.queTitle),
+      que_type: entry.queType ?? null,
+      before_answer: asArray(entry.beforeAnswer),
+      after_answer: asArray(entry.afterAnswer)
+    }
+  })
+}
+
+function translateAdminApiError(
+  error: unknown,
+  params:
+    | { tool: "qf_apps_info_list" | "qf_app_info_get"; entity: "app"; appKey: string }
+    | { tool: "qf_apply_audit_records_list"; entity: "apply"; applyId: string }
+    | { tool: "qf_apply_audit_record_get"; entity: "audit_record"; applyId: string; auditRcdId: string }
+): Error {
+  if (
+    error instanceof QingflowApiError &&
+    (error.httpStatus === 404 || error.errCode === 404)
+  ) {
+    if (params.entity === "app") {
+      return new InputValidationError({
+        message: `App \"${params.appKey}\" not found`,
+        errorCode: "APP_NOT_FOUND",
+        fixHint: "Call qf_apps_list or qf_apps_info_list first to confirm the exact app_key.",
+        details: {
+          tool: params.tool,
+          app_key: params.appKey
+        }
+      })
+    }
+    if (params.entity === "apply") {
+      return new InputValidationError({
+        message: `Apply \"${params.applyId}\" not found`,
+        errorCode: "APPLY_NOT_FOUND",
+        fixHint: "Use qf_record_get or your record query tools first to confirm the exact apply_id.",
+        details: {
+          tool: params.tool,
+          apply_id: params.applyId
+        }
+      })
+    }
+    return new InputValidationError({
+      message: `Audit record \"${params.auditRcdId}\" for apply \"${params.applyId}\" not found`,
+      errorCode: "AUDIT_RECORD_NOT_FOUND",
+      fixHint: "Call qf_apply_audit_records_list first to confirm the exact audit_rcd_id.",
+      details: {
+        tool: params.tool,
+        apply_id: params.applyId,
+        audit_rcd_id: params.auditRcdId
+      }
+    })
+  }
+
+  return error instanceof Error ? error : new Error(String(error))
+}
+
+function translateDirectoryApiError(
+  error: unknown,
+  params:
+    | { tool: "qf_departments_list" | "qf_department_users_list"; entity: "department"; deptId: string | number }
+    | { tool: "qf_user_get"; entity: "user"; userId: string }
+): Error {
+  if (
+    error instanceof QingflowApiError &&
+    (error.httpStatus === 404 || error.errCode === 404)
+  ) {
+    if (params.entity === "department") {
+      return new InputValidationError({
+        message: `Department \"${String(params.deptId)}\" not found`,
+        errorCode: "DEPARTMENT_NOT_FOUND",
+        fixHint: "Call qf_departments_list first to confirm the exact dept_id.",
+        details: {
+          tool: params.tool,
+          dept_id: params.deptId
+        }
+      })
+    }
+
+    return new InputValidationError({
+      message: `User \"${params.userId}\" not found`,
+      errorCode: "USER_NOT_FOUND",
+      fixHint: "Call qf_users_list or qf_department_users_list first to obtain a valid user_id.",
+      details: {
+        tool: params.tool,
+        user_id: params.userId
+      }
+    })
+  }
+
+  return error instanceof Error ? error : new Error(String(error))
+}
+
 function resolveOutputProfile(value: unknown): OutputProfile {
   return value === "verbose" ? "verbose" : DEFAULT_OUTPUT_PROFILE
 }
@@ -2346,6 +3807,7 @@ function missingRequiredFieldError(params: {
 const COMMON_INPUT_ALIASES: Record<string, string> = {
   appKey: "app_key",
   userId: "user_id",
+  tagId: "tag_id",
   pageNum: "page_num",
   pageSize: "page_size",
   pageToken: "page_token",
@@ -2357,6 +3819,7 @@ const COMMON_INPUT_ALIASES: Record<string, string> = {
   queryMode: "query_mode",
   queryLogic: "query_logic",
   applyId: "apply_id",
+  auditRcdId: "audit_rcd_id",
   applyIds: "apply_ids",
   maxRows: "max_rows",
   rowLimit: "max_rows",
@@ -2435,6 +3898,166 @@ function normalizeToolSpecInput(raw: unknown): unknown {
   }
 }
 
+function normalizeDepartmentListInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    deptId: "dept_id",
+    department_id: "dept_id",
+    departmentId: "dept_id"
+  })
+  return {
+    ...normalizedObj,
+    dept_id: coerceNumberLike(normalizeSelectorInputValue(normalizedObj.dept_id)),
+    keyword: coerceStringLike(normalizedObj.keyword),
+    limit: coerceNumberLike(normalizedObj.limit),
+    offset: coerceNumberLike(normalizedObj.offset)
+  }
+}
+
+function normalizeDepartmentUsersInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    deptId: "dept_id",
+    department_id: "dept_id",
+    departmentId: "dept_id",
+    fetchChild: "fetch_child"
+  })
+  return {
+    ...normalizedObj,
+    dept_id: coerceNumberLike(normalizeSelectorInputValue(normalizedObj.dept_id)),
+    fetch_child: coerceBooleanLike(normalizedObj.fetch_child),
+    keyword: coerceStringLike(normalizedObj.keyword),
+    limit: coerceNumberLike(normalizedObj.limit),
+    offset: coerceNumberLike(normalizedObj.offset)
+  }
+}
+
+function normalizeUsersListInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    pageNum: "page_num",
+    pageSize: "page_size"
+  })
+  return {
+    ...normalizedObj,
+    page_num: coerceNumberLike(normalizedObj.page_num),
+    page_size: coerceNumberLike(normalizedObj.page_size)
+  }
+}
+
+function normalizeUserGetInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    userId: "user_id"
+  })
+  return {
+    ...normalizedObj,
+    user_id: coerceStringLike(normalizedObj.user_id)
+  }
+}
+
+function normalizeAppInfoListInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    appKey: "app_key",
+    pageNum: "page_num",
+    pageSize: "page_size"
+  })
+  return {
+    ...normalizedObj,
+    app_key: coerceStringLike(normalizedObj.app_key),
+    page_num: coerceNumberLike(normalizedObj.page_num),
+    page_size: coerceNumberLike(normalizedObj.page_size)
+  }
+}
+
+function normalizeAppInfoGetInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    appKey: "app_key"
+  })
+  return {
+    ...normalizedObj,
+    app_key: coerceStringLike(normalizedObj.app_key)
+  }
+}
+
+function normalizeAppPackageListInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    userId: "user_id",
+    tagId: "tag_id"
+  })
+  return {
+    ...normalizedObj,
+    user_id: coerceStringLike(normalizedObj.user_id),
+    tag_id: coerceNumberLike(normalizeSelectorInputValue(normalizedObj.tag_id)),
+    keyword: coerceStringLike(normalizedObj.keyword),
+    limit: coerceNumberLike(normalizedObj.limit),
+    offset: coerceNumberLike(normalizedObj.offset)
+  }
+}
+
+function normalizeApplyAuditRecordsInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    applyId: "apply_id"
+  })
+  return {
+    ...normalizedObj,
+    apply_id: coerceStringLike(normalizedObj.apply_id)
+  }
+}
+
+function normalizeApplyAuditRecordGetInput(raw: unknown): unknown {
+  const parsedRoot = parseJsonLikeDeep(raw)
+  const obj = asObject(parsedRoot)
+  if (!obj) {
+    return parsedRoot
+  }
+  const normalizedObj = applyAliases(obj, {
+    applyId: "apply_id",
+    auditRcdId: "audit_rcd_id"
+  })
+  return {
+    ...normalizedObj,
+    apply_id: coerceStringLike(normalizedObj.apply_id),
+    audit_rcd_id: coerceStringLike(normalizedObj.audit_rcd_id)
+  }
+}
+
 function buildToolSpecCatalog(): ToolSpecDoc[] {
   return [
     {
@@ -2465,10 +4088,130 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       }
     },
     {
+      tool: "qf_apps_info_list",
+      required: ["page_num", "page_size"],
+      limits: {
+        input_contract: "strict JSON only; page_num/page_size must be native JSON numbers"
+      },
+      aliases: collectAliasHints(["page_num", "page_size", "app_key"], {}),
+      minimal_example: {
+        page_num: 1,
+        page_size: 50,
+        app_key: "21b3d559"
+      }
+    },
+    {
+      tool: "qf_app_info_get",
+      required: ["app_key"],
+      limits: {
+        input_contract: "strict JSON only; app_key must be a native JSON string"
+      },
+      aliases: collectAliasHints(["app_key"], {}),
+      minimal_example: {
+        app_key: "21b3d559"
+      }
+    },
+    {
+      tool: "qf_app_packages_list",
+      required: ["user_id"],
+      limits: {
+        limit_max: 500,
+        offset_min: 0,
+        input_contract: "strict JSON only; user_id must be a native JSON string when provided"
+      },
+      aliases: collectAliasHints(["user_id", "tag_id"], {}),
+      minimal_example: {
+        user_id: "u_123",
+        limit: 20
+      }
+    },
+    {
+      tool: "qf_apply_audit_records_list",
+      required: ["apply_id"],
+      limits: {
+        input_contract: "strict JSON only; apply_id must be a native JSON string"
+      },
+      aliases: collectAliasHints(["apply_id"], {}),
+      minimal_example: {
+        apply_id: "50001234"
+      }
+    },
+    {
+      tool: "qf_apply_audit_record_get",
+      required: ["apply_id", "audit_rcd_id"],
+      limits: {
+        input_contract: "strict JSON only; apply_id/audit_rcd_id must be native JSON strings"
+      },
+      aliases: collectAliasHints(["apply_id", "audit_rcd_id"], {}),
+      minimal_example: {
+        apply_id: "50001234",
+        audit_rcd_id: "1111"
+      }
+    },
+    {
+      tool: "qf_departments_list",
+      required: [],
+      limits: {
+        limit_max: 500,
+        offset_min: 0,
+        input_contract: "strict JSON only; dept_id must be a native JSON string or number when provided"
+      },
+      aliases: collectAliasHints(["dept_id"], {
+        dept_id: ["deptId", "department_id", "departmentId"]
+      }),
+      minimal_example: {
+        dept_id: 111,
+        limit: 20
+      }
+    },
+    {
+      tool: "qf_department_users_list",
+      required: ["dept_id", "fetch_child"],
+      limits: {
+        limit_max: 500,
+        offset_min: 0,
+        input_contract: "strict JSON only; fetch_child must be a native JSON boolean"
+      },
+      aliases: collectAliasHints(["dept_id", "fetch_child"], {
+        dept_id: ["deptId", "department_id", "departmentId"],
+        fetch_child: ["fetchChild"]
+      }),
+      minimal_example: {
+        dept_id: 111,
+        fetch_child: true,
+        limit: 50
+      }
+    },
+    {
+      tool: "qf_users_list",
+      required: ["page_num", "page_size"],
+      limits: {
+        input_contract: "strict JSON only; page_num/page_size must be native JSON numbers"
+      },
+      aliases: collectAliasHints(["page_num", "page_size"], {}),
+      minimal_example: {
+        page_num: 1,
+        page_size: 100
+      }
+    },
+    {
+      tool: "qf_user_get",
+      required: ["user_id"],
+      limits: {
+        input_contract: "strict JSON only; user_id must be a native JSON string"
+      },
+      aliases: collectAliasHints(["user_id"], {}),
+      minimal_example: {
+        user_id: "u_123"
+      }
+    },
+    {
       tool: "qf_form_get",
       required: ["app_key"],
       limits: {
-        app_key: "required string"
+        app_key: "required string",
+        write_format_hint:
+          "field_summaries[].write_format is populated for member/department fields so agents can discover exact create/update payload shapes before writing."
       },
       aliases: collectAliasHints(["app_key", "user_id", "force_refresh"], {}),
       minimal_example: {
@@ -2496,7 +4239,8 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       limits: {
         tool:
           "qf_records_list|qf_record_get|qf_query|qf_records_aggregate|qf_records_batch_get|qf_export_csv|qf_export_json",
-        input_contract: "strict JSON only; arguments must be a native JSON object"
+        input_contract: "strict JSON only; arguments must be a native JSON object",
+        usage_hint: "Debug/explain only. For normal queries use qf_query directly."
       },
       aliases: {},
       minimal_example: {
@@ -2613,9 +4357,9 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
     {
       tool: "qf_query",
       required: [
-        "record mode: apply_id + select_columns",
+        "record mode: apply_id (select_columns recommended)",
         "list mode: app_key + select_columns",
-        "summary mode: app_key + select_columns"
+        "summary mode: app_key only (select_columns auto-derived from amount_column/time_range)"
       ],
       limits: {
         query_mode: "auto|list|record|summary",
@@ -2647,7 +4391,7 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
     },
     {
       tool: "qf_records_aggregate",
-      required: ["app_key", "group_by"],
+      required: ["app_key"],
       limits: {
         page_size_max: 200,
         requested_pages_max: 500,
@@ -2683,7 +4427,13 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       required: ["app_key", "answers or fields"],
       limits: {
         write_mode: "Provide either answers[] or fields{}",
-        input_contract: "strict JSON only; answers must be array and fields must be object"
+        wait_result: "optional boolean; when true, polls qf_operation_get internally and returns resolved apply_id directly",
+        wait_timeout_ms: "optional int (max 20000); default 5000ms",
+        input_contract: "strict JSON only; answers must be array and fields must be object",
+        special_field_write_formats: {
+          member_list: [{ userId: "u_123", userName: "张三" }],
+          department_list: [{ deptId: 111, deptName: "销售部" }]
+        }
       },
       aliases: {},
       minimal_example: {
@@ -2699,7 +4449,13 @@ function buildToolSpecCatalog(): ToolSpecDoc[] {
       required: ["apply_id", "answers or fields"],
       limits: {
         write_mode: "Provide either answers[] or fields{}",
-        input_contract: "strict JSON only; answers must be array and fields must be object"
+        wait_result: "optional boolean; when true, polls qf_operation_get internally and returns resolved result directly",
+        wait_timeout_ms: "optional int (max 20000); default 5000ms",
+        input_contract: "strict JSON only; answers must be array and fields must be object",
+        special_field_write_formats: {
+          member_list: [{ userId: "u_123", userName: "张三" }],
+          department_list: [{ deptId: 111, deptName: "销售部" }]
+        }
       },
       aliases: {},
       minimal_example: {
@@ -2780,7 +4536,7 @@ function normalizeListInput(raw: unknown): unknown {
     strict_full: coerceBooleanLike(normalizedObj.strict_full),
     include_answers: coerceBooleanLike(normalizedObj.include_answers),
     output_profile: normalizeOutputProfileInput(normalizedObj.output_profile),
-    apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
+    apply_ids: normalizeOpaqueIdArrayInput(normalizedObj.apply_ids),
     sort: normalizeSortInput(normalizedObj.sort),
     filters: normalizeFiltersInput(normalizedObj.filters),
     select_columns: normalizeSelectorListInput(selectColumns),
@@ -2799,7 +4555,8 @@ function normalizeRecordGetInput(raw: unknown): unknown {
 
   return {
     ...normalizedObj,
-    apply_id: coerceNumberLike(normalizedObj.apply_id),
+    apply_id: normalizeOpaqueIdInput(normalizedObj.apply_id),
+    app_key: coerceStringLike(normalizedObj.app_key),
     max_columns: coerceNumberLike(normalizedObj.max_columns),
     select_columns: normalizeSelectorListInput(selectColumns),
     output_profile: normalizeOutputProfileInput(normalizedObj.output_profile)
@@ -2826,12 +4583,12 @@ function normalizeQueryInput(raw: unknown): unknown {
     max_rows: coerceNumberLike(normalizedObj.max_rows),
     max_items: coerceNumberLike(normalizedObj.max_items),
     max_columns: coerceNumberLike(normalizedObj.max_columns),
-    apply_id: coerceNumberLike(normalizedObj.apply_id),
+    apply_id: normalizeOpaqueIdInput(normalizedObj.apply_id),
     strict_full: coerceBooleanLike(normalizedObj.strict_full),
     include_answers: coerceBooleanLike(normalizedObj.include_answers),
     output_profile: normalizeOutputProfileInput(normalizedObj.output_profile),
     amount_column: normalizeAmountColumnInput(normalizedObj.amount_column),
-    apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
+    apply_ids: normalizeOpaqueIdArrayInput(normalizedObj.apply_ids),
     sort: normalizeSortInput(normalizedObj.sort),
     filters: normalizeFiltersInput(normalizedObj.filters),
     select_columns: normalizeSelectorListInput(selectColumns),
@@ -2867,7 +4624,7 @@ function normalizeAggregateInput(raw: unknown): unknown {
     amount_column: normalizeAmountColumnInput(amountColumns),
     metrics: normalizeMetricsInput(normalizedObj.metrics),
     time_bucket: normalizeTimeBucketInput(normalizedObj.time_bucket),
-    apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
+    apply_ids: normalizeOpaqueIdArrayInput(normalizedObj.apply_ids),
     sort: normalizeSortInput(normalizedObj.sort),
     filters: normalizeFiltersInput(normalizedObj.filters),
     time_range: timeRange,
@@ -2929,7 +4686,8 @@ function normalizeBatchGetInput(raw: unknown): unknown {
   const selectColumns = normalizedObj.select_columns ?? normalizedObj.keep_columns
   return {
     ...normalizedObj,
-    apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
+    app_key: coerceStringLike(normalizedObj.app_key),
+    apply_ids: normalizeOpaqueIdArrayInput(normalizedObj.apply_ids),
     max_columns: coerceNumberLike(normalizedObj.max_columns),
     select_columns: normalizeSelectorListInput(selectColumns),
     output_profile: normalizeOutputProfileInput(normalizedObj.output_profile)
@@ -2956,7 +4714,7 @@ function normalizeExportInput(raw: unknown): unknown {
     max_columns: coerceNumberLike(normalizedObj.max_columns),
     strict_full: coerceBooleanLike(normalizedObj.strict_full),
     output_profile: normalizeOutputProfileInput(normalizedObj.output_profile),
-    apply_ids: normalizeIdArrayInput(normalizedObj.apply_ids),
+    apply_ids: normalizeOpaqueIdArrayInput(normalizedObj.apply_ids),
     sort: normalizeSortInput(normalizedObj.sort),
     filters: normalizeFiltersInput(normalizedObj.filters),
     select_columns: normalizeSelectorListInput(selectColumns),
@@ -3087,6 +4845,36 @@ function normalizeIdArrayInput(value: unknown): unknown {
       .map((item) => item.trim())
       .filter((item) => item.length > 0)
       .map((item) => coerceNumberLike(item))
+  }
+  return parsed
+}
+
+function normalizeOpaqueIdInput(value: unknown): unknown {
+  const parsed = parseJsonLikeDeep(value)
+  if (parsed === undefined || parsed === null) {
+    return parsed
+  }
+  if (typeof parsed === "string") {
+    const trimmed = parsed.trim()
+    return trimmed ? trimmed : parsed
+  }
+  if (typeof parsed === "number" && Number.isFinite(parsed)) {
+    return String(Math.trunc(parsed))
+  }
+  return parsed
+}
+
+function normalizeOpaqueIdArrayInput(value: unknown): unknown {
+  const parsed = parseJsonLikeDeep(value)
+  if (Array.isArray(parsed)) {
+    return parsed.map((item) => normalizeOpaqueIdInput(item))
+  }
+  if (typeof parsed === "string" && parsed.includes(",")) {
+    return parsed
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0)
+      .map((item) => normalizeOpaqueIdInput(item))
   }
   return parsed
 }
@@ -3957,13 +5745,15 @@ function inferPlanMissingRequired(tool: string, args: Record<string, unknown>): 
       if (!hasSelectColumns) {
         missing.push("select_columns")
       }
-    } else {
+    } else if (queryMode === "list") {
       if (!hasAppKey) {
         missing.push("app_key")
       }
       if (!hasSelectColumns) {
         missing.push("select_columns")
       }
+    } else if (!hasAppKey) {
+      missing.push("app_key")
     }
   }
 
@@ -4365,6 +6155,196 @@ function scoreFieldMatches(
   }
 
   return scored.sort((a, b) => b.score - a.score).slice(0, topK)
+}
+
+function buildFieldCandidateList(fields: FormField[]): Array<{
+  que_id: string | number
+  que_title: string | null
+  que_type: unknown
+}> {
+  return fields
+    .filter((field) => field.queId !== undefined && field.queId !== null)
+    .map((field) => ({
+      que_id: normalizeQueId(field.queId),
+      que_title: asNullableString(field.queTitle),
+      que_type: field.queType
+    }))
+}
+
+function buildFieldSuggestions(
+  requested: string,
+  index: FieldIndex,
+  topK = 3
+): Array<{
+  que_id: string | number
+  que_title: string | null
+  que_type: unknown
+  score: number
+  match_type: string
+}> {
+  return scoreFieldMatches(requested, Array.from(index.byId.values()), true, topK)
+}
+
+function buildResolvedMappingEntry(params: {
+  requested: string
+  field?: FormField | null
+  resolved: boolean
+  reason?: string | null
+  auto_selected?: boolean
+}): Record<string, unknown> {
+  const field = params.field ?? null
+  return {
+    requested: params.requested,
+    resolved: params.resolved,
+    que_id:
+      field?.queId !== undefined && field?.queId !== null ? normalizeQueId(field.queId) : null,
+    que_title: asNullableString(field?.queTitle),
+    que_type: field?.queType ?? null,
+    ...(params.reason ? { reason: params.reason } : {}),
+    ...(params.auto_selected ? { auto_selected: true } : {})
+  }
+}
+
+function resolveFieldSelectorStrict(params: {
+  fieldKey: string | number
+  index: FieldIndex
+  tool: string
+  location: string
+  expectDateType?: boolean
+}): FormField {
+  const requested = String(params.fieldKey ?? "").trim()
+  if (!requested) {
+    throw new InputValidationError({
+      message: `${params.location} contains an empty field selector`,
+      errorCode: "EMPTY_FIELD_SELECTOR",
+      fixHint: "Pass a non-empty field title or que_id.",
+      details: {
+        tool: params.tool,
+        location: params.location
+      }
+    })
+  }
+
+  let resolved: FormField | null = null
+  if (isNumericKey(requested)) {
+    resolved = params.index.byId.get(String(Number(requested))) ?? null
+    if (!resolved) {
+      throw new InputValidationError({
+        message: `${params.location} references unknown que_id "${requested}"`,
+        errorCode: "FIELD_NOT_FOUND",
+        fixHint: "Use qf_form_get or qf_field_resolve to confirm the exact field que_id before retrying.",
+        details: {
+          tool: params.tool,
+          location: params.location,
+          requested,
+          suggestions: buildFieldSuggestions(requested, params.index)
+        }
+      })
+    }
+  } else {
+    const matches = params.index.byTitle.get(requested.toLowerCase()) ?? []
+    if (matches.length === 1) {
+      resolved = matches[0]
+    } else if (matches.length > 1) {
+      throw new InputValidationError({
+        message: `${params.location} field "${requested}" is ambiguous`,
+        errorCode: "AMBIGUOUS_FIELD",
+        fixHint: "Use numeric que_id, or call qf_field_resolve first to disambiguate the field title.",
+        details: {
+          tool: params.tool,
+          location: params.location,
+          requested,
+          candidates: buildFieldCandidateList(matches)
+        }
+      })
+    } else {
+      throw new InputValidationError({
+        message: `${params.location} cannot resolve field "${requested}"`,
+        errorCode: "FIELD_NOT_FOUND",
+        fixHint: "Use qf_form_get or qf_field_resolve to confirm the exact field title before retrying.",
+        details: {
+          tool: params.tool,
+          location: params.location,
+          requested,
+          suggestions: buildFieldSuggestions(requested, params.index)
+        }
+      })
+    }
+  }
+
+  if (params.expectDateType && !isDateLikeQueType(resolved.queType)) {
+    throw new InputValidationError({
+      message: `Field "${requested}" is not a date field and cannot be used in ${params.location}`,
+      errorCode: "TIME_RANGE_FIELD_TYPE_MISMATCH",
+      fixHint: "Use qf_form_get to pick a date field (queType=4), then retry time_range with that field.",
+      details: {
+        tool: params.tool,
+        location: params.location,
+        requested,
+        resolved_field: buildResolvedMappingEntry({
+          requested,
+          field: resolved,
+          resolved: true
+        })
+      }
+    })
+  }
+
+  return resolved
+}
+
+function resolveOutputColumn(
+  column: string | number,
+  index: FieldIndex,
+  label: string,
+  tool: string
+): SummaryColumn {
+  const requested = String(column).trim()
+  if (!requested) {
+    throw new InputValidationError({
+      message: `${label} contains an empty column selector`,
+      errorCode: "EMPTY_FIELD_SELECTOR",
+      fixHint: "Pass a non-empty field title or que_id.",
+      details: {
+        tool,
+        location: label
+      }
+    })
+  }
+
+  if (isNumericKey(requested)) {
+    const hit = index.byId.get(String(Number(requested)))
+    return {
+      requested,
+      que_id: hit?.queId !== undefined && hit?.queId !== null ? normalizeQueId(hit.queId) : Number(requested),
+      que_title: asNullableString(hit?.queTitle),
+      que_type: hit?.queType ?? null
+    }
+  }
+
+  const hit = resolveFieldSelectorStrict({
+    fieldKey: requested,
+    index,
+    tool,
+    location: label
+  })
+  return {
+    requested,
+    que_id: normalizeQueId(hit.queId),
+    que_title: asNullableString(hit.queTitle),
+    que_type: hit.queType
+  }
+}
+
+function resolveOutputColumns(
+  columns: Array<string | number>,
+  index: FieldIndex,
+  label: string,
+  tool: string
+): SummaryColumn[] {
+  return normalizeColumnSelectors(columns).map((requested) =>
+    resolveOutputColumn(requested, index, label, tool)
+  )
 }
 
 function normalizedTextSimilarity(left: string, right: string): number {
@@ -4833,6 +6813,7 @@ function buildRecordGetArgsFromQuery(
 
   return recordGetInputSchema.parse({
     apply_id: args.apply_id,
+    app_key: args.app_key,
     max_columns: args.max_columns,
     select_columns: args.select_columns,
     output_profile: args.output_profile
@@ -4942,6 +6923,13 @@ async function executeRecordsBatchGet(
   payload: z.infer<typeof batchGetOutputSchema>
   message: string
 }> {
+  if (!args.app_key) {
+    throw missingRequiredFieldError({
+      field: "app_key",
+      tool: "qf_records_batch_get",
+      fixHint: "Provide app_key, for example: {\"app_key\":\"21b3d559\",\"apply_ids\":[\"...\"],\"select_columns\":[0]}."
+    })
+  }
   if (!args.select_columns?.length) {
     throw missingRequiredFieldError({
       field: "select_columns",
@@ -4963,28 +6951,30 @@ async function executeRecordsBatchGet(
   const missingApplyIds: string[] = []
   let metaResponse: ReturnType<typeof buildMeta> | null = null
 
+  const { response, records } = await fetchRecordsByApplyIds({
+    appKey: args.app_key,
+    applyIds: requestedApplyIds
+  })
+  metaResponse = buildMeta(response)
+
+  const byApplyId = new Map(
+    records.map((record) => [String((record.applyId as string | number | null | undefined) ?? ""), record])
+  )
+
   for (const applyId of requestedApplyIds) {
-    try {
-      const response = await client.getRecord(applyId)
-      metaResponse = metaResponse ?? buildMeta(response)
-      const record = asObject(response.result) ?? {}
-      rows.push(
-        buildFlatRowFromAnswers({
-          applyId: (record.applyId as string | number | null | undefined) ?? applyId,
-          answers: asArray(record.answers),
-          selectedColumns: selectedColumnsForRow
-        })
-      )
-    } catch (error) {
-      if (
-        error instanceof QingflowApiError &&
-        (error.httpStatus === 404 || error.errCode === 404)
-      ) {
-        missingApplyIds.push(applyId)
-        continue
-      }
-      throw error
+    const record = byApplyId.get(String(applyId))
+    if (!record) {
+      missingApplyIds.push(applyId)
+      continue
     }
+    rememberApplyAppKey((record.applyId as string | number | null | undefined) ?? applyId, args.app_key)
+    rows.push(
+      buildFlatRowFromAnswers({
+        applyId: (record.applyId as string | number | null | undefined) ?? applyId,
+        answers: asArray(record.answers),
+        selectedColumns: selectedColumnsForRow
+      })
+    )
   }
 
   const completeness: z.infer<typeof completenessSchema> = {
@@ -5066,6 +7056,7 @@ async function executeRecordsExport(
 ): Promise<{
   payload: z.infer<typeof exportOutputSchema>
   message: string
+  resolvedMappings: Record<string, unknown>
 }> {
   if (!args.app_key) {
     throw missingRequiredFieldError({
@@ -5084,6 +7075,18 @@ async function executeRecordsExport(
   }
 
   const outputProfile = resolveOutputProfile(args.output_profile)
+  const form = await getFormCached(args.app_key, args.user_id, false)
+  const index = buildFieldIndex(form.result)
+  const selectResolution = resolveSelectColumnsWithIndex(args.select_columns, index, `qf_export_${format}`)
+  const filterResolution = resolveFiltersWithIndex(args.filters, index, `qf_export_${format}`)
+  const timeRangeResolution = resolveTimeRangeWithIndex(args.time_range, index, `qf_export_${format}`)
+  const sortResolution = resolveSortWithIndex(args.sort, index, `qf_export_${format}`)
+  const resolvedMappings: Record<string, unknown> = {
+    select_columns: selectResolution.mappings,
+    ...(filterResolution.mappings.length > 0 ? { filters: filterResolution.mappings } : {}),
+    ...(sortResolution.mappings.length > 0 ? { sort: sortResolution.mappings } : {}),
+    ...(timeRangeResolution.mapping ? { time_range: timeRangeResolution.mapping } : {})
+  }
   const queryId = randomUUID()
   const pageNum = resolveStartPage(args.page_num, args.page_token, args.app_key)
   const requestedPages = args.requested_pages ?? EXPORT_DEFAULT_PAGES
@@ -5091,14 +7094,12 @@ async function executeRecordsExport(
   const maxRows = Math.min(args.max_rows ?? EXPORT_MAX_ROWS, EXPORT_MAX_ROWS)
   const startedAt = Date.now()
   const adaptivePaging = createAdaptivePagingState(args.page_size ?? DEFAULT_PAGE_SIZE)
-  const effectiveFilters = appendTimeRangeFilter(args.filters, args.time_range)
-  assertTimeRangeFilterApplied(`qf_export_${format}`, args.time_range, effectiveFilters)
+  const effectiveFilters = appendTimeRangeFilter(filterResolution.filters, timeRangeResolution.time_range)
+  assertTimeRangeFilterApplied(`qf_export_${format}`, timeRangeResolution.time_range, effectiveFilters)
   if (hasDateLikeRangeFilters(effectiveFilters)) {
-    const form = await getFormCached(args.app_key, args.user_id, false)
-    const index = buildFieldIndex(form.result)
     validateDateRangeFilters(effectiveFilters, index, `qf_export_${format}`)
   }
-  const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
+  const normalizedSort = sortResolution.sort
 
   let currentPage = pageNum
   let fetchedPages = 0
@@ -5176,29 +7177,31 @@ async function executeRecordsExport(
   }
 
   const normalizedItems = rawItems.map((raw) => normalizeRecordItem(raw, true))
+  const requestedSelectColumns = selectResolution.columns.map((item) => item.requested)
   const projection = projectRecordItemsColumns({
     items: normalizedItems,
     includeAnswers: true,
     maxColumns: args.max_columns,
-    selectColumns: args.select_columns
+    selectColumns: requestedSelectColumns
   })
   if (normalizedItems.length > 0 && projection.matchedAnswersCount === 0) {
     throw new InputValidationError({
-      message: `No answers matched select_columns (${args.select_columns
+      message: `No answers matched select_columns (${requestedSelectColumns
         .map((item) => String(item))
         .join(", ")}).`,
       errorCode: "COLUMN_SELECTOR_NOT_FOUND",
       fixHint:
-        "Use qf_form_get to confirm que_id/que_title. If parameters were stringified, pass native JSON arrays (or plain arrays) for select_columns.",
+        "Use qf_form_get or qf_field_resolve to confirm the exact field title/que_id before retrying.",
       details: {
-        select_columns: args.select_columns
+        select_columns: requestedSelectColumns,
+        resolved_mappings: selectResolution.mappings
       }
     })
   }
   const selectedColumnsForRows =
     args.max_columns !== undefined
-      ? projection.selectedColumns.slice(0, args.max_columns)
-      : projection.selectedColumns
+      ? requestedSelectColumns.slice(0, args.max_columns)
+      : requestedSelectColumns
   const rows = buildFlatRowsFromItems({
     items: normalizedItems,
     selectedColumns: selectedColumnsForRows
@@ -5254,12 +7257,12 @@ async function executeRecordsExport(
       app_key: args.app_key,
       selected_columns: selectedColumnsForRows,
       filters: echoFilters(effectiveFilters),
-      time_range: args.time_range
+      time_range: timeRangeResolution.mapping
         ? {
-            column: String(args.time_range.column),
-            from: args.time_range.from ?? null,
-            to: args.time_range.to ?? null,
-            timezone: args.time_range.timezone ?? null
+            column: String(args.time_range?.column ?? timeRangeResolution.mapping.requested ?? ""),
+            from: timeRangeResolution.time_range?.from ?? null,
+            to: timeRangeResolution.time_range?.to ?? null,
+            timezone: timeRangeResolution.time_range?.timezone ?? null
           }
         : null
     },
@@ -5289,12 +7292,12 @@ async function executeRecordsExport(
       columns,
       preview: rows.slice(0, EXPORT_PREVIEW_ROWS),
       ...(isVerboseProfile(outputProfile)
-        ? {
-            completeness,
-            evidence,
-            execution: {
-              scanned_pages: fetchedPages,
-              requested_pages: requestedPages,
+      ? {
+          completeness,
+          evidence,
+          execution: {
+            scanned_pages: fetchedPages,
+            requested_pages: requestedPages,
               page_size: args.page_size ?? DEFAULT_PAGE_SIZE,
               truncated: !completeness.is_complete
             }
@@ -5306,6 +7309,7 @@ async function executeRecordsExport(
       ? {
           completeness,
           evidence,
+          resolved_mappings: resolvedMappings,
           error_code: null,
           fix_hint: null
         }
@@ -5320,7 +7324,8 @@ async function executeRecordsExport(
 
   return {
     payload,
-    message: `Exported ${rows.length} rows to ${filePath}`
+    message: `Exported ${rows.length} rows to ${filePath}`,
+    resolvedMappings
   }
 }
 
@@ -5332,6 +7337,7 @@ async function executeRecordsList(
   completeness: z.infer<typeof completenessSchema>
   evidence: z.infer<typeof evidenceSchema>
   outputProfile: OutputProfile
+  resolvedMappings: Record<string, unknown>
 }> {
   if (!args.app_key) {
     throw missingRequiredFieldError({
@@ -5349,6 +7355,18 @@ async function executeRecordsList(
     })
   }
   const outputProfile = resolveOutputProfile(args.output_profile)
+  const form = await getFormCached(args.app_key, args.user_id, false)
+  const index = buildFieldIndex(form.result)
+  const selectResolution = resolveSelectColumnsWithIndex(args.select_columns, index, "qf_records_list")
+  const filterResolution = resolveFiltersWithIndex(args.filters, index, "qf_records_list")
+  const timeRangeResolution = resolveTimeRangeWithIndex(args.time_range, index, "qf_records_list")
+  const sortResolution = resolveSortWithIndex(args.sort, index, "qf_records_list")
+  const resolvedMappings: Record<string, unknown> = {
+    select_columns: selectResolution.mappings,
+    ...(filterResolution.mappings.length > 0 ? { filters: filterResolution.mappings } : {}),
+    ...(sortResolution.mappings.length > 0 ? { sort: sortResolution.mappings } : {}),
+    ...(timeRangeResolution.mapping ? { time_range: timeRangeResolution.mapping } : {})
+  }
 
   const queryId = randomUUID()
   const pageNum = resolveStartPage(args.page_num, args.page_token, args.app_key)
@@ -5356,14 +7374,12 @@ async function executeRecordsList(
   const adaptivePaging = createAdaptivePagingState(pageSize)
   const requestedPages = args.requested_pages ?? 1
   const scanMaxPages = args.scan_max_pages ?? requestedPages
-  const effectiveFilters = appendTimeRangeFilter(args.filters, args.time_range)
-  assertTimeRangeFilterApplied("qf_records_list", args.time_range, effectiveFilters)
+  const effectiveFilters = appendTimeRangeFilter(filterResolution.filters, timeRangeResolution.time_range)
+  assertTimeRangeFilterApplied("qf_records_list", timeRangeResolution.time_range, effectiveFilters)
   if (hasDateLikeRangeFilters(effectiveFilters)) {
-    const form = await getFormCached(args.app_key, args.user_id, false)
-    const index = buildFieldIndex(form.result)
     validateDateRangeFilters(effectiveFilters, index, "qf_records_list")
   }
-  const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
+  const normalizedSort = sortResolution.sort
   const includeAnswers = true
   const startedAt = Date.now()
   let currentPage = pageNum
@@ -5443,30 +7459,35 @@ async function executeRecordsList(
   const items = collectedRawItems
     .slice(0, listLimit.limit)
     .map((raw) => normalizeRecordItem(raw, includeAnswers))
+  for (const item of items) {
+    rememberApplyAppKey(item.apply_id as string | number | null | undefined, args.app_key)
+  }
   const sourceItemsForRows = items.slice()
+  const requestedSelectColumns = selectResolution.columns.map((item) => item.requested)
   const columnProjection = projectRecordItemsColumns({
     items,
     includeAnswers,
     maxColumns: args.max_columns,
-    selectColumns: args.select_columns
+    selectColumns: requestedSelectColumns
   })
   if (items.length > 0 && columnProjection.matchedAnswersCount === 0) {
     throw new InputValidationError({
-      message: `No answers matched select_columns (${args.select_columns
+      message: `No answers matched select_columns (${requestedSelectColumns
         .map((item) => String(item))
         .join(", ")}).`,
       errorCode: "COLUMN_SELECTOR_NOT_FOUND",
       fixHint:
-        "Use qf_form_get to confirm que_id/que_title. If parameters were stringified, pass native JSON arrays (or plain arrays) for select_columns.",
+        "Use qf_form_get or qf_field_resolve to confirm the exact field title/que_id before retrying.",
       details: {
-        select_columns: args.select_columns
+        select_columns: requestedSelectColumns,
+        resolved_mappings: selectResolution.mappings
       }
     })
   }
   const selectedColumnsForRows =
     args.max_columns !== undefined
-      ? columnProjection.selectedColumns.slice(0, args.max_columns)
-      : columnProjection.selectedColumns
+      ? requestedSelectColumns.slice(0, args.max_columns)
+      : requestedSelectColumns
   const rows = buildFlatRowsFromItems({
     items: sourceItemsForRows,
     selectedColumns: selectedColumnsForRows
@@ -5511,14 +7532,14 @@ async function executeRecordsList(
   const listState: ListQueryState = {
     query_id: queryId,
     app_key: args.app_key,
-    selected_columns: columnProjection.selectedColumns,
+    selected_columns: requestedSelectColumns,
     filters: echoFilters(effectiveFilters),
-    time_range: args.time_range
+    time_range: timeRangeResolution.mapping
       ? {
-          column: String(args.time_range.column),
-          from: args.time_range.from ?? null,
-          to: args.time_range.to ?? null,
-          timezone: args.time_range.timezone ?? null
+          column: String(args.time_range?.column ?? timeRangeResolution.mapping.requested ?? ""),
+          from: timeRangeResolution.time_range?.from ?? null,
+          to: timeRangeResolution.time_range?.to ?? null,
+          timezone: timeRangeResolution.time_range?.timezone ?? null
         }
       : null
   }
@@ -5560,6 +7581,7 @@ async function executeRecordsList(
         : {})
     },
     output_profile: outputProfile,
+    resolved_mappings: resolvedMappings,
     ...(isVerboseProfile(outputProfile)
       ? {
           completeness,
@@ -5585,7 +7607,8 @@ async function executeRecordsList(
     }),
     completeness,
     evidence,
-    outputProfile
+    outputProfile,
+    resolvedMappings
   }
 }
 
@@ -5608,10 +7631,57 @@ async function executeRecordGet(
   const outputProfile = resolveOutputProfile(args.output_profile)
 
   const queryId = randomUUID()
-  const response = await client.getRecord(String(args.apply_id))
-  const record = asObject(response.result) ?? {}
+  let response: QingflowResponse<unknown>
+  let record: Record<string, unknown> | null = null
+  try {
+    response = await client.getRecord(String(args.apply_id))
+    record = asObject(response.result) ?? {}
+  } catch (error) {
+    const providerError = error instanceof QingflowApiError ? error : null
+    const shouldFallback = providerError && (providerError.httpStatus === 404 || providerError.errCode === 404 || providerError.errCode === 49304)
+    if (!shouldFallback) {
+      throw error
+    }
+
+    const fallbackAppKey = args.app_key ?? getCachedApplyAppKey(args.apply_id)
+
+    if (!fallbackAppKey) {
+      throw new InputValidationError({
+        message: `qf_record_get could not read apply_id \"${String(args.apply_id)}\" through the direct record endpoint`,
+        errorCode: "APP_KEY_REQUIRED_FOR_RECORD_GET",
+        fixHint: "Retry qf_record_get with app_key, or call qf_records_batch_get/qf_records_list/qf_record_update first so MCP can infer the app_key for this apply_id.",
+        details: {
+          apply_id: String(args.apply_id),
+          provider_err_code: providerError?.errCode ?? null,
+          provider_err_msg: providerError?.errMsg ?? null
+        }
+      })
+    }
+
+    const fallback = await fetchRecordsByApplyIds({
+      appKey: fallbackAppKey,
+      applyIds: [String(args.apply_id)]
+    })
+    response = fallback.response
+    record = fallback.records.find(
+      (item) => String((item.applyId as string | number | null | undefined) ?? "") === String(args.apply_id)
+    ) ?? null
+    if (!record) {
+      throw new InputValidationError({
+        message: `Record \"${String(args.apply_id)}\" not found in app \"${fallbackAppKey}\"`,
+        errorCode: "RECORD_NOT_FOUND",
+        fixHint: "Confirm apply_id and app_key, or fetch the row via qf_records_list/qf_query first.",
+        details: {
+          apply_id: String(args.apply_id),
+          app_key: fallbackAppKey
+        }
+      })
+    }
+    rememberApplyAppKey((record.applyId as string | number | null | undefined) ?? args.apply_id, fallbackAppKey)
+  }
+
   const projection = projectAnswersForOutput({
-    answers: asArray(record.answers),
+    answers: asArray(record?.answers),
     maxColumns: args.max_columns,
     selectColumns: args.select_columns
   })
@@ -5620,8 +7690,8 @@ async function executeRecordGet(
       ? (projection.selectedColumns ?? []).slice(0, args.max_columns)
       : projection.selectedColumns ?? []
   const row = buildFlatRowFromAnswers({
-    applyId: (record.applyId as string | number | null | undefined) ?? null,
-    answers: asArray(record.answers),
+    applyId: (record?.applyId as string | number | null | undefined) ?? null,
+    answers: asArray(record?.answers),
     selectedColumns: selectedColumnsForRow
   })
 
@@ -5643,12 +7713,13 @@ async function executeRecordGet(
     apply_id: String(args.apply_id),
     selected_columns: selectedColumnsForRow
   }
+  rememberApplyAppKey((record?.applyId as string | number | null | undefined) ?? args.apply_id, args.app_key ?? getCachedApplyAppKey(args.apply_id))
 
   return {
     payload: {
       ok: true,
       data: {
-        apply_id: (record.applyId as string | number | null | undefined) ?? null,
+        apply_id: (record?.applyId as string | number | null | undefined) ?? null,
         row,
         applied_limits: {
           column_cap: args.max_columns ?? null,
@@ -5899,19 +7970,13 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
   completeness: z.infer<typeof completenessSchema>
   evidence: z.infer<typeof evidenceSchema>
   outputProfile: OutputProfile
+  resolvedMappings: Record<string, unknown>
 }> {
   if (!args.app_key) {
     throw missingRequiredFieldError({
       field: "app_key",
       tool: "qf_query(summary)",
       fixHint: "Provide app_key, for example: {\"query_mode\":\"summary\",\"app_key\":\"21b3d559\",...}"
-    })
-  }
-  if (!args.select_columns?.length) {
-    throw missingRequiredFieldError({
-      field: "select_columns",
-      tool: "qf_query(summary)",
-      fixHint: "Provide select_columns as an array (<=2), for example: {\"select_columns\":[\"客户全称\"]}"
     })
   }
   const outputProfile = resolveOutputProfile(args.output_profile)
@@ -5929,7 +7994,11 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
 
   const form = await getFormCached(args.app_key, args.user_id, false)
   const index = buildFieldIndex(form.result)
-  const selectedColumns = resolveSummaryColumns(args.select_columns, index, "select_columns")
+  const selectResolution =
+    args.select_columns && args.select_columns.length > 0
+      ? resolveSelectColumnsWithIndex(args.select_columns, index, "qf_query(summary)")
+      : buildDefaultSummarySelectColumns(args, index)
+  const selectedColumns = selectResolution.columns
   const effectiveColumns =
     args.max_columns !== undefined ? selectedColumns.slice(0, args.max_columns) : selectedColumns
 
@@ -5941,15 +8010,29 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     args.amount_column !== undefined
       ? resolveSummaryColumn(args.amount_column, index, "amount_column")
       : null
-  const timeColumn = args.time_range ? resolveSummaryColumn(args.time_range.column, index, "time_range.column") : null
+  const timeRangeResolution = resolveTimeRangeWithIndex(args.time_range, index, "qf_query(summary)")
+  const timeColumn = timeRangeResolution.time_range
+    ? resolveSummaryColumn(timeRangeResolution.time_range.column, index, "time_range.column")
+    : null
+  const filterResolution = resolveFiltersWithIndex(args.filters, index, "qf_query(summary)")
+  const sortResolution = resolveSortWithIndex(args.sort, index, "qf_query(summary)")
+  const resolvedMappings: Record<string, unknown> = {
+    select_columns: selectResolution.mappings,
+    ...(amountColumn
+      ? { amount_column: buildResolvedMappingFromSummaryColumn(amountColumn) }
+      : {}),
+    ...(filterResolution.mappings.length > 0 ? { filters: filterResolution.mappings } : {}),
+    ...(sortResolution.mappings.length > 0 ? { sort: sortResolution.mappings } : {}),
+    ...(timeRangeResolution.mapping ? { time_range: timeRangeResolution.mapping } : {})
+  }
 
-  const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
-  const summaryFilters = [...(args.filters ?? [])]
-  if (timeColumn && (args.time_range?.from || args.time_range?.to)) {
+  const normalizedSort = sortResolution.sort
+  const summaryFilters = [...(filterResolution.filters ?? [])]
+  if (timeColumn && (timeRangeResolution.time_range?.from || timeRangeResolution.time_range?.to)) {
     summaryFilters.push({
       que_id: timeColumn.que_id,
-      ...(args.time_range.from ? { min_value: args.time_range.from } : {}),
-      ...(args.time_range.to ? { max_value: args.time_range.to } : {})
+      ...(timeRangeResolution.time_range.from ? { min_value: timeRangeResolution.time_range.from } : {}),
+      ...(timeRangeResolution.time_range.to ? { max_value: timeRangeResolution.time_range.to } : {})
     })
   }
   validateDateRangeFilters(summaryFilters, index, "qf_query(summary)")
@@ -5966,7 +8049,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     select_columns: effectiveColumns,
     amount_column: amountColumn,
     time_column: timeColumn,
-    time_range: args.time_range,
+    time_range: timeRangeResolution.time_range,
     stat_policy: {
       include_negative: includeNegative,
       include_null: includeNull
@@ -5989,8 +8072,8 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
     time_range: timeColumn
       ? {
           column: timeColumn.requested,
-          from: args.time_range?.from ?? null,
-          to: args.time_range?.to ?? null,
+          from: timeRangeResolution.time_range?.from ?? null,
+          to: timeRangeResolution.time_range?.to ?? null,
           timezone
         }
       : null
@@ -6236,6 +8319,7 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       },
       rows,
       completeness,
+      resolved_mappings: resolvedMappings,
       ...(isVerboseProfile(outputProfile)
         ? {
             evidence,
@@ -6246,8 +8330,8 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
                 time_range: timeColumn
                   ? {
                       column: timeColumn.requested,
-                      from: args.time_range?.from ?? null,
-                      to: args.time_range?.to ?? null,
+                      from: timeRangeResolution.time_range?.from ?? null,
+                      to: timeRangeResolution.time_range?.to ?? null,
                       timezone
                     }
                   : null
@@ -6274,7 +8358,8 @@ async function executeRecordsSummary(args: z.infer<typeof queryInputSchema>): Pr
       : `Summarized ${scannedRecords}/${knownResultAmount} records (partial)`,
     completeness,
     evidence,
-    outputProfile
+    outputProfile,
+    resolvedMappings
   }
 }
 
@@ -6298,7 +8383,12 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
 
   const form = await getFormCached(args.app_key, args.user_id, false)
   const index = buildFieldIndex(form.result)
-  const groupColumns = resolveSummaryColumns(args.group_by, index, "group_by")
+  const filterResolution = resolveFiltersWithIndex(args.filters, index, "qf_records_aggregate")
+  const sortResolution = resolveSortWithIndex(args.sort, index, "qf_records_aggregate")
+  const timeRangeResolution = resolveTimeRangeWithIndex(args.time_range, index, "qf_records_aggregate")
+  const groupColumns = args.group_by && args.group_by.length > 0
+    ? resolveSummaryColumns(args.group_by, index, "group_by")
+    : []
   const amountSelectors =
     args.amount_columns && args.amount_columns.length > 0
       ? args.amount_columns
@@ -6310,15 +8400,26 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     : []
   const primaryAmountColumn = amountColumns[0] ?? null
   const metrics = resolveAggregateMetrics(args.metrics, amountColumns.length > 0)
-  const timeColumn = args.time_range ? resolveSummaryColumn(args.time_range.column, index, "time_range.column") : null
+  const timeColumn = timeRangeResolution.time_range
+    ? resolveSummaryColumn(timeRangeResolution.time_range.column, index, "time_range.column")
+    : null
+  const resolvedMappings: Record<string, unknown> = {
+    group_by: groupColumns.map((item) => buildResolvedMappingFromSummaryColumn(item)),
+    ...(amountColumns.length > 0
+      ? { amount_columns: amountColumns.map((item) => buildResolvedMappingFromSummaryColumn(item)) }
+      : {}),
+    ...(filterResolution.mappings.length > 0 ? { filters: filterResolution.mappings } : {}),
+    ...(sortResolution.mappings.length > 0 ? { sort: sortResolution.mappings } : {}),
+    ...(timeRangeResolution.mapping ? { time_range: timeRangeResolution.mapping } : {})
+  }
 
-  const normalizedSort = await normalizeListSort(args.sort, args.app_key, args.user_id)
-  const aggregateFilters = [...(args.filters ?? [])]
-  if (timeColumn && (args.time_range?.from || args.time_range?.to)) {
+  const normalizedSort = sortResolution.sort
+  const aggregateFilters = [...(filterResolution.filters ?? [])]
+  if (timeColumn && (timeRangeResolution.time_range?.from || timeRangeResolution.time_range?.to)) {
     aggregateFilters.push({
       que_id: timeColumn.que_id,
-      ...(args.time_range.from ? { min_value: args.time_range.from } : {}),
-      ...(args.time_range.to ? { max_value: args.time_range.to } : {})
+      ...(timeRangeResolution.time_range.from ? { min_value: timeRangeResolution.time_range.from } : {}),
+      ...(timeRangeResolution.time_range.to ? { max_value: timeRangeResolution.time_range.to } : {})
     })
   }
   validateDateRangeFilters(aggregateFilters, index, "qf_records_aggregate")
@@ -6336,7 +8437,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     amount_columns: amountColumns,
     metrics,
     time_column: timeColumn,
-    time_range: args.time_range,
+    time_range: timeRangeResolution.time_range,
     time_bucket: timeBucket,
     stat_policy: {
       include_negative: includeNegative,
@@ -6363,8 +8464,8 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
     time_range: timeColumn
       ? {
           column: timeColumn.requested,
-          from: args.time_range?.from ?? null,
-          to: args.time_range?.to ?? null,
+          from: timeRangeResolution.time_range?.from ?? null,
+          to: timeRangeResolution.time_range?.to ?? null,
           timezone
         }
       : null
@@ -6668,6 +8769,7 @@ async function executeRecordsAggregate(args: z.infer<typeof aggregateInputSchema
           : {})
       },
       output_profile: outputProfile,
+      resolved_mappings: resolvedMappings,
       ...(isVerboseProfile(outputProfile)
         ? {
             completeness,
@@ -6705,27 +8807,12 @@ function resolveSummaryColumn(
   label: string
 ): SummaryColumn {
   const requested = String(column).trim()
-  if (!requested) {
-    throw new Error(`${label} contains an empty column selector`)
-  }
-
-  if (isNumericKey(requested)) {
-    const hit = index.byId.get(String(Number(requested)))
-    if (!hit) {
-      throw new Error(`${label} references unknown que_id "${requested}"`)
-    }
-    return {
-      requested,
-      que_id: normalizeQueId(hit.queId),
-      que_title: asNullableString(hit.queTitle),
-      que_type: hit.queType
-    }
-  }
-
-  const hit = resolveFieldByKey(requested, index)
-  if (!hit || hit.queId === undefined || hit.queId === null) {
-    throw new Error(`${label} cannot resolve field "${requested}"`)
-  }
+  const hit = resolveFieldSelectorStrict({
+    fieldKey: requested,
+    index,
+    tool: label.startsWith("group_by") ? "qf_records_aggregate" : "qf_query",
+    location: label
+  })
 
   return {
     requested,
@@ -7070,9 +9157,11 @@ function resolveAnswers(params: {
   explicitAnswers?: z.infer<typeof answerInputSchema>[]
   fields?: Record<string, unknown>
   form?: unknown
+  tool?: string
 }): Record<string, unknown>[] {
-  const normalizedFromFields = resolveFieldAnswers(params.fields, params.form)
-  const normalizedExplicit = normalizeExplicitAnswers(params.explicitAnswers)
+  const index = params.form ? buildFieldIndex(params.form) : null
+  const normalizedFromFields = resolveFieldAnswers(params.fields, index, params.tool)
+  const normalizedExplicit = normalizeExplicitAnswers(params.explicitAnswers, index, params.tool)
 
   const merged = new Map<string, Record<string, unknown>>()
   for (const answer of normalizedFromFields) {
@@ -7090,14 +9179,16 @@ function resolveAnswers(params: {
 }
 
 function normalizeExplicitAnswers(
-  answers?: z.infer<typeof answerInputSchema>[]
+  answers?: z.infer<typeof answerInputSchema>[],
+  index?: FieldIndex | null,
+  tool = "qf_record_create"
 ): Record<string, unknown>[] {
   if (!answers?.length) {
     return []
   }
 
   const output: Record<string, unknown>[] = []
-  for (const item of answers) {
+  for (const [itemIndex, item] of answers.entries()) {
     const queId = item.que_id ?? item.queId
     if (queId === undefined || queId === null || String(queId).trim() === "") {
       throw new Error("answer item requires que_id or queId")
@@ -7128,7 +9219,14 @@ function normalizeExplicitAnswers(
     if (values === undefined) {
       throw new Error(`answer item ${String(queId)} requires values or table_values`)
     }
-    normalized.values = values.map((value) => normalizeAnswerValue(value))
+    const field = resolveExplicitAnswerField(item, index)
+    normalized.values = values.map((value, valueIndex) =>
+      normalizeAnswerValue(value, {
+        field,
+        tool,
+        location: `answers[${itemIndex}].values[${valueIndex}]`
+      })
+    )
     output.push(normalized)
   }
 
@@ -7137,28 +9235,53 @@ function normalizeExplicitAnswers(
 
 function resolveFieldAnswers(
   fields: Record<string, unknown> | undefined,
-  form: unknown
+  index: FieldIndex | null | undefined,
+  tool = "qf_record_create"
 ): Record<string, unknown>[] {
   const entries = Object.entries(fields ?? {})
   if (entries.length === 0) {
     return []
   }
 
-  const index = buildFieldIndex(form)
+  const resolvedIndex = index ?? { byId: new Map<string, FormField>(), byTitle: new Map<string, FormField[]>() }
   const answers: Record<string, unknown>[] = []
 
   for (const [fieldKey, fieldValue] of entries) {
-    const field = resolveFieldByKey(fieldKey, index)
-    if (!field) {
-      throw new Error(`Cannot resolve field key "${fieldKey}" from form metadata`)
+    let field: FormField | null
+    if (isNumericKey(fieldKey)) {
+      field = resolveFieldByKey(fieldKey, resolvedIndex)
+    } else {
+      field = resolveFieldSelectorStrict({
+        fieldKey,
+        index: resolvedIndex,
+        tool,
+        location: `fields.${fieldKey}`
+      })
     }
-    answers.push(makeAnswerFromField(field, fieldValue))
+    if (!field) {
+      throw new InputValidationError({
+        message: `Cannot resolve field key "${fieldKey}" from form metadata`,
+        errorCode: "FIELD_NOT_FOUND",
+        fixHint: "Use qf_form_get or qf_field_resolve to confirm the exact field title before retrying.",
+        details: {
+          tool,
+          location: `fields.${fieldKey}`,
+          requested: fieldKey,
+          suggestions: buildFieldSuggestions(fieldKey, resolvedIndex)
+        }
+      })
+    }
+    answers.push(makeAnswerFromField(field, fieldValue, tool))
   }
 
   return answers
 }
 
-function makeAnswerFromField(field: FormField, value: unknown): Record<string, unknown> {
+function makeAnswerFromField(
+  field: FormField,
+  value: unknown,
+  tool = "qf_record_create"
+): Record<string, unknown> {
   const base: Record<string, unknown> = {
     queId: field.queId
   }
@@ -7180,7 +9303,13 @@ function makeAnswerFromField(field: FormField, value: unknown): Record<string, u
     if ("values" in objectValue) {
       return {
         ...base,
-        values: asArray(objectValue.values).map((item) => normalizeAnswerValue(item))
+        values: asArray(objectValue.values).map((item, index) =>
+          normalizeAnswerValue(item, {
+            field,
+            tool,
+            location: `fields.${String(field.queTitle ?? field.queId ?? "field")}.values[${index}]`
+          })
+        )
       }
     }
   }
@@ -7195,11 +9324,53 @@ function makeAnswerFromField(field: FormField, value: unknown): Record<string, u
   const valueArray = Array.isArray(value) ? value : [value]
   return {
     ...base,
-    values: valueArray.map((item) => normalizeAnswerValue(item))
+    values: valueArray.map((item, index) =>
+      normalizeAnswerValue(item, {
+        field,
+        tool,
+        location: `fields.${String(field.queTitle ?? field.queId ?? "field")}.values[${index}]`
+      })
+    )
   }
 }
 
-function normalizeAnswerValue(value: unknown): unknown {
+function resolveExplicitAnswerField(
+  item: z.infer<typeof answerInputSchema>,
+  index?: FieldIndex | null
+): FormField | null {
+  if (index) {
+    const rawQueId = item.que_id ?? item.queId
+    if (rawQueId !== undefined && rawQueId !== null) {
+      const hit = index.byId.get(String(normalizeQueId(rawQueId)))
+      if (hit) {
+        return hit
+      }
+    }
+    const rawQueTitle = item.que_title ?? item.queTitle
+    if (typeof rawQueTitle === "string" && rawQueTitle.trim()) {
+      const candidates = index.byTitle.get(rawQueTitle.trim().toLowerCase()) ?? []
+      if (candidates.length === 1) {
+        return candidates[0]
+      }
+    }
+  }
+
+  return {
+    queId: item.que_id ?? item.queId,
+    queTitle: item.que_title ?? item.queTitle,
+    queType: item.que_type ?? item.queType
+  }
+}
+
+function normalizeAnswerValue(
+  value: unknown,
+  params?: {
+    field?: FormField | null
+    tool?: string
+    location?: string
+  }
+): unknown {
+  validateWriteValueShape(params?.field ?? null, value, params)
   if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
     return {
       value,
@@ -7207,6 +9378,92 @@ function normalizeAnswerValue(value: unknown): unknown {
     }
   }
   return value
+}
+
+function validateWriteValueShape(
+  field: FormField | null,
+  value: unknown,
+  params?: {
+    tool?: string
+    location?: string
+  }
+): void {
+  const writeFormat = field ? inferFieldWriteFormat(field) : null
+  if (!writeFormat) {
+    return
+  }
+  const validatedField = field
+  if (!validatedField) {
+    return
+  }
+  if (writeFormat.kind === "member_list" && !isValidMemberWriteValue(value)) {
+    throw fieldValueFormatError({
+      field: validatedField,
+      writeFormat,
+      value,
+      tool: params?.tool,
+      location: params?.location
+    })
+  }
+  if (writeFormat.kind === "department_list" && !isValidDepartmentWriteValue(value)) {
+    throw fieldValueFormatError({
+      field: validatedField,
+      writeFormat,
+      value,
+      tool: params?.tool,
+      location: params?.location
+    })
+  }
+}
+
+function isValidMemberWriteValue(value: unknown): boolean {
+  const obj = asObject(value)
+  return Boolean(obj && asNullableString(obj.userId)?.trim())
+}
+
+function isValidDepartmentWriteValue(value: unknown): boolean {
+  const obj = asObject(value)
+  if (!obj) {
+    return false
+  }
+  const deptId = obj.deptId
+  return (
+    (typeof deptId === "string" && deptId.trim().length > 0) ||
+    (typeof deptId === "number" && Number.isFinite(deptId))
+  )
+}
+
+function fieldValueFormatError(params: {
+  field: FormField
+  writeFormat: NonNullable<z.infer<typeof fieldSummarySchema>["write_format"]>
+  value: unknown
+  tool?: string
+  location?: string
+}): InputValidationError {
+  const fieldLabel =
+    asNullableString(params.field.queTitle)?.trim() ||
+    String(params.field.queId ?? "unknown_field")
+  const formatName =
+    params.writeFormat.kind === "member_list" ? "成员字段" : "部门字段"
+  return new InputValidationError({
+    message: `${formatName} "${fieldLabel}" 的写入值格式不正确`,
+    errorCode: "FIELD_VALUE_FORMAT_ERROR",
+    fixHint:
+      params.writeFormat.kind === "member_list"
+        ? '传对象数组，例如 [{"userId":"u_123","userName":"张三"}]；不要传纯字符串或 user_id。'
+        : '传对象数组，例如 [{"deptId":111,"deptName":"销售部"}]；不要传纯字符串或 dept_id。',
+    details: {
+      tool: params.tool ?? "qf_record_create",
+      location: params.location ?? null,
+      field: {
+        que_id: params.field.queId ?? null,
+        que_title: asNullableString(params.field.queTitle),
+        que_type: params.field.queType ?? null
+      },
+      expected_format: params.writeFormat,
+      received_value: params.value
+    }
+  })
 }
 
 function needsFormResolution(fields?: Record<string, unknown>): boolean {
@@ -7248,10 +9505,104 @@ function extractFieldSummaries(form: Record<string, unknown> | null) {
       que_id: (field.queId as string | number | null | undefined) ?? null,
       que_title: asNullableString(field.queTitle),
       que_type: field.queType,
+      write_format: inferFieldWriteFormat(field as FormField),
       has_sub_fields: sub.length > 0,
       sub_field_count: sub.length
     }
   })
+}
+
+function inferFieldWriteFormat(
+  field: Pick<FormField, "queId" | "queTitle" | "queType">
+): z.infer<typeof fieldSummarySchema>["write_format"] {
+  const kind = inferFieldWriteFormatKind(field.queType)
+  if (kind === "member_list") {
+    return {
+      kind,
+      description: "Pass one or more member objects in values[]. Each item must contain userId.",
+      item_shape: {
+        userId: "string",
+        userName: "string? (recommended)",
+        name: "string? (accepted alias)"
+      },
+      example: [
+        {
+          userId: "u_123",
+          userName: "张三"
+        }
+      ],
+      resolution_hint:
+        "Use qf_users_list or qf_department_users_list to resolve valid userId values before writing."
+    }
+  }
+  if (kind === "department_list") {
+    return {
+      kind,
+      description: "Pass one or more department objects in values[]. Each item must contain deptId.",
+      item_shape: {
+        deptId: "string|number",
+        deptName: "string? (recommended)",
+        name: "string? (accepted alias)"
+      },
+      example: [
+        {
+          deptId: 111,
+          deptName: "销售部"
+        }
+      ],
+      resolution_hint: "Use qf_departments_list to resolve valid deptId values before writing."
+    }
+  }
+  return null
+}
+
+function inferFieldWriteFormatKind(queType: unknown): "member_list" | "department_list" | null {
+  const tokens = collectQueTypeTokens(queType)
+  if (tokens.some((token) => MEMBER_QUE_TYPE_KEYWORDS.some((keyword) => token.includes(keyword)))) {
+    return "member_list"
+  }
+  if (
+    tokens.some((token) => DEPARTMENT_QUE_TYPE_KEYWORDS.some((keyword) => token.includes(keyword)))
+  ) {
+    return "department_list"
+  }
+  return null
+}
+
+function collectQueTypeTokens(queType: unknown): string[] {
+  const tokens = new Set<string>()
+  const queue: unknown[] = [queType]
+
+  while (queue.length > 0) {
+    const current = queue.shift()
+    if (current === null || current === undefined) {
+      continue
+    }
+    if (typeof current === "string") {
+      const normalized = current.trim().toLowerCase()
+      if (normalized) {
+        tokens.add(normalized)
+      }
+      continue
+    }
+    if (typeof current === "number" || typeof current === "boolean") {
+      tokens.add(String(current))
+      continue
+    }
+    if (Array.isArray(current)) {
+      queue.push(...current)
+      continue
+    }
+    const obj = asObject(current)
+    if (!obj) {
+      continue
+    }
+    for (const value of Object.values(obj)) {
+      queue.push(value)
+    }
+  }
+
+  return Array.from(tokens)
 }
 
 function buildFieldIndex(form: unknown): FieldIndex {
@@ -7327,17 +9678,349 @@ async function normalizeListSort(
 
   return sort.map((item) => {
     const rawKey = String(item.que_id).trim()
-    const resolved = resolveFieldByKey(rawKey, index)
-    if (!resolved || resolved.queId === undefined || resolved.queId === null) {
-      throw new Error(
-        `Cannot resolve sort.que_id "${rawKey}". Use numeric que_id or exact field title from qf_form_get.`
-      )
-    }
+    const resolved = resolveFieldSelectorStrict({
+      fieldKey: rawKey,
+      index,
+      tool: "qf_records_list",
+      location: "sort[].que_id"
+    })
     return {
       que_id: normalizeQueId(resolved.queId),
       ...(item.ascend !== undefined ? { ascend: item.ascend } : {})
     }
   })
+}
+
+function buildResolvedMappingFromSummaryColumn(
+  column: SummaryColumn,
+  extra: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return {
+    requested: column.requested,
+    resolved: true,
+    que_id: column.que_id,
+    que_title: column.que_title,
+    que_type: column.que_type ?? null,
+    ...extra
+  }
+}
+
+function resolveFiltersWithIndex(
+  filters:
+    | Array<{
+        que_id?: string | number
+        search_key?: string
+        search_keys?: string[]
+        min_value?: string
+        max_value?: string
+        scope?: number
+        search_options?: Array<string | number>
+        search_user_ids?: string[]
+      }>
+    | undefined,
+  index: FieldIndex,
+  tool: string
+): {
+  filters:
+    | Array<{
+        que_id?: string | number
+        search_key?: string
+        search_keys?: string[]
+        min_value?: string
+        max_value?: string
+        scope?: number
+        search_options?: Array<string | number>
+        search_user_ids?: string[]
+      }>
+    | undefined
+  mappings: Array<Record<string, unknown>>
+} {
+  if (!filters?.length) {
+    return {
+      filters,
+      mappings: []
+    }
+  }
+
+  const mappings: Array<Record<string, unknown>> = []
+  const resolvedFilters = filters.map((filter, indexInArray) => {
+    if (filter.que_id === undefined || filter.que_id === null) {
+      return filter
+    }
+    const resolved = resolveFieldSelectorStrict({
+      fieldKey: filter.que_id,
+      index,
+      tool,
+      location: `filters[${indexInArray}].que_id`
+    })
+    mappings.push(
+      buildResolvedMappingEntry({
+        requested: String(filter.que_id),
+        field: resolved,
+        resolved: true
+      })
+    )
+    return {
+      ...filter,
+      que_id: normalizeQueId(resolved.queId)
+    }
+  })
+
+  return {
+    filters: resolvedFilters,
+    mappings
+  }
+}
+
+function resolveSortWithIndex(
+  sort: Array<{ que_id: string | number; ascend?: boolean }> | undefined,
+  index: FieldIndex,
+  tool: string
+): {
+  sort: Array<{ que_id: string | number; ascend?: boolean }> | undefined
+  mappings: Array<Record<string, unknown>>
+} {
+  if (!sort?.length) {
+    return {
+      sort,
+      mappings: []
+    }
+  }
+
+  const mappings: Array<Record<string, unknown>> = []
+  const resolvedSort = sort.map((item, indexInArray) => {
+    const resolved = resolveFieldSelectorStrict({
+      fieldKey: item.que_id,
+      index,
+      tool,
+      location: `sort[${indexInArray}].que_id`
+    })
+    mappings.push(
+      buildResolvedMappingEntry({
+        requested: String(item.que_id),
+        field: resolved,
+        resolved: true
+      })
+    )
+    return {
+      que_id: normalizeQueId(resolved.queId),
+      ...(item.ascend !== undefined ? { ascend: item.ascend } : {})
+    }
+  })
+
+  return {
+    sort: resolvedSort,
+    mappings
+  }
+}
+
+function resolveTimeRangeWithIndex(
+  timeRange:
+    | {
+        column: string | number
+        from?: string
+        to?: string
+        timezone?: string
+      }
+    | undefined,
+  index: FieldIndex,
+  tool: string
+): {
+  time_range:
+    | {
+        column: string | number
+        from?: string
+        to?: string
+        timezone?: string
+      }
+    | undefined
+  mapping: Record<string, unknown> | null
+} {
+  if (!timeRange) {
+    return {
+      time_range: undefined,
+      mapping: null
+    }
+  }
+
+  const resolved = resolveFieldSelectorStrict({
+    fieldKey: timeRange.column,
+    index,
+    tool,
+    location: "time_range.column",
+    expectDateType: true
+  })
+
+  return {
+    time_range: {
+      ...timeRange,
+      column: normalizeQueId(resolved.queId)
+    },
+    mapping: buildResolvedMappingEntry({
+      requested: String(timeRange.column),
+      field: resolved,
+      resolved: true
+    })
+  }
+}
+
+function resolveSelectColumnsWithIndex(
+  selectColumns: Array<string | number>,
+  index: FieldIndex,
+  tool: string
+): {
+  columns: SummaryColumn[]
+  mappings: Array<Record<string, unknown>>
+} {
+  const columns = resolveOutputColumns(selectColumns, index, "select_columns", tool)
+  return {
+    columns,
+    mappings: columns.map((column) => buildResolvedMappingFromSummaryColumn(column))
+  }
+}
+
+function buildDefaultSummarySelectColumns(
+  args: z.infer<typeof queryInputSchema>,
+  index: FieldIndex
+): {
+  columns: SummaryColumn[]
+  mappings: Array<Record<string, unknown>>
+} {
+  const candidates: Array<{ selector: string | number; reason: string }> = []
+  if (args.time_range?.column !== undefined) {
+    candidates.push({
+      selector: args.time_range.column,
+      reason: "auto-selected from time_range.column"
+    })
+  }
+  if (args.amount_column !== undefined) {
+    candidates.push({
+      selector: args.amount_column,
+      reason: "auto-selected from amount_column"
+    })
+  }
+
+  const idZero = index.byId.get("0")
+  if (idZero?.queId !== undefined && idZero.queId !== null) {
+    candidates.push({
+      selector: normalizeQueId(idZero.queId),
+      reason: "auto-selected default row preview column"
+    })
+  } else {
+    const firstBusinessField = Array.from(index.byId.values()).find((field) => {
+      const normalized = field.queId !== undefined && field.queId !== null ? normalizeQueId(field.queId) : null
+      return typeof normalized === "number" ? normalized > 0 : Boolean(normalized)
+    })
+    if (firstBusinessField?.queId !== undefined && firstBusinessField.queId !== null) {
+      candidates.push({
+        selector: normalizeQueId(firstBusinessField.queId),
+        reason: "auto-selected first business field for row preview"
+      })
+    }
+  }
+
+  const deduped = new Set<string>()
+  const selectedCandidates: Array<{ selector: string | number; reason: string }> = []
+  for (const candidate of candidates) {
+    const key = normalizeColumnSelector(candidate.selector)
+    if (deduped.has(key)) {
+      continue
+    }
+    deduped.add(key)
+    selectedCandidates.push(candidate)
+    if (selectedCandidates.length >= MAX_COLUMN_LIMIT) {
+      break
+    }
+  }
+
+  const columns = selectedCandidates.map((candidate) =>
+    resolveOutputColumn(candidate.selector, index, "select_columns", "qf_query(summary)")
+  )
+
+  return {
+    columns,
+    mappings: columns.map((column, indexInArray) =>
+      buildResolvedMappingFromSummaryColumn(column, {
+        auto_selected: true,
+        reason: selectedCandidates[indexInArray]?.reason ?? "auto-selected"
+      })
+    )
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
+}
+
+function extractOperationStatus(operationResult: unknown): string | null {
+  const obj = asObject(operationResult)
+  const rawStatus = asNullableString(
+    obj?.status ?? obj?.operationStatus ?? obj?.operation_status ?? obj?.resultStatus ?? null
+  )
+  return rawStatus ? rawStatus.trim().toUpperCase() : null
+}
+
+function isPendingOperationStatus(status: string | null): boolean {
+  if (!status) {
+    return false
+  }
+  return ["PENDING", "PROCESSING", "RUNNING", "IN_PROGRESS", "QUEUED"].includes(status)
+}
+
+function extractOperationApplyId(operationResult: unknown): string | number | null {
+  // Handle case where operationResult itself is a numeric string or number (the apply_id directly)
+  if (typeof operationResult === "string" && /^\d+$/.test(operationResult.trim())) {
+    return operationResult.trim()
+  }
+  if (typeof operationResult === "number" && Number.isFinite(operationResult)) {
+    return operationResult
+  }
+  const obj = asObject(operationResult)
+  return (obj?.applyId as string | number | null | undefined) ?? (obj?.apply_id as string | number | null | undefined) ?? null
+}
+
+async function waitForOperationResolution(params: {
+  requestId: string
+  timeoutMs: number
+}): Promise<{
+  status: "completed" | "timeout" | "failed"
+  operationResult: unknown | null
+  applyId: string | number | null
+}> {
+  const deadline = Date.now() + Math.max(1, params.timeoutMs)
+  let lastResult: unknown | null = null
+
+  while (Date.now() <= deadline) {
+    const response = await client.getOperation(params.requestId)
+    lastResult = response.result
+    const opStatus = extractOperationStatus(lastResult)
+    const applyId = extractOperationApplyId(lastResult)
+
+    if (applyId !== null) {
+      return { status: "completed", operationResult: lastResult, applyId }
+    }
+
+    if (opStatus && !isPendingOperationStatus(opStatus)) {
+      // Non-pending status but no apply_id — treat as failed
+      return { status: "failed", operationResult: lastResult, applyId: null }
+    }
+
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      break
+    }
+    await delay(Math.min(WAIT_RESULT_POLL_INTERVAL_MS, remaining))
+  }
+
+  // Timed out — check if last result has apply_id anyway (edge case)
+  const finalApplyId = extractOperationApplyId(lastResult)
+  if (finalApplyId !== null) {
+    return { status: "completed", operationResult: lastResult, applyId: finalApplyId }
+  }
+
+  return { status: "timeout", operationResult: lastResult, applyId: null }
 }
 
 function resolveListItemLimit(params: {
@@ -7906,6 +10589,49 @@ function buildErrorExampleCalls(params: {
         note: "再使用标准 list 查询模板重试"
       }
     ]
+  }
+
+  if (errorCode === "FIELD_VALUE_FORMAT_ERROR") {
+    const expectedFormat = asObject(params.details?.expected_format)
+    const kind = asNullableString(expectedFormat?.kind)
+    if (kind === "member_list") {
+      return [
+        {
+          tool: "qf_form_get",
+          arguments: {
+            app_key: appKey
+          },
+          note: "先查看字段 write_format，确认成员字段写入 shape"
+        },
+        {
+          tool: "qf_department_users_list",
+          arguments: {
+            dept_id: 111,
+            fetch_child: false
+          },
+          note: "查询有效成员 userId，再按 [{userId,userName}] 写入"
+        }
+      ]
+    }
+    if (kind === "department_list") {
+      return [
+        {
+          tool: "qf_form_get",
+          arguments: {
+            app_key: appKey
+          },
+          note: "先查看字段 write_format，确认部门字段写入 shape"
+        },
+        {
+          tool: "qf_departments_list",
+          arguments: {
+            keyword: "销售",
+            limit: 20
+          },
+          note: "查询有效部门 deptId，再按 [{deptId,deptName}] 写入"
+        }
+      ]
+    }
   }
 
   if (errorCode === "INTERNAL_ERROR" || errorCode === "UNKNOWN_ERROR") {

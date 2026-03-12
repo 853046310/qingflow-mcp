@@ -3,6 +3,13 @@
 This MCP server wraps Qingflow OpenAPI for:
 
 - `qf_apps_list`
+- `qf_apps_info_list`
+- `qf_app_info_get`
+- `qf_app_packages_list`
+- `qf_departments_list`
+- `qf_department_users_list`
+- `qf_users_list`
+- `qf_user_get`
 - `qf_form_get`
 - `qf_field_resolve`
 - `qf_query_plan`
@@ -13,6 +20,8 @@ This MCP server wraps Qingflow OpenAPI for:
 - `qf_export_json`
 - `qf_query` (unified read entry: list / record / summary)
 - `qf_records_aggregate` (deterministic grouped metrics)
+- `qf_apply_audit_records_list`
+- `qf_apply_audit_record_get`
 - `qf_record_create`
 - `qf_record_update`
 - `qf_operation_get`
@@ -108,7 +117,7 @@ npm i -g git+https://github.com/853046310/qingflow-mcp.git
 Install from npm (pinned version):
 
 ```bash
-npm i -g qingflow-mcp@0.3.14
+npm i -g qingflow-mcp@0.3.23
 ```
 
 Or one-click installer:
@@ -144,13 +153,69 @@ MCP client config example:
 ## Recommended Flow
 
 1. `qf_apps_list` to pick app.
-2. `qf_form_get` to inspect field ids/titles.
+2. `qf_form_get` to inspect field ids/titles and `field_summaries[].write_format`.
 3. `qf_record_create` or `qf_record_update`.
 4. If create/update returns only `request_id`, call `qf_operation_get` to resolve async result.
+
+Directory / org flow:
+
+1. `qf_departments_list` to inspect department tree.
+2. `qf_department_users_list` to inspect one department's members.
+3. `qf_users_list` for workspace-wide pagination.
+4. `qf_user_get` for one exact user.
+
+Admin app flow:
+
+1. `qf_apps_list` for lightweight visible app listing.
+2. `qf_apps_info_list` for admin-level app detail listing.
+3. `qf_app_info_get` for one exact app.
+4. `qf_app_packages_list` for user-visible app packages.
+
+Audit flow:
+
+1. `qf_apply_audit_records_list` to inspect one record's workflow history.
+2. `qf_apply_audit_record_get` to inspect one audit record's field modifications.
 
 Full calling contract (Chinese):
 
 - [MCP 调用规范](./docs/MCP_CALLING_SPEC.md)
+
+## Write Format Discovery
+
+For create/update, `0.3.23` now makes special write formats explicit:
+
+1. `qf_form_get`
+   - `field_summaries[].write_format` is populated for member/department fields.
+2. `qf_tool_spec_get`
+   - `qf_record_create` / `qf_record_update` include member/department examples in `limits.special_field_write_formats`.
+3. `qf_record_create` / `qf_record_update`
+   - invalid member/department values fail fast with `FIELD_VALUE_FORMAT_ERROR`.
+
+Examples:
+
+```json
+{
+  "fields": {
+    "归属销售": [
+      { "userId": "u_123", "userName": "张三" }
+    ],
+    "归属部门": [
+      { "deptId": 111, "deptName": "销售部" }
+    ]
+  }
+}
+```
+
+Invalid examples that will now fail:
+
+```json
+{
+  "fields": {
+    "归属销售": "张三",
+    "归属部门": "销售部"
+  }
+}
+```
 
 ## Unified Query (`qf_query`)
 
@@ -165,13 +230,89 @@ Full calling contract (Chinese):
 4. In `list` mode, `select_columns` is required.
 5. In `list` mode, row cap defaults to 200 when `max_rows` and `max_items` are omitted.
 6. In `record` mode, `select_columns` is required.
-7. In `summary` mode, `select_columns` is required (`max_rows` defaults to 200 when omitted).
+7. In `summary` mode, `select_columns` is optional and can be auto-derived from `amount_column` / `time_range` (`max_rows` defaults to 200 when omitted).
 
 Summary mode output:
 
 1. `summary`: aggregated stats (`total_count`, `total_amount`, `by_day`, `missing_count`).
-2. `rows`: strict column rows (only requested `select_columns`).
+2. `rows`: strict column rows (requested `select_columns`, or auto-derived preview columns when omitted).
 3. `meta`: field mapping, filter scope, stat policy, execution limits (`output_profile=verbose` only).
+
+## Directory / Org Tools
+
+These tools expose department and member APIs without routing through `qf_query`:
+
+1. `qf_departments_list`
+   - optional `dept_id`
+   - local `keyword`, `limit`, `offset`
+   - aliases: `deptId`, `department_id`, `departmentId`
+2. `qf_department_users_list`
+   - required `dept_id`, `fetch_child`
+   - local `keyword`, `limit`, `offset`
+   - aliases: `deptId`, `department_id`, `departmentId`, `fetchChild`
+3. `qf_users_list`
+   - required `page_num`, `page_size`
+   - aliases: `pageNum`, `pageSize`
+4. `qf_user_get`
+   - required `user_id`
+   - alias: `userId`
+
+CLI examples:
+
+```bash
+qingflow-mcp cli call qf_departments_list --args '{"keyword":"销售","limit":20}'
+
+qingflow-mcp cli call qf_department_users_list --args '{"deptId":111,"fetchChild":true}'
+
+qingflow-mcp cli call qf_users_list --args '{"pageNum":1,"pageSize":100}'
+
+qingflow-mcp cli call qf_user_get --args '{"userId":"u_123"}'
+```
+
+## Admin App Tools
+
+These tools expose admin-facing app and package metadata without routing through `qf_query`:
+
+1. `qf_apps_info_list`
+   - required `page_num`, `page_size`
+   - optional `app_key`
+   - aliases: `pageNum`, `pageSize`, `appKey`
+2. `qf_app_info_get`
+   - required `app_key`
+   - alias: `appKey`
+3. `qf_app_packages_list`
+   - required `user_id`
+   - optional `tag_id`, `keyword`, `limit`, `offset`
+   - aliases: `userId`, `tagId`
+
+CLI examples:
+
+```bash
+qingflow-mcp cli call qf_apps_info_list --args '{"pageNum":1,"pageSize":50}'
+
+qingflow-mcp cli call qf_app_info_get --args '{"appKey":"app_demo"}'
+
+qingflow-mcp cli call qf_app_packages_list --args '{"userId":"u_123","tagId":1001}'
+```
+
+## Audit Tools
+
+These tools expose workflow log history as read-only MCP tools:
+
+1. `qf_apply_audit_records_list`
+   - required `apply_id`
+   - alias: `applyId`
+2. `qf_apply_audit_record_get`
+   - required `apply_id`, `audit_rcd_id`
+   - aliases: `applyId`, `auditRcdId`
+
+CLI examples:
+
+```bash
+qingflow-mcp cli call qf_apply_audit_records_list --args '{"applyId":"50001234"}'
+
+qingflow-mcp cli call qf_apply_audit_record_get --args '{"applyId":"50001234","auditRcdId":"1111"}'
+```
 
 Return shape:
 
@@ -325,7 +466,7 @@ If you see runtime errors around `Headers` or missing web APIs:
 2. Upgrade package to latest:
 
 ```bash
-npm i -g qingflow-mcp@latest
+npm i -g qingflow-mcp@0.3.23
 ```
 
 3. Verify runtime:
